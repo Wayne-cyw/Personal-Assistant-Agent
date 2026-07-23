@@ -1,0 +1,4 @@
+# Adversarial test cases: attack prompts + expected agent behavior.
+# Built out in Issue #27 (cases derived from a manual red-team session)
+# and formalized to >=50 cases across categories in Issue #32.
+cases: []
