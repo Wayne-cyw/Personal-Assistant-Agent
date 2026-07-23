@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -62,6 +64,57 @@ def test_allowed_origins_parses_comma_separated_string() -> None:
     )
 
     assert settings.allowed_origins == ["https://a.example.com", "https://b.example.com"]
+
+
+def test_allowed_origins_from_real_env_var_not_json_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: pydantic-settings JSON-decodes list-typed fields
+    sourced from the real process env / .env file *before* any
+    field_validator runs, unless the field opts out via NoDecode. A plain
+    comma-separated string like "https://a.com,https://b.com" is not valid
+    JSON, so without NoDecode this raises SettingsError at import/construction
+    time instead of being parsed. Passing ALLOWED_ORIGINS as a Settings(...)
+    kwarg (as the test above does) bypasses that source entirely and would
+    not have caught this.
+    """
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://a.example.com,https://b.example.com")
+
+    settings = Settings(_env_file=None, LLM_PROVIDER="anthropic", LLM_API_KEY="key")  # type: ignore[call-arg]
+
+    assert settings.allowed_origins == ["https://a.example.com", "https://b.example.com"]
+
+
+def test_allowed_origins_empty_string_from_real_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALLOWED_ORIGINS", "")
+
+    settings = Settings(_env_file=None, LLM_PROVIDER="anthropic", LLM_API_KEY="key")  # type: ignore[call-arg]
+
+    assert settings.allowed_origins == []
+
+
+def test_env_example_leaves_optional_vars_at_their_python_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: .env.example must not bind LLM_MODEL/DATABASE_URL to
+    an explicit empty string, since an explicitly-set-but-blank key (e.g.
+    `DATABASE_URL=`) overrides the Python default with "" rather than being
+    treated as absent — unlike a fully commented-out/omitted key. Also
+    confirms inline "KEY=  # comment" no longer corrupts the value: python-
+    dotenv only strips inline comments when a non-empty value precedes them,
+    so a comment on a blank-value line was previously taken literally as
+    part of the value.
+    """
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    env_example = Path(__file__).parents[2] / ".env.example"
+
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=env_example, LLM_PROVIDER="anthropic", LLM_API_KEY="key"
+    )
+
+    assert settings.llm_model is None
+    assert settings.database_url == "sqlite:///./personal_agent.db"
 
 
 def test_numeric_overrides_are_coerced_to_int() -> None:

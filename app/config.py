@@ -7,9 +7,10 @@ issues introduce them.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class LLMProvider(StrEnum):
@@ -38,8 +39,13 @@ class Settings(BaseSettings):
     window_high_tokens: int = Field(default=3000, alias="WINDOW_HIGH_TOKENS")
     window_low_tokens: int = Field(default=1500, alias="WINDOW_LOW_TOKENS")
 
-    # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set
-    allowed_origins: list[str] = Field(default_factory=list, alias="ALLOWED_ORIGINS")
+    # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
+    # NoDecode stops pydantic-settings from JSON-decoding the raw env string
+    # before our validator runs (list-typed fields are decoded as JSON by
+    # default, which would reject a plain comma-separated value).
+    allowed_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="ALLOWED_ORIGINS"
+    )
 
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
