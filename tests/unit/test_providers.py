@@ -145,6 +145,153 @@ def _fake_chat_completion(text: str, cached_tokens: int = 5) -> Any:
     return _Completion()
 
 
+class _FakeFunctionDelta:
+    def __init__(self, name: str | None, arguments: str | None):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCallDelta:
+    def __init__(
+        self,
+        index: int,
+        id: str | None = None,  # noqa: A002
+        name: str | None = None,
+        arguments: str | None = None,
+    ):
+        self.index = index
+        self.id = id
+        self.function = _FakeFunctionDelta(name, arguments) if (name or arguments) else None
+
+
+class _FakeDelta:
+    def __init__(
+        self, content: str | None = None, tool_calls: list[_FakeToolCallDelta] | None = None
+    ):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _FakeStreamChoice:
+    def __init__(self, delta: _FakeDelta, finish_reason: str | None = None):
+        self.delta = delta
+        self.finish_reason = finish_reason
+
+
+class _FakeStreamUsage:
+    def __init__(self, prompt_tokens: int, completion_tokens: int, cached_tokens: int):
+        class _Details:
+            pass
+
+        details = _Details()
+        details.cached_tokens = cached_tokens  # type: ignore[attr-defined]
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.prompt_tokens_details = details
+
+
+class _FakeChunk:
+    def __init__(self, choices: list[_FakeStreamChoice], usage: _FakeStreamUsage | None = None):
+        self.choices = choices
+        self.usage = usage
+
+
+class _FakeAsyncStream:
+    def __init__(self, chunks: list[_FakeChunk], raise_after: int | None = None):
+        self._chunks = chunks
+        self._raise_after = raise_after
+
+    def __aiter__(self) -> Any:
+        return self._gen()
+
+    async def _gen(self) -> Any:
+        for i, chunk in enumerate(self._chunks):
+            if self._raise_after is not None and i == self._raise_after:
+                raise _fake_status_error(500)
+            yield chunk
+
+
+async def test_complete_stream_yields_deltas_then_done() -> None:
+    provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
+    chunks = [
+        _FakeChunk(choices=[_FakeStreamChoice(_FakeDelta(content="Hel"))]),
+        _FakeChunk(choices=[_FakeStreamChoice(_FakeDelta(content="lo"), finish_reason="stop")]),
+        _FakeChunk(choices=[], usage=_FakeStreamUsage(10, 2, 3)),
+    ]
+    mock_create = AsyncMock(return_value=_FakeAsyncStream(chunks))
+
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        events = [event async for event in provider.complete_stream(_messages(), [], 100)]
+
+    deltas = [e.delta for e in events if e.type == "delta"]
+    assert deltas == ["Hel", "lo"]
+    done = events[-1]
+    assert done.type == "done"
+    assert done.response is not None
+    assert done.response.text == "Hello"
+    assert done.response.finish_reason == "stop"
+    assert done.response.usage.cached_input_tokens == 3
+
+
+async def test_complete_stream_accumulates_tool_call_fragments() -> None:
+    provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
+    first_delta = _FakeToolCallDelta(0, id="call_1", name="get_current_date", arguments="")
+    second_delta = _FakeToolCallDelta(0, arguments='{"tz"')
+    third_delta = _FakeToolCallDelta(0, arguments=': "UTC"}')
+    chunks = [
+        _FakeChunk(choices=[_FakeStreamChoice(_FakeDelta(tool_calls=[first_delta]))]),
+        _FakeChunk(
+            choices=[
+                _FakeStreamChoice(_FakeDelta(tool_calls=[second_delta]), finish_reason="tool_calls")
+            ]
+        ),
+        _FakeChunk(choices=[_FakeStreamChoice(_FakeDelta(tool_calls=[third_delta]))]),
+    ]
+    mock_create = AsyncMock(return_value=_FakeAsyncStream(chunks))
+
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        events = [event async for event in provider.complete_stream(_messages(), [], 100)]
+
+    done = events[-1].response
+    assert done is not None
+    assert len(done.tool_calls) == 1
+    assert done.tool_calls[0].id == "call_1"
+    assert done.tool_calls[0].name == "get_current_date"
+    assert done.tool_calls[0].arguments == {"tz": "UTC"}
+
+
+async def test_complete_stream_sanitizes_error_on_create() -> None:
+    provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
+    mock_create = AsyncMock(side_effect=_fake_status_error(500))
+
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        from app.agent.providers.base import UpstreamError
+
+        with pytest.raises(UpstreamError) as exc_info:
+            async for _ in provider.complete_stream(_messages(), [], 100):
+                pass
+
+    assert "sk-dummy-secret-value-12345" not in repr(exc_info.value)
+
+
+async def test_complete_stream_sanitizes_error_mid_stream() -> None:
+    provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
+    chunks = [
+        _FakeChunk(choices=[_FakeStreamChoice(_FakeDelta(content="partial"))]),
+        _FakeChunk(choices=[_FakeStreamChoice(_FakeDelta(content="more"))]),
+    ]
+    mock_create = AsyncMock(return_value=_FakeAsyncStream(chunks, raise_after=1))
+
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        from app.agent.providers.base import UpstreamError
+
+        with pytest.raises(UpstreamError) as exc_info:
+            async for _ in provider.complete_stream(_messages(), [], 100):
+                pass
+
+    assert "sk-dummy-secret-value-12345" not in repr(exc_info.value)
+
+
 async def test_complete_parses_usage_and_cached_tokens() -> None:
     provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
     mock_create = AsyncMock(return_value=_fake_chat_completion("hello there"))
@@ -207,20 +354,37 @@ def test_message_with_tool_calls_round_trips_to_openai_format() -> None:
 
 def test_provider_modules_import_only_via_base_or_factory() -> None:
     """Acceptance criteria (Issue #4): all other code imports only base.py
-    types (plus the get_provider factory) — never a concrete provider module
-    directly.
+    types (plus the get_provider factory) — never a concrete provider module,
+    or the openai SDK itself, directly.
     """
     repo_root = Path(__file__).parents[2]
-    pattern = r"from app\.agent\.providers\.(openai|fake) import"
-    result = subprocess.run(
-        ["grep", "-rlnE", "--include=*.py", pattern, "app/"],
+    allowed_files = {
+        "app/agent/providers/__init__.py",
+        "app/agent/providers/openai.py",
+    }
+
+    internal_pattern = r"from app\.agent\.providers\.(openai|fake) import"
+    internal_result = subprocess.run(
+        ["grep", "-rlnE", "--include=*.py", internal_pattern, "app/"],
         cwd=repo_root,
         capture_output=True,
         text=True,
     )
-    matches = [
+    internal_matches = [
         line
-        for line in result.stdout.splitlines()
-        if line and line not in ("app/agent/providers/__init__.py",)
+        for line in internal_result.stdout.splitlines()
+        if line and line != "app/agent/providers/__init__.py"
     ]
-    assert matches == []
+    assert internal_matches == []
+
+    sdk_pattern = r"^\s*(import openai|from openai)"
+    sdk_result = subprocess.run(
+        ["grep", "-rlnE", "--include=*.py", sdk_pattern, "app/"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    sdk_matches = [
+        line for line in sdk_result.stdout.splitlines() if line and line not in allowed_files
+    ]
+    assert sdk_matches == []

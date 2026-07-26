@@ -26,9 +26,28 @@ _MAX_RETRIES = 2
 _RETRYABLE_STATUS_MIN = 500
 
 
+def _sanitize(exc: APIStatusError | APIConnectionError) -> UpstreamError:
+    """Build a sanitized UpstreamError from only status_code and the
+    exception's class name. `exc` (and exc.request/exc.response, which can
+    carry the outbound Authorization header) must never be assigned to any
+    variable outside this function, logged, or interpolated into the
+    message — the message is a fixed generic string (Engineering Guide 4.8).
+    """
+    status = getattr(exc, "status_code", 599)
+    return UpstreamError(
+        status_code=status,
+        error_type=type(exc).__name__,
+        message="Upstream LLM provider error",
+    )
+
+
 class OpenAIProvider:
     def __init__(self, api_key: str, model: str) -> None:
-        self._client = AsyncOpenAI(api_key=api_key)
+        # max_retries=0: the SDK's own built-in retry loop is disabled so
+        # the hand-rolled retry below is the *only* retry mechanism — left
+        # enabled, the two would stack and "max 2 retries" (Issue #4) would
+        # silently become up to 9 real HTTP attempts.
+        self._client = AsyncOpenAI(api_key=api_key, max_retries=0)
         self._model = model
 
     async def complete(
@@ -46,31 +65,39 @@ class OpenAIProvider:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": _to_openai_messages(messages),
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = _to_openai_tools(tools)
-        stream = await self._client.chat.completions.create(**kwargs)
 
-        text_parts: list[str] = []
-        finish_reason = "stop"
-        usage = Usage(input_tokens=0, output_tokens=0)
-        async for chunk in stream:
-            chunk_finish, delta_text = _consume_chunk(chunk, text_parts)
-            if chunk_finish is not None:
-                finish_reason = chunk_finish
-            if delta_text:
-                yield StreamEvent(type="delta", delta=delta_text)
-            if chunk.usage is not None:
-                usage = _usage_from_openai(chunk.usage)
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+
+            text_parts: list[str] = []
+            tool_call_parts: dict[int, dict[str, str]] = {}
+            finish_reason = "stop"
+            usage = Usage(input_tokens=0, output_tokens=0)
+            async for chunk in stream:
+                chunk_finish, delta_text = _consume_chunk(chunk, text_parts, tool_call_parts)
+                if chunk_finish is not None:
+                    finish_reason = chunk_finish
+                if delta_text:
+                    yield StreamEvent(type="delta", delta=delta_text)
+                if chunk.usage is not None:
+                    usage = _usage_from_openai(chunk.usage)
+        except (APIStatusError, APIConnectionError) as exc:
+            # No retry here: an unknown amount of the stream may already
+            # have been yielded to the caller, so silently retrying would
+            # risk duplicated/out-of-order output. Sanitize and raise once.
+            raise _sanitize(exc) from None
 
         yield StreamEvent(
             type="done",
             response=LLMResponse(
                 text="".join(text_parts),
-                tool_calls=[],
+                tool_calls=_finalize_tool_calls(tool_call_parts),
                 usage=usage,
                 finish_reason=finish_reason,
             ),
@@ -83,7 +110,7 @@ class OpenAIProvider:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": _to_openai_messages(messages),
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
         }
         if tools:
             kwargs["tools"] = _to_openai_tools(tools)
@@ -94,17 +121,7 @@ class OpenAIProvider:
             except (APIStatusError, APIConnectionError) as exc:
                 status = getattr(exc, "status_code", 599)
                 retryable = status == 429 or status >= _RETRYABLE_STATUS_MIN
-                # Sanitize immediately: only status_code and the exception's
-                # class name are read here. exc (and exc.request/exc.response,
-                # which can carry the outbound Authorization header) is never
-                # assigned to any variable outside this except block, logged,
-                # or interpolated into the message — the message is a fixed
-                # generic string (Engineering Guide 4.8).
-                err = UpstreamError(
-                    status_code=status,
-                    error_type=type(exc).__name__,
-                    message="Upstream LLM provider error",
-                )
+                err = _sanitize(exc)
                 if not retryable or attempt == _MAX_RETRIES:
                     raise err from None
                 last_err = err
@@ -114,7 +131,9 @@ class OpenAIProvider:
 
 
 def _consume_chunk(
-    chunk: ChatCompletionChunk, text_parts: list[str]
+    chunk: ChatCompletionChunk,
+    text_parts: list[str],
+    tool_call_parts: dict[int, dict[str, str]],
 ) -> tuple[str | None, str | None]:
     if not chunk.choices:
         return None, None
@@ -122,7 +141,27 @@ def _consume_chunk(
     delta_text = choice.delta.content
     if delta_text:
         text_parts.append(delta_text)
+    for tc_delta in choice.delta.tool_calls or []:
+        entry = tool_call_parts.setdefault(tc_delta.index, {"id": "", "name": "", "arguments": ""})
+        if tc_delta.id:
+            entry["id"] = tc_delta.id
+        if tc_delta.function is not None:
+            if tc_delta.function.name:
+                entry["name"] = tc_delta.function.name
+            if tc_delta.function.arguments:
+                entry["arguments"] += tc_delta.function.arguments
     return choice.finish_reason, delta_text
+
+
+def _finalize_tool_calls(tool_call_parts: dict[int, dict[str, str]]) -> list[ToolCall]:
+    return [
+        ToolCall(
+            id=parts["id"],
+            name=parts["name"],
+            arguments=json.loads(parts["arguments"] or "{}"),
+        )
+        for _index, parts in sorted(tool_call_parts.items())
+    ]
 
 
 def _usage_from_openai(usage: object) -> Usage:
