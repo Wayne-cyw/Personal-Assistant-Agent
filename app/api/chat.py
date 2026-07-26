@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,9 +65,13 @@ def get_main_provider() -> LLMProvider:
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
+    http_request: Request,
     db: AsyncSession = Depends(get_db),
     provider: LLMProvider = Depends(get_main_provider),
 ) -> ChatResponse:
+    # Read by the logging middleware (Issue #6) after this handler returns.
+    http_request.state.session_id = request.session_id
+
     await get_or_create_session(db, request.session_id)
     history = await recent_messages(db, request.session_id, n=_HISTORY_ROWS)
 
@@ -87,6 +91,8 @@ async def chat(
     response = await provider.complete(
         messages=messages, tools=[], max_tokens=settings.max_tokens_per_turn
     )
+    http_request.state.llm_tokens_in = response.usage.input_tokens
+    http_request.state.llm_tokens_out = response.usage.output_tokens
 
     await append_message(db, request.session_id, "assistant", response.text)
 

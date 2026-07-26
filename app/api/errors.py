@@ -9,6 +9,7 @@ response, no matter where the exception originated.
 from __future__ import annotations
 
 import logging
+import traceback
 from enum import StrEnum
 
 from fastapi import FastAPI, Request, status
@@ -16,6 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.agent.providers.base import UpstreamError
+from app.safety.pii import redact
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,13 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
-        # Full traceback logged server-side only; never in the response body
-        # (Engineering Guide 4.8 — message is always the fixed generic string).
-        logger.exception("unhandled exception", exc_info=exc)
+        # Full traceback logged server-side only, never in the response body
+        # (Engineering Guide 4.8). The traceback is built and redacted
+        # explicitly rather than via logger.exception(exc_info=exc) — that
+        # would let Python's logging machinery format str(exc) and the raw
+        # traceback straight into the log unredacted, bypassing the safety
+        # net an arbitrary (not pre-sanitized like UpstreamError) exception
+        # needs (Issue #6).
+        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error("unhandled exception\n%s", redact(tb_text))
         return _error_response(ErrorCode.INTERNAL_ERROR)
