@@ -19,9 +19,11 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
+    event,
+    inspect,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, Mapper, mapped_column
 
 # Portable JSON: generic JSON everywhere, rendered as JSONB on Postgres.
 PortableJSON = JSON().with_variant(JSONB(), "postgresql")
@@ -33,6 +35,34 @@ def _utcnow() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+@event.listens_for(Base, "before_insert", propagate=True)
+@event.listens_for(Base, "before_update", propagate=True)
+def _reject_naive_datetimes(mapper: Mapper[object], _connection: object, target: object) -> None:
+    """Naive datetimes are banned (4.7 rule 2): SQLite silently tolerates
+    them but Postgres comparisons will bite. SQLAlchemy's DateTime(timezone=
+    True) does not enforce this on its own, so it's enforced here instead.
+
+    Only columns *changed in this flush* are checked. SQLite has no native
+    timezone-aware storage, so a previously-written aware datetime can come
+    back naive after a plain reload; re-validating unchanged columns on
+    every update would reject that harmless round-trip instead of catching
+    an actual newly-written naive value.
+    """
+    state = inspect(target)
+    assert state is not None
+    for column in mapper.columns:
+        if not (isinstance(column.type, DateTime) and column.type.timezone):
+            continue
+        if not state.attrs[column.key].history.has_changes():
+            continue
+        value = getattr(target, column.key)
+        if isinstance(value, datetime) and value.tzinfo is None:
+            raise ValueError(
+                f"{type(target).__name__}.{column.key} must be a "
+                "timezone-aware datetime, got a naive one"
+            )
 
 
 class SessionRow(Base):
