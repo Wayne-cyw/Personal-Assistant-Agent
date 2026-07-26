@@ -26,13 +26,19 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    # LLM provider
-    llm_provider: LLMProvider = Field(alias="LLM_PROVIDER")
-    llm_api_key: str = Field(alias="LLM_API_KEY")
-    llm_model: str | None = Field(default=None, alias="LLM_MODEL")
+    # LLM provider — OpenAI is the chosen primary provider for v1 (Engineering
+    # Guide Tech Stack); all three LLM roles are pinned to gpt-5.6-luna.
+    llm_provider: LLMProvider = Field(default=LLMProvider.OPENAI, alias="LLM_PROVIDER")
+    openai_api_key: str = Field(alias="OPENAI_API_KEY")
+    llm_model: str = Field(default="gpt-5.6-luna", alias="LLM_MODEL")
+    classifier_model: str = Field(default="gpt-5.6-luna", alias="CLASSIFIER_MODEL")
+    summarizer_model: str = Field(default="gpt-5.6-luna", alias="SUMMARIZER_MODEL")
 
-    # Database
-    database_url: str = Field(default="sqlite:///./personal_agent.db", alias="DATABASE_URL")
+    # Database — async driver required (Engineering Guide 4.7 rule 1): SQLite
+    # (aiosqlite) for local dev/tests, Postgres (asyncpg) in production.
+    database_url: str = Field(
+        default="sqlite+aiosqlite:///./agent.db", alias="DATABASE_URL"
+    )
 
     # Token / conversation-window budgets (Engineering Guide 4.3)
     max_tokens_per_turn: int = Field(default=2048, alias="MAX_TOKENS_PER_TURN")
