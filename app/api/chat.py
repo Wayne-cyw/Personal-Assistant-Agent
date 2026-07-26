@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _HISTORY_TURNS = 10
+_HISTORY_ROWS = _HISTORY_TURNS * 2  # each turn is one user row + one assistant row
 
 _PLACEHOLDER_SYSTEM_PROMPT = (
     "You are a helpful assistant. This is a placeholder system prompt; "
@@ -43,7 +44,7 @@ class ResponseType(StrEnum):
 
 
 class ChatRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(min_length=1, max_length=200)
     message: str = Field(min_length=1, max_length=2000)
     timezone: str | None = None
 
@@ -68,20 +69,25 @@ async def chat(
     provider: LLMProvider = Depends(get_main_provider),
 ) -> ChatResponse:
     await get_or_create_session(db, request.session_id)
-    history = await recent_messages(db, request.session_id, n=_HISTORY_TURNS)
+    history = await recent_messages(db, request.session_id, n=_HISTORY_ROWS)
 
     messages = [LLMMessage(role="system", content=_PLACEHOLDER_SYSTEM_PROMPT)]
-    messages.extend(LLMMessage(role=m.role, content=m.content) for m in history)  # type: ignore[arg-type]
+    messages.extend(
+        LLMMessage(role=m.role, content=m.content)  # type: ignore[arg-type]
+        for m in history
+        if m.role in ("user", "assistant")  # tool-role replay needs pairing logic; Issue #10
+    )
     messages.append(LLMMessage(role="user", content=request.message))
 
-    # If this raises UpstreamError, it propagates to the handler in
-    # app/api/errors.py; neither turn is persisted, since the user's message
-    # is only recorded once there's a reply to pair it with.
+    # The user's message is persisted before the provider call, per 4.3's
+    # "the DB log is complete" invariant — even a message that triggers an
+    # upstream failure (rate limit, outage) must remain in the audit log.
+    await append_message(db, request.session_id, "user", request.message)
+
     response = await provider.complete(
         messages=messages, tools=[], max_tokens=settings.max_tokens_per_turn
     )
 
-    await append_message(db, request.session_id, "user", request.message)
     await append_message(db, request.session_id, "assistant", response.text)
 
     return ChatResponse(reply=response.text, type=ResponseType.MESSAGE, data=None)
