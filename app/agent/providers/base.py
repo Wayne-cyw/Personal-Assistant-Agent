@@ -21,6 +21,11 @@ class ToolCall(BaseModel):
 
 
 class Message(BaseModel):
+    # Note for a future Anthropic provider: OpenAI's Chat Completions API
+    # tolerates consecutive same-role messages (e.g. two "user" rows in a
+    # row, which app/api/chat.py's history replay can produce after a
+    # failed turn); Anthropic's Messages API requires strict alternation
+    # and will reject that. Not an issue for v1 (OpenAI-only, Tech Stack).
     role: Literal["system", "user", "assistant", "tool"]
     content: str
     tool_call_id: str | None = None  # set when role == "tool"
