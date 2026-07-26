@@ -8,7 +8,9 @@ dependencies = [
   "uvicorn[standard]",
   "pydantic>=2",
   "pydantic-settings",
-  "sqlalchemy",
+  "sqlalchemy[asyncio]",
+  "aiosqlite",
+  "asyncpg",
   "httpx",
   "numpy",
 ]
@@ -43,3 +45,4 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
