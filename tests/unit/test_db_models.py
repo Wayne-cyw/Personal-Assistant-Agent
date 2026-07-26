@@ -2,9 +2,10 @@ import os
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
-from sqlalchemy import DateTime, String, inspect, text
+from sqlalchemy import DateTime, String, Table, inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -116,18 +117,34 @@ class _RenamedDateTimeColumnModel(Base):
     happened_at: Mapped[datetime] = mapped_column("occurred_at", DateTime(timezone=True))
 
 
-async def test_naive_datetime_guard_handles_renamed_datetime_column(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    async with session_factory() as db:
-        db.add(_RenamedDateTimeColumnModel(id="x", happened_at=datetime.now(UTC)))
-        await db.commit()  # must not raise KeyError (regression for the renamed-column bug)
+_renamed_datetime_table = cast(Table, _RenamedDateTimeColumnModel.__table__)
 
-    async with session_factory() as db:
-        naive_row = _RenamedDateTimeColumnModel(id="y", happened_at=datetime.now())  # noqa: DTZ005
-        db.add(naive_row)
-        with pytest.raises(ValueError, match="timezone-aware"):
-            await db.commit()
+# Deliberately detached from Base.metadata's create_all sweep: every other
+# fixture/test in this file (and the live-Postgres parity test) calls
+# `Base.metadata.create_all`, which would otherwise create/drop this stray
+# test-only table against every engine, including a real external Postgres.
+# The one test below creates/drops it explicitly instead.
+Base.metadata.remove(_renamed_datetime_table)
+
+
+async def test_naive_datetime_guard_handles_renamed_datetime_column(
+    engine: AsyncEngine, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(_renamed_datetime_table.create)
+    try:
+        async with session_factory() as db:
+            db.add(_RenamedDateTimeColumnModel(id="x", happened_at=datetime.now(UTC)))
+            await db.commit()  # must not raise KeyError (regression for the renamed-column bug)
+
+        async with session_factory() as db:
+            naive_row = _RenamedDateTimeColumnModel(id="y", happened_at=datetime.now())  # noqa: DTZ005
+            db.add(naive_row)
+            with pytest.raises(ValueError, match="timezone-aware"):
+                await db.commit()
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(_renamed_datetime_table.drop)
 
 
 async def test_naive_datetime_guard_handles_renamed_string_column(

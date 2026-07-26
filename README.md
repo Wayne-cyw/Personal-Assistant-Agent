@@ -18,12 +18,12 @@ Copy `.env.example` to `.env` and fill in values before running locally.
 
 ### Testing against local Postgres
 
-Unit tests run against a temp SQLite file by default. To point the same tests at a local Postgres (dialect parity — the real CI parity job lands in Issue #31):
+Unit tests run against a temp SQLite file by default. `test_tables_land_as_postgres_native_types` (dialect parity — the real CI parity job lands in Issue #31) is skipped unless `POSTGRES_TEST_URL` is set:
 
 ```
 docker run --rm -d --name personal-agent-pg \
   -e POSTGRES_USER=agent -e POSTGRES_PASSWORD=agent -e POSTGRES_DB=agent \
   -p 5432:5432 postgres:16
 
-DATABASE_URL=postgresql+asyncpg://agent:agent@localhost:5432/agent make test
+POSTGRES_TEST_URL=postgresql+asyncpg://agent:agent@localhost:5432/agent make test
 ```
