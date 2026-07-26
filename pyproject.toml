@@ -13,6 +13,7 @@ dependencies = [
   "asyncpg",
   "httpx",
   "numpy",
+  "openai",
 ]
 
 [project.optional-dependencies]
