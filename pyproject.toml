@@ -8,7 +8,9 @@ dependencies = [
   "uvicorn[standard]",
   "pydantic>=2",
   "pydantic-settings",
-  "sqlalchemy",
+  "sqlalchemy[asyncio]",
+  "aiosqlite",
+  "asyncpg",
   "httpx",
   "numpy",
 ]
