@@ -142,6 +142,8 @@ def _consume_chunk(
     if delta_text:
         text_parts.append(delta_text)
     for tc_delta in choice.delta.tool_calls or []:
+        if tc_delta.type is not None and tc_delta.type != "function":
+            continue  # mirrors _parse_response's non-streaming filter
         entry = tool_call_parts.setdefault(tc_delta.index, {"id": "", "name": "", "arguments": ""})
         if tc_delta.id:
             entry["id"] = tc_delta.id

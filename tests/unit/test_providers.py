@@ -158,9 +158,11 @@ class _FakeToolCallDelta:
         id: str | None = None,  # noqa: A002
         name: str | None = None,
         arguments: str | None = None,
+        type: str | None = "function",  # noqa: A002
     ):
         self.index = index
         self.id = id
+        self.type = type
         self.function = _FakeFunctionDelta(name, arguments) if (name or arguments) else None
 
 
