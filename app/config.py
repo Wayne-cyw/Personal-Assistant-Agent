@@ -63,5 +63,15 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, value: object) -> object:
+        # logging.Logger.setLevel requires exact-case names ("INFO", not
+        # "info"); normalizing here means every consumer gets a valid level
+        # regardless of how the env var was cased.
+        if isinstance(value, str):
+            return value.upper()
+        return value
+
 
 settings = Settings()  # type: ignore[call-arg]  # values come from env, not call args
