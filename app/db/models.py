@@ -44,23 +44,34 @@ def _reject_naive_datetimes(mapper: Mapper[object], _connection: object, target:
     them but Postgres comparisons will bite. SQLAlchemy's DateTime(timezone=
     True) does not enforce this on its own, so it's enforced here instead.
 
-    Only columns *changed in this flush* are checked. SQLite has no native
-    timezone-aware storage, so a previously-written aware datetime can come
-    back naive after a plain reload; re-validating unchanged columns on
-    every update would reject that harmless round-trip instead of catching
-    an actual newly-written naive value.
+    Only attributes *changed in this flush* are checked. SQLite has no
+    native timezone-aware storage, so a previously-written aware datetime
+    can come back naive after a plain reload; re-validating unchanged
+    columns on every update would reject that harmless round-trip instead
+    of catching an actual newly-written naive value.
+
+    Scope: this is an ORM unit-of-work event, so it only fires for writes
+    that go through the ORM (session.add/flush) — exactly what every
+    function in this module uses. It does NOT fire for Core-level
+    `session.execute(insert(...)/update(...))` statements. 4.7 rule 3
+    mandates the future rate-limit counter update use exactly such a Core
+    upsert statement (single round trip, insert-else-update, with a
+    RETURNING clause) for atomicity — whoever implements that write is
+    responsible for constructing `window_start` as timezone-aware by hand,
+    since this guard will not catch a mistake there.
     """
     state = inspect(target)
     assert state is not None
-    for column in mapper.columns:
+    for prop in mapper.column_attrs:
+        column = prop.columns[0]
         if not (isinstance(column.type, DateTime) and column.type.timezone):
             continue
-        if not state.attrs[column.key].history.has_changes():
+        if not state.attrs[prop.key].history.has_changes():
             continue
-        value = getattr(target, column.key)
+        value = getattr(target, prop.key)
         if isinstance(value, datetime) and value.tzinfo is None:
             raise ValueError(
-                f"{type(target).__name__}.{column.key} must be a "
+                f"{type(target).__name__}.{prop.key} must be a "
                 "timezone-aware datetime, got a naive one"
             )
 
@@ -113,7 +124,9 @@ class BookingState(Base):
     proposal_rounds: Mapped[int] = mapped_column(Integer, default=0)
     contact_name: Mapped[str | None] = mapped_column(Text, default=None)
     contact_email: Mapped[str | None] = mapped_column(Text, default=None)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class Booking(Base):
@@ -126,7 +139,7 @@ class Booking(Base):
     timezone_name: Mapped[str] = mapped_column("timezone", String)
     contact_name: Mapped[str] = mapped_column(Text)
     contact_email: Mapped[str] = mapped_column(Text)
-    gcal_event_id: Mapped[str | None] = mapped_column(String, default=None)
+    gcal_event_id: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String)  # tentative|cancelled
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
@@ -136,10 +149,12 @@ class KBChunk(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_file: Mapped[str] = mapped_column(String)
-    heading: Mapped[str | None] = mapped_column(String, default=None)
+    heading: Mapped[str] = mapped_column(String)
     content: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    embedding: Mapped[bytes] = mapped_column(LargeBinary)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class RateLimit(Base):

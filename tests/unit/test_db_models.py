@@ -1,18 +1,21 @@
+import os
 from collections.abc import AsyncGenerator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import DateTime, String, inspect, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import session as db_session
-from app.db.models import Base, SessionRow
+from app.db.models import Base, BookingState, SessionRow
 
 EXPECTED_TABLES = {
     "sessions",
@@ -97,6 +100,49 @@ async def test_json_columns_round_trip(
         assert fetched.pinned_facts_json == [{"fact": "likes rust"}]
 
 
+class _RenamedDateTimeColumnModel(Base):
+    """Test-only model regression-testing the naive-datetime guard against a
+    *DateTime* column whose Python attribute name differs from its DB column
+    name (BookingState/Booking rename `timezone` to `timezone_name`, but
+    that column is a String, so it never exercised this code path). Before
+    the fix, the guard indexed InstanceState.attrs (keyed by the Python
+    attribute name) using the Core column's DB name, raising KeyError on any
+    write to a renamed DateTime column.
+    """
+
+    __tablename__ = "_test_renamed_datetime_column_model"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    happened_at: Mapped[datetime] = mapped_column("occurred_at", DateTime(timezone=True))
+
+
+async def test_naive_datetime_guard_handles_renamed_datetime_column(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        db.add(_RenamedDateTimeColumnModel(id="x", happened_at=datetime.now(UTC)))
+        await db.commit()  # must not raise KeyError (regression for the renamed-column bug)
+
+    async with session_factory() as db:
+        naive_row = _RenamedDateTimeColumnModel(id="y", happened_at=datetime.now())  # noqa: DTZ005
+        db.add(naive_row)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await db.commit()
+
+
+async def test_naive_datetime_guard_handles_renamed_string_column(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """BookingState.timezone_name maps to DB column "timezone" — confirms an
+    ordinary write through a renamed *non-datetime* column still works.
+    """
+    async with session_factory() as db:
+        db.add(SessionRow(id="sess-1"))
+        await db.flush()
+        db.add(BookingState(session_id="sess-1", step="proposing", timezone_name="UTC"))
+        await db.commit()  # must not raise
+
+
 async def test_embedding_stored_as_bytes(
     engine: AsyncEngine, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
@@ -115,3 +161,39 @@ async def test_embedding_stored_as_bytes(
         )
         stored = result.scalar()
         assert stored == b"\x00\x01\x02"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("POSTGRES_TEST_URL"),
+    reason="set POSTGRES_TEST_URL (see README) to run against a local Postgres",
+)
+async def test_tables_land_as_postgres_native_types() -> None:
+    """Acceptance criteria (Issue #3): on Postgres, portable types render as
+    the expected native types — JSONB, BYTEA, TIMESTAMPTZ. Skipped unless
+    POSTGRES_TEST_URL is set (no Postgres available by default; the CI
+    parity job lands in Issue #31).
+    """
+    pg_engine = create_async_engine(os.environ["POSTGRES_TEST_URL"])
+    try:
+        async with pg_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        def _inspect(sync_conn: Connection) -> dict[str, str]:
+            insp = inspect(sync_conn)
+            columns = {c["name"]: str(c["type"]) for c in insp.get_columns("sessions")}
+            columns.update(
+                {f"kb_chunks.{c['name']}": str(c["type"]) for c in insp.get_columns("kb_chunks")}
+            )
+            return columns
+
+        async with pg_engine.connect() as conn:
+            types = await conn.run_sync(_inspect)
+
+        assert "JSONB" in types["pinned_facts_json"]
+        assert "TIMESTAMP" in types["created_at"] and "WITH TIME ZONE" in types["created_at"]
+        assert "BYTEA" in types["kb_chunks.embedding"]
+
+        async with pg_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+    finally:
+        await pg_engine.dispose()

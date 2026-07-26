@@ -13,9 +13,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.config import settings
 from app.db import session as db_session
 from app.db.models import Base
-from app.db.session import append_message, get_or_create_session, recent_messages
+from app.db.session import append_message, get_engine, get_or_create_session, recent_messages
 
 
 @pytest.fixture
@@ -110,13 +111,60 @@ async def test_concurrent_slow_write_does_not_block_concurrent_read(
     assert read_duration < 0.1
 
 
+async def test_postgres_pool_kwargs_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Postgres-only pool settings (4.7 rule 4) must reach create_async_engine
+    unchanged; verified by spying on the call rather than introspecting the
+    Pool object's private attributes. No live Postgres needed: constructing
+    an asyncpg engine does not connect.
+    """
+    captured: dict[str, object] = {}
+
+    def _spy(url: str, **kwargs: object) -> AsyncEngine:
+        captured.update(kwargs)
+        return create_async_engine(url, **kwargs)
+
+    monkeypatch.setattr(db_session, "create_async_engine", _spy)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://user:pw@localhost/db")
+    await db_session.dispose_engine()
+    try:
+        get_engine()
+    finally:
+        await db_session.dispose_engine()
+
+    assert captured == {
+        "pool_size": 5,
+        "max_overflow": 5,
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    }
+
+
+async def test_sqlite_gets_no_postgres_pool_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _spy(url: str, **kwargs: object) -> AsyncEngine:
+        captured.update(kwargs)
+        return create_async_engine(url, **kwargs)
+
+    monkeypatch.setattr(db_session, "create_async_engine", _spy)
+    monkeypatch.setattr(settings, "database_url", "sqlite+aiosqlite:///:memory:")
+    await db_session.dispose_engine()
+    try:
+        get_engine()
+    finally:
+        await db_session.dispose_engine()
+
+    assert captured == {}
+
+
 def test_no_sync_db_access_outside_session_module() -> None:
     """Grep-audit (Issue #3 acceptance criteria): no synchronous SQLAlchemy
-    engine, no `sqlite3` import, anywhere under app/ except db/session.py.
+    engine, no `sqlite3` import, and no dialect-specific SQL (PRAGMA / ON
+    CONFLICT) anywhere under app/ except db/session.py.
     """
     repo_root = Path(__file__).parents[2]
     result = subprocess.run(
-        ["grep", "-rlnE", "--include=*.py", r"sqlite3|create_engine\(", "app/"],
+        ["grep", "-rlnE", "--include=*.py", r"sqlite3|create_engine\(|PRAGMA|ON CONFLICT", "app/"],
         cwd=repo_root,
         capture_output=True,
         text=True,
