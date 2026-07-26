@@ -5,6 +5,7 @@ from collections.abc import Generator
 import httpx
 import pytest
 from fastapi import FastAPI, Request
+from starlette.types import Message, Receive, Scope, Send
 
 from app.api.errors import register_exception_handlers
 from app.middleware.logging import LoggingMiddleware, request_logger
@@ -137,6 +138,41 @@ async def test_unhandled_exception_never_leaks_secret_in_any_log_output(
 
     errors_log_output = "\n".join(f"{r.name}:{r.getMessage()}" for r in caplog.records)
     assert "sk-dummy-secret-value-99999" not in errors_log_output
+
+
+async def test_status_not_overwritten_when_response_already_started(
+    request_log: _ListHandler,
+) -> None:
+    """Regression test: a failure *after* headers are already sent (e.g. a
+    client disconnect mid-body-write) must log the real, already-observed
+    status — not be overwritten to a fabricated 500 that was never actually
+    produced or sent to anyone.
+    """
+
+    async def inner_app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise ConnectionResetError("client disconnected mid-body")
+
+    middleware = LoggingMiddleware(inner_app)
+    scope: Scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/streaming",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+    }
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: Message) -> None:
+        pass
+
+    with pytest.raises(ConnectionResetError):
+        await middleware(scope, receive, send)
+
+    entry = json.loads(request_log.records[-1].getMessage())
+    assert entry["status"] == 200
 
 
 def test_request_logger_emits_pure_json_lines() -> None:

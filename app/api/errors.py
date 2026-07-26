@@ -78,6 +78,14 @@ def register_exception_handlers(app: FastAPI) -> None:
         # traceback straight into the log unredacted, bypassing the safety
         # net an arbitrary (not pre-sanitized like UpstreamError) exception
         # needs (Issue #6).
+        #
+        # Unlike the UpstreamError handler above, this can't do construction-
+        # time (layer-1) sanitization: an arbitrary Exception has no typed,
+        # pre-sanitized shape to extract fields from — that's the whole
+        # reason Issue #5 wants the raw traceback here (server-side
+        # debuggability for a truly unexpected error). So this path leans
+        # entirely on redact() (layer 2), which is exactly the "safety net
+        # against a future mistake" role Issue #6 describes for it.
         tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         logger.error("unhandled exception\n%s", redact(tb_text))
         return _error_response(ErrorCode.INTERNAL_ERROR)

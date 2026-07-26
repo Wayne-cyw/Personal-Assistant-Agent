@@ -21,9 +21,11 @@ absolute outermost layer — outside every user middleware, including this
 one. A truly unhandled exception therefore propagates *past* this
 middleware's `send` wrapper entirely and is turned into a response further
 out, using a `send` this middleware never sees. The `except Exception` below
-records status 500 itself (the only outcome `ServerErrorMiddleware` ever
-produces here, per the registered handler in app/api/errors.py) before
-re-raising, so the log line is still written and still accurate.
+records status 500 itself, but only when `send_wrapper` hasn't already
+captured a real status — if headers were already sent before the exception
+(e.g. a client disconnect mid-body-write), `ServerErrorMiddleware` cannot
+invoke the handler or produce a 500 at all (headers are immutable once
+sent), so overwriting an already-observed status would log a fabricated one.
 """
 
 from __future__ import annotations
@@ -69,7 +71,8 @@ class LoggingMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         except Exception:
-            status_code = 500
+            if status_code is None:
+                status_code = 500
             raise
         finally:
             latency_ms = round((time.monotonic() - start) * 1000, 2)

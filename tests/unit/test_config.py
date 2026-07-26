@@ -133,6 +133,18 @@ def test_every_credential_and_model_name_is_env_overridable() -> None:
     assert settings.summarizer_model == "gpt-5.6-luna-summarizer-test"
 
 
+def test_log_level_normalized_to_uppercase() -> None:
+    """Regression test: logging.Logger.setLevel requires an exact-case name
+    ("INFO", not "info"); a lowercase LOG_LEVEL env var must not reach any
+    consumer un-normalized, or it crashes at import/setup time.
+    """
+    import logging
+
+    settings = _settings(LOG_LEVEL="debug")
+    assert settings.log_level == "DEBUG"
+    logging.getLogger("test_log_level_normalized").setLevel(settings.log_level)  # must not raise
+
+
 def test_os_environ_read_only_in_config_module() -> None:
     """Grep audit (Issue #2 acceptance criteria): grep -r "os.environ" app/
     must return only config.py — no other module may read the process

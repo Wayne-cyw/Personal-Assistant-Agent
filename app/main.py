@@ -23,10 +23,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Personal AI Assistant Agent", lifespan=lifespan)
 
 register_exception_handlers(app)
-# Added after exception handlers: middleware wraps outside FastAPI's
-# exception-handling layer, so call_next() here returns the final response
-# (including a 422/503/500 already converted by the handlers above) — the
-# log line always reflects the real status code sent to the client.
+# Registration order relative to add_middleware has no effect on request
+# handling — Starlette's build_middleware_stack() routes each handler by
+# exception type regardless of call order (see app/middleware/logging.py's
+# module docstring for why LoggingMiddleware still logs the correct status
+# for every path, including the generic-Exception one bound to
+# ServerErrorMiddleware, which always sits outside any add_middleware layer).
 app.add_middleware(LoggingMiddleware)
 app.include_router(chat_router)
 app.include_router(health_router)
