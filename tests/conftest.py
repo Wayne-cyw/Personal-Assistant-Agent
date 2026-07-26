@@ -8,5 +8,4 @@ Settings directly (with _env_file=None) rather than relying on this.
 
 import os
 
-os.environ.setdefault("LLM_PROVIDER", "anthropic")
-os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("OPENAI_API_KEY", "test-key")
