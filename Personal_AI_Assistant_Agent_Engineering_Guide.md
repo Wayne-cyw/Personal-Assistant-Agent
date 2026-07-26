@@ -1,6 +1,11 @@
 # Personal AI Assistant Agent — Engineering Documentation & Build Guide
 
-**Version:** 1.0
+**Version:** 1.5
+**Changes in 1.5:** Implemented the "secrets never touch a log, error message, or client response" rule end-to-end: Issue #1 adds a pre-commit secret scanner + GitHub push protection; Issue #4's `UpstreamError` is now constructed sanitized (no raw request/response object retained); Issue #6 expands log redaction into two enforced layers (construction-time sanitization + a regex-scrub safety net) with a regression test asserting a dummy key never survives the logging path; the API contract's error envelope (4.8) now states explicitly that `message` is always a fixed generic string per code, never an interpolated exception; Issue #34's launch checklist adds a one-time secrets sweep against the live deployment before go-live.
+**Changes in 1.4:** Made explicit (Issue #2 acceptance criteria) that every credential, connection string, and model name — `OPENAI_API_KEY`, `DATABASE_URL`, `LLM_MODEL`, `CLASSIFIER_MODEL`, `SUMMARIZER_MODEL` — is overridable purely via environment variable with no code change, and added a test asserting it. Added a new principle to 4.3 confirming the three LLM roles (main agent, classifier, summarizer) are fully isolated call sites — separate message arrays, separate prompt-cache entries, separate context windows — despite sharing one model string in v1; cross-referenced from Issues #11 and #25.
+**Changes in 1.3:** **All three LLM roles (main agent, input classifier, memory summarizer) pinned to a single model, `gpt-5.6-luna`**, for v1 — Tech Stack, Issues #2, #10, #11, #25 updated; `LLM_MODEL` bare-alias-defaults-to-Sol pricing trap noted explicitly in config. Corrected the prompt-caching discount figure from ~50% to the accurate ~90% for GPT-5.6's automatic prefix caching (4.3, cost table). Left a documented, config-only upgrade path to `gpt-5.6-terra` for the main loop alone if Luna's tool-calling reliability proves insufficient in testing (#10) — classifier and summarizer stay on Luna regardless.
+**Changes in 1.2:** **Postgres is now the production database** (managed, free-tier, async via `asyncpg`); SQLite remains for local dev and unit tests only. Section 4.7's operational configuration rewritten for the dual-dialect setup; Issues #3, #31, #34 updated (pooling, SSL, CI parity job, provisioning, backups); Postgres-specific concerns (connection limits, serverless idle, type mapping, migrations) addressed inline.
+**Changes in 1.1:** OpenAI (official `openai` SDK) fixed as the primary LLM provider · async SQLite (`aiosqlite`) + WAL/pragmas/indexes made mandatory (4.7, #3) · single-worker deployment constraint made explicit for the per-session lock (4.3, #11, #34) · hosting persistence/cold-start caveats surfaced (Tech Stack, #34) · input classifier redesigned to run concurrently, adding no serial latency (4.6, #25) · streaming SSE endpoint `POST /v1/chat/stream` added to the contract and plan (4.8, new Issue #36).
 **Companion document:** `Personal_AI_Assistant_Agent_PRD_v2.md`
 **Audience:** Any engineer. This document is self-contained — reading it end to end should be enough to understand the full system and build it from an empty repository.
 
@@ -50,15 +55,16 @@ There is **no frontend in v1**. The system is a hosted HTTPS API, exercised by a
 | Language | Python 3.11+ | Ecosystem fit for LLM + API work; type hints used throughout |
 | Web framework | FastAPI + Uvicorn | Async-native, automatic OpenAPI docs, Pydantic validation built in |
 | Validation/schemas | Pydantic v2 | Single source of truth for API request/response shapes and internal models |
-| LLM | Anthropic Claude API (tool use) *or* OpenAI API (function calling) | Both supported behind a thin provider interface; pick one by end of Milestone 2 (see Issue #10) |
-| Embeddings | Provider embedding API (e.g., `voyage-3-lite` or `text-embedding-3-small`) | Knowledge base is tiny (< 100 chunks); no local model needed |
-| Vector store | SQLite table + in-memory cosine similarity (NumPy) | At < 100 chunks, a vector DB is overkill; brute-force search is < 1 ms |
-| Database | SQLite via SQLAlchemy (Postgres-compatible schema) | Zero-ops for a solo project; SQLAlchemy keeps a Postgres migration trivial |
+| LLM | **OpenAI API (primary provider)** via the official `openai` Python SDK, using function calling | Chosen as the main provider. Still wrapped behind the thin provider interface (`providers/base.py`) so switching providers later touches one file — but v1 ships with `openai.py` only |
+| Models (v1) | **`gpt-5.6-luna` for everything** — main agent loop, input classifier, and memory summarizer all pinned to the same model string | Single-model strategy for v1: Luna is priced and positioned for exactly these workloads (chat, classification, lightweight agentic tool use, summarization) at the cheapest GPT-5.6 tier ($1/$6 per 1M tokens). One model to prompt-engineer around, one set of quirks to learn, lowest possible token cost while validated. If the adversarial suite (#35) or real usage shows Luna under-performing on tool-calling reliability in the main loop specifically, `LLM_MODEL` can be bumped to `gpt-5.6-terra` with no code change — the classifier/summarizer stay on Luna regardless, since those roles are Luna's strike zone |
+| Embeddings | OpenAI `text-embedding-3-small` (same SDK, same API key) | Knowledge base is tiny (< 100 chunks); no local model needed; one provider account for everything |
+| Vector store | DB table (`kb_chunks`) + in-memory cosine similarity (NumPy) | At < 100 chunks, a vector DB (or even `pgvector`) is overkill; embeddings are loaded into memory at startup and brute-force search is < 1 ms — the DB is just durable storage for them |
+| Database | **Postgres in production** (free managed instance: Neon / Supabase / Railway / Render PG) via SQLAlchemy **async engine (`asyncpg`)**; **SQLite (`aiosqlite`) for local dev & unit tests only** | Managed Postgres survives redeploys, is backed up by the provider, and kills the ephemeral-disk problem outright. SQLite stays for instant, zero-setup tests. One codebase, dialect-neutral — see 4.7's "Database operational configuration" for the rules that keep both working |
 | Calendar | Google Calendar API (`google-api-python-client` + OAuth 2.0 refresh token) | Free/busy read + event write, scoped to the owner's one calendar |
 | Rate limiting | Custom middleware backed by DB counters | Simple, inspectable, survives restarts; no Redis dependency at this scale |
 | Testing | pytest + httpx test client; a YAML-driven adversarial suite | The adversarial suite is a first-class deliverable, not an afterthought |
 | Dev tooling | ruff (lint/format), mypy (types), pre-commit | Keeps the portfolio codebase clean |
-| Hosting | Render / Railway / Fly.io | Free-tier friendly, deploy-from-GitHub, HTTPS out of the box |
+| Hosting | Render / Railway / Fly.io + a free managed Postgres, **app and DB in the same region** | Deploy-from-GitHub, HTTPS out of the box. The ephemeral-filesystem problem is solved by Postgres being external — redeploys lose nothing. Remaining caveats: free web tiers sleep on idle (30–60 s cold start for the first visitor), and serverless Postgres tiers (e.g. Neon) also scale to zero, adding a short first-query wake-up — both handled in Issue #34. Co-locate app and DB regions or every query pays cross-region latency |
 | Secrets | Environment variables only (`.env` locally, host-provided in prod) | Never committed, never sent to any client |
 
 **Explicitly not used:** LangChain/LlamaIndex (hand-rolled loop instead), Redis (DB counters suffice), Docker in dev (optional for deploy), any frontend tooling.
@@ -92,8 +98,8 @@ There is **no frontend in v1**. The system is a hosted HTTPS API, exercised by a
                                  │                   │                        
                                  ▼                   ▼                        
                         ┌──────────────┐   ┌──────────────────┐   ┌─────────┐
-                        │ Claude/OpenAI│   │ Google Calendar  │   │ SQLite  │
-                        │     API      │   │ API (owner only) │   │   DB    │
+                        │  OpenAI API  │   │ Google Calendar  │   │Postgres │
+                        │  (primary)   │   │ API (owner only) │   │(managed)│
                         └──────────────┘   └──────────────────┘   └─────────┘
 ```
 
@@ -155,6 +161,7 @@ Key properties:
 
 - **Refusals are HTTP 200.** An in-scope refusal is a normal conversational outcome, not an error. Only infrastructure problems (rate limit, malformed request, upstream outage) produce error status codes.
 - **The backend is stateless per request** beyond the `session_id` lookup. All conversation memory (rolling window, summary, pinned profile) and booking state live in the DB.
+- **Streaming shares this exact lifecycle.** `POST /v1/chat/stream` (4.8, Issue #36) runs the same middleware, classifier, loop, and persistence — only the *delivery* of the final answer differs (SSE deltas + a terminal `done` event carrying the same envelope). One code path for correctness, two for transport.
 - **Turn zero is deterministic and owner-authored.** The first message of every new session is a prefix message written verbatim by the owner (not generated): it identifies the agent as AI, gives a short "about me" introduction of the owner, states what the agent can help with, and soft-asks for the visitor's name and LinkedIn. Zero LLM tokens are spent producing it.
 
 ### 4.2 The Orchestration Loop
@@ -194,7 +201,7 @@ Three things make this loop safe and predictable:
 
 ### 4.3 Conversation Memory & Logging
 
-The agent's memory is split into layers with different lifetimes and different token costs. Two guiding rules: **the DB log is complete; the LLM context is minimal** — and **the context prefix is engineered to be cache-stable**, because provider prompt caching prices cached input tokens at roughly 10% of normal, making cache behavior the single largest cost lever in the whole system.
+The agent's memory is split into layers with different lifetimes and different token costs. Two guiding rules: **the DB log is complete; the LLM context is minimal** — and **the context prefix is engineered to be cache-stable**, because provider prompt caching discounts cached input tokens heavily — on GPT-5.6 (our pinned model family), cached input is billed at roughly 10% of the standard rate, automatically, for prompt prefixes above the model's caching threshold — making cache behavior one of the largest cost levers in the whole system. Cache hits also *reduce latency*, not just cost.
 
 ```
                       ┌─────────────────────────────────────────────────┐
@@ -211,6 +218,8 @@ The agent's memory is split into layers with different lifetimes and different t
 ```
 
 **Context ordering is volatility-sorted, and this is load-bearing.** Caching works on prefixes: everything before the first changed byte is billed at the cached rate. So the layers are ordered from least- to most-frequently-changing, and the ordering is fixed — an implementer who reorders it "harmlessly" silently forfeits the discount. Corollary: the system prompt stays **static**. Do not dynamically slim it per booking step to "save tokens" — a slightly longer static prompt that caches beats a minimal dynamic one that doesn't. (Step-specific booking guidance is injected further down, with the booking context, where change is expected.)
+
+**The three LLM roles are fully isolated call sites, by design — not just by using the same model string.** The main agent loop (4.2), the input classifier (4.6), and the memory summarizer (below) each build their own `messages` array from scratch, with their **own system prompt in `prompts.py`, their own prefix, and their own cache namespace.** Sharing `gpt-5.6-luna` as the model for all three (Tech Stack) does not mean they share a context window, a conversation history, or a prompt cache entry — OpenAI's prefix caching keys on the literal byte-for-byte prompt prefix of *each individual request*, so the classifier's one-line prompt, the summarizer's structured-JSON prompt, and the main loop's persona-plus-tools prompt each cache independently the moment they're reused turn over turn, with zero cross-contamination risk between roles. This is also a safety property, not just a cost one: the classifier and summarizer never see the main loop's tool definitions or booking state, and the main loop never sees the classifier's raw abuse-detection prompt — each role's context is exactly what that role needs and nothing more, which keeps prompt-injection blast radius contained to a single call site (4.6).
 
 **Layer — Pinned visitor profile (never evicted).** Basic visitor facts — **name** above all, plus LinkedIn, email, timezone, and at most `PINNED_FACTS_MAX` (5) short stated facts — live in dedicated session columns and are injected into *every* prompt as a compact structured block. Because they sit outside the rolling window, the agent can never "forget" the visitor's name no matter how long the conversation runs. Capture is **tool-based, not extraction-based**: the agent has a `save_visitor_info(name?, linkedin?, fact?)` tool it calls when the visitor volunteers information, so pinning costs zero extra LLM calls (it happens inside a turn already being paid for) and validation/dedup/caps happen in code — consistent with the system-wide rule that side effects live in tools. Booking contact fields (name/email from the booking flow) also feed the profile via their existing validated paths.
 
@@ -240,6 +249,8 @@ Structured beats prose here for concrete reasons: the summarizer *merges field-w
 
 **Per-session concurrency (bug-in-waiting without it).** Two in-flight requests on the same `session_id` — an impatient double-send, a client retry — race on the booking state machine and on window/summary bookkeeping. Turn processing is therefore **serialized per session**: a per-session lock is taken for the duration of a turn; a concurrent request waits briefly (a few seconds) and, if still blocked, receives the standard 429 envelope. Simple, and it turns a heisenbug into a non-event.
 
+**⚠ The lock assumes a single process — this is a hard deployment constraint.** The per-session lock is an in-process `asyncio.Lock`. If the app is ever run with multiple uvicorn workers (`--workers 2+`) or horizontally scaled, the serialization guarantee silently evaporates and the booking-state/memory races return. The rule for v1: **the app runs as exactly one uvicorn worker, everywhere, always** — enforced in the deploy config (Issue #34) and documented in `docs/deploy.md`. This is not a real limitation at this traffic scale — the LLM call dominates every turn, so extra workers would buy nothing measurable. Note that Postgres (v1.2) removes the *database-side* obstacle to multiple workers, but the constraint stands regardless: the in-process lock is the blocker. If multi-process operation is ever genuinely needed, replace the lock first — Postgres makes this straightforward via `pg_advisory_xact_lock(hashtext(session_id))` (a transaction-scoped advisory lock, no extra table needed) — and only then scale workers. Until that swap is done, one worker, always.
+
 **Reconciliation: versioned summaries and reload-on-disagreement.** A summary is only trustworthy for the range it claims to cover — `summary_through_message_id` is that boundary, and it doubles as the summary's *version*. Trusting a versioned summary forever, with no way to notice it went stale or was compressed wrong, is a gap: the fix is not to have the model reconcile two versions of memory in its head (that compounds errors), but to detect disagreement and go back to the source of truth.
 
 Three triggers, cheapest first:
@@ -254,7 +265,7 @@ On any of the first two triggers: `reload_and_reconcile(session, scope)` fetches
 
 | Mechanism | Saving |
 |---|---|
-| Prompt caching: static system prompt + volatility-sorted, append-only prefix | ~90% discount on the bulk of input tokens, most turns — the dominant lever |
+| Prompt caching: static system prompt + volatility-sorted, append-only prefix | ~90% discount on cached input tokens (GPT-5.6's automatic prefix caching) across most turns, plus lower latency — the dominant lever |
 | Chunked eviction w/ hysteresis | cache stays warm between evictions; summarizer called per chunk, not per turn |
 | Output brevity rule + `CHAT_MAX_OUTPUT_TOKENS` | output tokens cost 3–5× input; response length is a first-class control |
 | Turn-zero prefix is static | 0 LLM tokens for every session's first message |
@@ -327,7 +338,7 @@ State transitions happen **only** inside `execute_tool` / handler code. The stat
 Defense in depth, ordered by strength:
 
 1. **Structural (strongest): scoped tools.** The agent's only capabilities are read-only KB search, free/busy reads, and tentative-event creation gated by the state machine. There is nothing dangerous to trick it into.
-2. **Input classifier.** A cheap, fast LLM call (or the first N tokens of the main call, decided in Issue #27) labels each inbound message `on_topic | off_topic | abusive` before the main loop runs. Off-topic → templated friendly refusal without ever reaching the main agent. Abusive → terse refusal + session flag + owner notification.
+2. **Input classifier.** A cheap, fast LLM call labels each inbound message `on_topic | off_topic | abusive` before the main loop's *result* is used. Off-topic → templated friendly refusal without ever reaching the main agent. Abusive → terse refusal + session flag + owner notification. **Latency rule: the classifier must never add a serial LLM round trip to the happy path.** A naive sequential design (classify → then start the main turn) puts 300–800 ms in front of every message. Instead, the classifier call is launched **concurrently** with the other turn-start work (loading memory, embedding the query) via `asyncio.gather`; the main provider call is only dispatched once the label comes back `on_topic`, so blocked messages still spend zero main-loop tokens, but the classifier latency overlaps rather than stacks. Issue #25 specifies this, plus the piggyback alternative to evaluate.
 3. **Prompt hardening.** The system prompt: defines the narrow persona and scope; instructs the model to treat all user text and all tool results as data, never as instructions; never reveals its own contents (any request for "your instructions/system prompt" is refused by policy and covered in the test suite).
 4. **Rate & cost limits.** Per-session and per-IP message limits, a separate stricter limit on booking attempts, a max-tokens cap per turn, and a per-session lifetime token budget.
 5. **PII discipline.** Only name/LinkedIn/email are ever collected; logs store PII in dedicated columns (not blobs) so retention/deletion is queryable; secrets live in env vars; no PII in URLs.
@@ -378,6 +389,20 @@ rate_limits     (key TEXT PK,                                  -- "sess:{id}" | 
 
 Retention: a scheduled cleanup script deletes `messages` and `sessions` older than the configured retention period (default 90 days); `bookings` persist until the owner deletes them. At this project's traffic scale, storage cost is negligible — verbatim text logging runs low-single-digit MB/month even under active use, and the 90-day rolling window caps growth rather than letting it accumulate indefinitely; the dominant real cost in this system is LLM tokens, not disk, which is why the token/caching strategy (4.3) gets the bulk of the optimization attention.
 
+**Database operational configuration (mandatory).** The database strategy is **Postgres in production, SQLite for local dev and unit tests**. One codebase serves both: models and repository functions are dialect-neutral SQLAlchemy, and everything dialect-specific lives in `app/db/session.py`. The rules, wired in Issue #3 and asserted by tests:
+
+1. **Async everywhere.** FastAPI is async-native; a synchronous DB driver blocks the event loop, meaning one slow query stalls *all* concurrent requests — including the rate-limit check that runs in front of everything. Production uses SQLAlchemy's async engine with `asyncpg` (`DATABASE_URL=postgresql+asyncpg://...`); dev/tests use `aiosqlite` (`sqlite+aiosqlite:///...`). No sync DB calls anywhere in the request path (`grep`-auditable, like the `os.environ` rule).
+2. **Portable types.** Column types are chosen to mean the same thing on both dialects, via SQLAlchemy's portable type layer: JSON columns use the generic `JSON` type (rendered `JSONB` on Postgres via a dialect variant — the `*_json` columns in the schema above); the embedding column uses `LargeBinary` (`BLOB` on SQLite, `BYTEA` on Postgres); **all timestamps are timezone-aware UTC** (`DateTime(timezone=True)` → `TIMESTAMPTZ` on Postgres). Naive datetimes are banned — SQLite silently tolerates them, Postgres comparisons will bite.
+3. **Portable SQL only.** The rate-limit counter update stays a single atomic `INSERT ... ON CONFLICT DO UPDATE ... RETURNING count` — valid on both dialects — one round trip on the hottest path in the system. No dialect-specific SQL outside `session.py`; anything Postgres-only (e.g. advisory locks, if ever needed for multi-worker) is a deliberate, documented exception.
+4. **Connection pooling (Postgres-specific, important on free tiers).** Free managed Postgres has low connection caps and may drop idle connections (serverless tiers scale to zero). Engine settings: small pool (`pool_size=5, max_overflow=5` — one worker needs no more), `pool_pre_ping=True` (transparently replaces dead idle connections instead of erroring on first use after a sleep), `pool_recycle=300`, and SSL as the provider requires. If the provider offers a pooled endpoint (Supabase pooler, Neon pooled connection string), prefer it.
+5. **SQLite pragmas (dev/test-side, dialect-guarded).** On SQLite connections only, a `connect` event hook sets `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`, so local behavior (concurrent reads, FK enforcement) stays as close to Postgres as SQLite allows. A no-op on Postgres.
+6. **Indexes.** Explicit indexes on the hot lookups: `messages(session_id, id)` (history load), `messages(created_at)` and `sessions(last_seen_at)` (retention scan), `rate_limits(window_start)` (GC).
+7. **Parity is verified, not assumed.** Unit tests run on SQLite for speed; the integration suite **also runs against real Postgres in CI** (service container, Issue #31). Subtle dialect differences — type coercion, transaction semantics, FK enforcement — are exactly the bugs that only show up there. The rule: no deploy on a Postgres-untested commit.
+8. **Startup resilience.** The app retries the initial DB connection with backoff (a serverless Postgres waking up, or the DB briefly unavailable during a deploy, must not crash-loop the app); `/health.db` runs a `SELECT 1` through the pool.
+9. **Migrations.** `create_all` on startup is fine while the schema is only ever *added to* (new nullable columns/tables). The moment a change would alter or drop anything on a production DB holding real data, introduce Alembic (Issue #34 carries this as a documented trigger, not an up-front cost).
+
+With these in place, per-turn DB cost is a handful of sub-millisecond indexed reads plus one batched write (plan for ~1 ms per query of network hop to the co-located managed Postgres — still nothing next to the LLM call, which dominates latency by orders of magnitude; that is exactly where the bottleneck should live).
+
 ### 4.8 API Contract
 
 **`POST /v1/chat`**
@@ -414,11 +439,27 @@ Errors (non-200 only for infrastructure problems):
 ```json
 { "error": { "code": "rate_limited", "message": "Too many requests. Try again in a minute." } }
 ```
-Codes: `rate_limited` (429), `invalid_request` (422), `upstream_unavailable` (503), `internal_error` (500).
+Codes: `rate_limited` (429), `invalid_request` (422), `upstream_unavailable` (503), `internal_error` (500). **`message` is always a short, hand-written, generic string per code — never the raw exception, never an f-string built from the underlying error object.** `upstream_unavailable` and `internal_error` in particular are tempting places to accidentally interpolate `str(exc)` for a "helpful" detail; that exception can carry request headers (see Issue #4/#6). The handler maps `UpstreamError`/any exception to one of the four fixed messages by `code` alone — no exception content ever reaches the response body.
+
+**`POST /v1/chat/stream`** — the streaming variant (Server-Sent Events). Same request body, same semantics, same middleware (rate limits, classifier, state machine), different delivery: the reply streams token-by-token so a future chat widget can render as the model generates. Event protocol:
+
+```
+event: delta      data: {"text": "Yes — three years of R"}     ← repeated; text fragments only
+event: done       data: {reply, type, data}                    ← the FULL 4.8 envelope, verbatim
+event: error      data: {"error": {code, message}}             ← same error shape as non-streaming
+```
+
+Streaming rules:
+
+- **The `done` event is the contract.** It carries the exact same envelope `POST /v1/chat` would have returned; `delta` events are a rendering convenience. A client that ignores every `delta` and reads only `done` behaves identically to a non-streaming client — this is what keeps the two endpoints trivially consistent (and testable against each other, Issue #36).
+- **Deterministic responses don't fake-stream.** Turn-zero prefix, templated refusals, rate-limit and budget messages are emitted as a single `done` event immediately — no token theater.
+- **Only the final text answer streams.** Tool-execution phases (RAG, slot generation) happen silently as today; deltas begin when the model starts its user-facing answer. (An optional `event: status` heartbeat — e.g. `{"stage": "checking_calendar"}` — is a nice-to-have flag in Issue #36, not a commitment.)
+- **Persistence is unchanged.** The turn is persisted once, complete, exactly as in the non-streaming path; a client disconnect mid-stream doesn't corrupt state (the server finishes the turn).
+- The OpenAI provider implementation exposes `complete_stream(...)` (the SDK's `stream=True`) alongside `complete(...)`; the non-streaming endpoint keeps using `complete`.
 
 **`GET /health`** → `{"status": "ok", "llm": "ok", "calendar": "ok", "db": "ok"}` (component checks; used by the host and to surface OAuth breakage early).
 
-**Contract rules:** the path is versioned (`/v1/`); new `type` values and new optional fields are non-breaking; streaming, if ever added, will be a separate SSE endpoint. CORS origins come from the `ALLOWED_ORIGINS` env var (empty in v1).
+**Contract rules:** the path is versioned (`/v1/`); new `type` values and new optional fields are non-breaking; streaming is additive — `/v1/chat` remains the canonical endpoint and `/v1/chat/stream` (Issue #36) mirrors it. CORS origins come from the `ALLOWED_ORIGINS` env var (empty in v1).
 
 ---
 
@@ -431,12 +472,13 @@ personal-agent/
 │   ├── config.py              # Pydantic Settings — all env vars declared here
 │   ├── api/
 │   │   ├── chat.py            # /v1/chat handler
+│   │   ├── chat_stream.py     # /v1/chat/stream SSE handler (Issue #36; thin wrapper over chat.py's core)
 │   │   └── health.py          # /health handler
 │   ├── agent/
 │   │   ├── loop.py            # orchestration loop (4.2)
 │   │   ├── memory.py          # pinned profile + token-budgeted window + chunked summarizer + session lock (4.3)
 │   │   ├── prompts.py         # system prompt + step-specific guidance + summarizer prompt
-│   │   └── providers/         # llm provider interface + anthropic.py / openai.py
+│   │   └── providers/         # llm provider interface (base.py) + openai.py (primary, official SDK) + fake.py
 │   ├── tools/
 │   │   ├── registry.py        # tool defs, arg validation, execute_tool dispatch
 │   │   ├── rag.py             # rag_search
@@ -500,6 +542,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 - [ ] Create the repo with the structure from Section 5 (empty modules with docstrings are fine).
 - [ ] `pyproject.toml` with runtime deps (`fastapi`, `uvicorn`, `pydantic`, `pydantic-settings`, `sqlalchemy`, `httpx`, `numpy`) and dev deps (`pytest`, `ruff`, `mypy`, `pre-commit`).
 - [ ] Configure ruff + mypy; add pre-commit hooks; add a `Makefile` or task runner with `run`, `test`, `lint`.
+- [ ] **Add a pre-commit secret scanner** (`gitleaks` or `detect-secrets`) to the hook chain — blocks any commit whose diff contains a key-shaped string, not just files literally named `.env`. This catches the leak paths `.gitignore` alone misses: a key pasted into a fixture, a debug print left in a diff, a config file edited by hand. Also enable GitHub's built-in secret scanning + push protection on the repo once it's pushed (free, one settings toggle) as a second, server-side backstop.
 - [ ] `.env.example` listing every env var this doc mentions (fill in as milestones progress), `.gitignore` covering `.env`, `*.db`.
 - [ ] `README.md` stub linking to this document.
 
@@ -515,13 +558,14 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **What this builds:** A single typed source of truth for all configuration, so nothing ever reads `os.environ` directly and missing config fails loudly at startup.
 
 **Tasks:**
-- [ ] `app/config.py`: a Pydantic `Settings` class covering (initially): `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `DATABASE_URL`, `MAX_TOKENS_PER_TURN`, `WINDOW_HIGH_TOKENS`, `WINDOW_LOW_TOKENS`, `ALLOWED_ORIGINS`, `LOG_LEVEL`. Later issues extend this class — never add config anywhere else.
+- [ ] `app/config.py`: a Pydantic `Settings` class covering (initially): `LLM_PROVIDER` (default `"openai"` — the chosen primary provider), `OPENAI_API_KEY`, `LLM_MODEL` (default `"gpt-5.6-luna"` — pinned explicitly; never rely on a bare family alias, since an un-pinned GPT-5.6 call defaults to the far pricier Sol tier), `CLASSIFIER_MODEL` and `SUMMARIZER_MODEL` (both default `"gpt-5.6-luna"` too — v1 runs one model for all three roles; see Tech Stack — added here as placeholders even though the classifier and summarizer aren't built until #25/#11, so the naming is consistent from day one), `DATABASE_URL` (async driver required, see 4.7 — local default `sqlite+aiosqlite:///./agent.db`; production is always `postgresql+asyncpg://...` from the managed provider, SSL params included), `MAX_TOKENS_PER_TURN`, `WINDOW_HIGH_TOKENS`, `WINDOW_LOW_TOKENS`, `ALLOWED_ORIGINS`, `LOG_LEVEL`. Later issues extend this class — never add config anywhere else.
 - [ ] Load from environment with `.env` support locally; validate at import time.
 - [ ] Unit test: missing required var → clear startup error naming the var.
 
 **Acceptance criteria:**
 - App refuses to start with a missing/invalid required setting, and the error says which one.
 - `grep -r "os.environ" app/` returns only `config.py`.
+- **Every credential, connection string, and model name is overridable purely via environment variable, with no code change** — this is the whole point of centralizing config in `Settings`. Concretely, verified by a test that sets `OPENAI_API_KEY`, `DATABASE_URL`, `LLM_MODEL`, `CLASSIFIER_MODEL`, and `SUMMARIZER_MODEL` to arbitrary test values via env and asserts `Settings()` picks up every one of them — nothing hardcoded, nothing requiring a redeploy of source. This is what makes rotating a leaked key, pointing at a different Postgres instance, or swapping `gpt-5.6-luna` → `gpt-5.6-terra` for one role (per #10's escape hatch) a one-line env change on the host, not a code change.
 
 ---
 
@@ -531,14 +575,18 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **What this builds:** The full schema from Section 4.7 (all tables, even ones used later — the schema is cheap to create now and avoids migrations mid-build) plus helpers to load/save conversation history.
 
 **Tasks:**
-- [ ] `app/db/models.py`: SQLAlchemy models for `sessions`, `messages`, `booking_states`, `bookings`, `kb_chunks`, `rate_limits`, exactly as specified in 4.7.
-- [ ] `app/db/session.py`: engine creation from `DATABASE_URL`, table creation on startup, request-scoped session helper.
-- [ ] Repository functions: `get_or_create_session(session_id)`, `append_message(...)`, `recent_messages(session_id, n)`.
-- [ ] Unit tests for the repository functions against a temp SQLite file.
+- [ ] `app/db/models.py`: SQLAlchemy models for `sessions`, `messages`, `booking_states`, `bookings`, `kb_chunks`, `rate_limits`, exactly as specified in 4.7 — using the **portable types** from 4.7's rules (generic `JSON` with a `JSONB` Postgres variant for `*_json` columns, `LargeBinary` for embeddings, `DateTime(timezone=True)` with UTC everywhere; a test rejects any naive datetime reaching the DB layer) and **including the explicit indexes** (`messages(session_id, id)`, `messages(created_at)`, `sessions(last_seen_at)`, `rate_limits(window_start)`).
+- [ ] `app/db/session.py`: **async engine** (`create_async_engine`) built from `DATABASE_URL`, working with both `postgresql+asyncpg` (prod) and `sqlite+aiosqlite` (dev/tests); table creation on startup with connect-retry-and-backoff (4.7 rule 8); request-scoped async session helper. All repository functions are `async def`; no sync `Session` exists in the codebase.
+- [ ] Postgres engine options per 4.7 rule 4: `pool_size=5`, `max_overflow=5`, `pool_pre_ping=True`, `pool_recycle=300`, provider-required SSL — applied only on the Postgres dialect.
+- [ ] SQLite pragmas via a `connect` event hook (dialect-guarded, no-op on Postgres): `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`.
+- [ ] Repository functions: `get_or_create_session(session_id)`, `append_message(...)`, `recent_messages(session_id, n)` — portable SQL only (4.7 rule 3).
+- [ ] Unit tests for the repository functions against a temp SQLite file; one test asserts the pragmas are in effect (`PRAGMA journal_mode` returns `wal`). A `docker compose` snippet (or `docker run` one-liner) for a local Postgres is added to the README so the same tests can be pointed at Postgres locally — the CI parity job lands in #31.
+- [ ] Guard test/lint rule: no synchronous SQLAlchemy engine, no `sqlite3` import, and no dialect-specific SQL outside `db/session.py` anywhere under `app/` (grep-style audit, like the `os.environ` rule in #2).
 
 **Acceptance criteria:**
-- Starting the app creates the DB with all six tables.
+- Starting the app creates the DB with all six tables and all indexes on **both** backends: SQLite locally (WAL on — a `-wal` file appears) and a local Dockerized Postgres (tables land as `JSONB`/`BYTEA`/`TIMESTAMPTZ` — verified via `\d` inspection in the test).
 - Messages written for one `session_id` never appear in another session's history (test asserts this).
+- A deliberately slow write in one task does not block a concurrent read in another (event-loop non-blocking asserted with an async test).
 
 ---
 
@@ -548,12 +596,12 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **What this builds:** The abstraction that keeps the rest of the codebase provider-agnostic: one interface, one concrete client, tool-use support from day one (even though no tools exist yet).
 
 **Tasks:**
-- [ ] `app/agent/providers/base.py`: `class LLMProvider(Protocol)` with `complete(messages: list[Message], tools: list[ToolDef], max_tokens: int) -> LLMResponse`, where `LLMResponse` exposes `.text`, `.tool_calls`, `.usage`.
-- [ ] Implement the chosen primary provider (`anthropic.py` or `openai.py`) mapping the native API to these types, including tool-call parsing.
-- [ ] Provider selected by `LLM_PROVIDER` setting via a small factory.
-- [ ] A `FakeProvider` for tests: returns scripted responses/tool calls.
-- [ ] Retry-with-backoff on 429/5xx (max 2 retries); raise a typed `UpstreamError` otherwise.
-- [ ] **Prompt-caching support:** the message types carry an optional cache-breakpoint marker; the Anthropic implementation maps it to `cache_control` (OpenAI caches prefixes automatically). `LLMResponse.usage` reports cached vs uncached input tokens separately so caching effectiveness is measurable in #6's logs — this is the plumbing the memory system's cost model (4.3) depends on.
+- [ ] `app/agent/providers/base.py`: `class LLMProvider(Protocol)` with `complete(messages: list[Message], tools: list[ToolDef], max_tokens: int) -> LLMResponse` **and** `complete_stream(...) -> AsyncIterator[StreamEvent]` (text deltas, then a final `LLMResponse`; consumed by Issue #36 — defined now so the interface never changes). `LLMResponse` exposes `.text`, `.tool_calls`, `.usage`.
+- [ ] **Implement `openai.py` — the primary and only real provider in v1** — using the official `openai` Python SDK (`AsyncOpenAI` client, Chat Completions with `tools`/function calling): map messages and tool schemas to the native format, parse `tool_calls` back into the interface types, and implement `complete_stream` via the SDK's `stream=True`.
+- [ ] Provider selected by `LLM_PROVIDER` setting via a small factory (`"openai"` is the default and the only real entry; the factory exists so an `anthropic.py` can be added later without touching call sites).
+- [ ] A `FakeProvider` for tests: returns scripted responses/tool calls (and scripted delta sequences for stream tests).
+- [ ] Retry-with-backoff on 429/5xx (max 2 retries); raise a typed `UpstreamError` otherwise. Use the SDK's async client throughout — no sync OpenAI calls in the request path. **`UpstreamError` is constructed with only `{status_code, error_type, message}`** — a plain, sanitized string message with no interpolated request/response object — and the handler that builds it never stores the underlying `httpx`/SDK exception (which carries the outbound `Authorization` header) anywhere it could later be logged or serialized to a client; it's inspected once, for the fields needed, then discarded. This is the source-side half of the logging safeguard in Issue #6.
+- [ ] **Prompt-caching plumbing:** OpenAI caches prompt prefixes ≥ 1024 tokens automatically — no request-side markers needed — but effectiveness must be *measurable*: surface `usage.prompt_tokens_details.cached_tokens` in `LLMResponse.usage` as cached vs uncached input, logged in #6. This is the feedback signal the memory system's cache-stable prefix design (4.3) is verified against. (Keep the optional cache-breakpoint field on the message types as a no-op for OpenAI, so an Anthropic implementation can map it to `cache_control` later.)
 
 **Acceptance criteria:**
 - A smoke script sends "say hello" through the interface and prints a real completion.
@@ -582,15 +630,18 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 #### Issue #6 — Structured logging middleware
 **Labels:** `infra` · **Depends on:** #5
 
-**What this builds:** JSON-line request logging — the observability backbone the safety metrics (Section 2 of the PRD) are computed from.
+**What this builds:** JSON-line request logging — the observability backbone the safety metrics (Section 2 of the PRD) are computed from. This issue is also where the "secrets never touch a log or error message" rule from 4.9 gets enforced in code, not just stated as a principle.
 
 **Tasks:**
 - [ ] `app/middleware/logging.py`: per request log `{ts, session_id, ip, path, status, latency_ms, llm_tokens_in/out}`.
 - [ ] Log tool calls and turn tags when they exist (fields present but null for now).
-- [ ] Never log secrets; message *content* lives in the DB, not the request log (log message length instead).
+- [ ] **Never log secrets — enforced two ways, not one.** (1) By construction: nothing that touches a log call is ever built from a raw secret value — logging code only ever receives already-sanitized fields (message *length*, not content; token counts, not prompts). (2) As defense-in-depth against a future mistake: a `redact()` helper wraps every log sink (the JSON logger, and any `print`/traceback output) and regex-scrubs anything matching a key-shaped pattern (`sk-...`, `AIza...`, bearer tokens, `postgresql://user:PASSWORD@...` connection-string credentials) before it's written, replacing it with `[REDACTED]`. This is a safety net, not the primary control — task (1) is.
+- [ ] **Exception logging is sanitized, not raw.** A caught `httpx`/OpenAI SDK exception can carry the outbound request's headers (including `Authorization: Bearer <key>`) inside `exception.request` or `response.request`. The logging middleware's exception handler never calls `str(exc)` or logs a raw exception object directly — it extracts only `{status_code, error_type, message}` through a typed wrapper (the `UpstreamError` from Issue #4) and discards the underlying request/response objects before anything reaches a log line or a traceback print.
+- [ ] Unit test: construct a fake exception carrying a fake `Authorization` header with a dummy key value, pass it through the logging path, assert the captured log output does not contain the dummy value anywhere (headers, message, or stringified repr) — this is a regression guard on the two rules above, not just a hope.
 
 **Acceptance criteria:**
 - One JSON line per request, parseable by `jq`, with latency and token usage populated on chat calls.
+- The exception-scrubbing test passes: no log line, ever, contains an API key, DB credential, or bearer token value, even when the underlying error object had one.
 
 ---
 
@@ -652,7 +703,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 #### Issue #10 — Real orchestration loop with tool-call execution
 **Labels:** `agent` · **Depends on:** #8
 
-**What this builds:** The loop from 4.2 — the component that turns "an LLM call" into "an agent". Proven with a trivial `get_current_date` tool before any real tool exists. **This issue also finalizes the provider decision** (whichever provider's tool-use proved more reliable in #4/#10 testing becomes the default; record the decision in the README).
+**What this builds:** The loop from 4.2 — the component that turns "an LLM call" into "an agent". Proven with a trivial `get_current_date` tool before any real tool exists. The provider and model are already pinned (OpenAI, `gpt-5.6-luna` — see Tech Stack and #4); this issue validates that Luna's function calling behaves reliably enough inside the loop for a budget-tier model, and records any model-choice notes in the README. If Luna's tool-call reliability proves shaky here, that's the signal to consider `gpt-5.6-terra` for the main loop only (config-only change, classifier/summarizer stay on Luna) — not a reason to change the interface.
 
 **Tasks:**
 - [ ] `app/tools/registry.py`: `ToolDef` (name, description, Pydantic args schema), `execute_tool(call, ctx)` dispatch with argument validation; invalid args → structured error returned *to the model* as the tool result (so it can self-correct), logged server-side.
@@ -662,7 +713,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 
 **Acceptance criteria:**
 - CLI: "what day is it?" → model calls the tool → correct date in the reply; loop-cap test passes.
-- Provider decision recorded; `LLM_PROVIDER` still switches cleanly.
+- Luna's function-calling reliability notes (any quirks observed at this price tier) recorded in the README; the provider factory still resolves cleanly from `LLM_PROVIDER` / `LLM_MODEL`.
 
 ---
 
@@ -675,9 +726,9 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 - [ ] `app/agent/memory.py`: `load_memory(session) -> Memory{pinned_profile, summary, rolling_window}` and `persist_turn(...)` which appends to the `messages` log, updates pinned fields, and runs the eviction check. Context assembly enforces the fixed volatility-sorted order from 4.3 (system → pinned+summary → window → current message) — add a comment explaining *why* the order is load-bearing (cache prefixes) so no one "tidies" it later.
 - [ ] **Pinned profile:** assembled from `sessions.visitor_name / visitor_linkedin / pinned_facts_json` + booking-state contact/timezone; rendered as a compact structured block (~50 tokens). Register a `save_visitor_info(name?, linkedin?, fact?)` tool: the model calls it when the visitor volunteers info (zero extra LLM calls); code validates (LinkedIn URL format, length clamps, character sanitization), deduplicates, and caps facts at `PINNED_FACTS_MAX` (5). Booking-flow contact fields feed the profile through their existing validated paths.
 - [ ] **Token-budgeted window with hysteresis:** count window tokens with the provider tokenizer (or a calibrated estimate); on `window_tokens > WINDOW_HIGH_TOKENS` (default 3000), evict oldest turns down to `WINDOW_LOW_TOKENS` (default 1500) in one batch. Strip tool payloads in the window to one-line receipts on the *next* request after they occur (their structured content is already persisted).
-- [ ] **Structured summarizer:** on eviction, call a cheap/small model (`SUMMARIZER_MODEL`; own hardened prompt in `prompts.py` — conversation text is strictly data, an injection surface) with `(existing_summary_json, evicted_turns)` → merged JSON in the fixed shape `{visitor_context, open_questions, commitments, notes}`, capped at `SUMMARY_MAX_TOKENS` (150), validated against a Pydantic schema in code (malformed output → retry once → skip gracefully). Explicitly excludes pinned facts and all booking state. Update `sessions.summary_json` + `summary_through_message_id`. Runs post-response — zero user-facing latency.
+- [ ] **Structured summarizer:** on eviction, call the cheap model (`SUMMARIZER_MODEL`, `gpt-5.6-luna` per #2; own hardened prompt in `prompts.py`, own message array, own cache entry, separate from the main loop and classifier per 4.3 — conversation text is strictly data, an injection surface) with `(existing_summary_json, evicted_turns)` → merged JSON in the fixed shape `{visitor_context, open_questions, commitments, notes}`, capped at `SUMMARY_MAX_TOKENS` (150), validated against a Pydantic schema in code (malformed output → retry once → skip gracefully). Explicitly excludes pinned facts and all booking state. Update `sessions.summary_json` + `summary_through_message_id`. Runs post-response — zero user-facing latency.
 - [ ] **Incrementality guarantee:** summarizer input is only the turns between `summary_through_message_id` and the new window start — each turn is folded at most once, ever; never re-read the whole conversation.
-- [ ] **Per-session concurrency guard:** serialize turn processing per `session_id` (per-session lock; a concurrent request waits up to a few seconds, then receives the standard 429 envelope). Covers the booking state machine as well as memory bookkeeping.
+- [ ] **Per-session concurrency guard:** serialize turn processing per `session_id` via an in-process `asyncio.Lock` registry (a concurrent request waits up to a few seconds, then receives the standard 429 envelope). Covers the booking state machine as well as memory bookkeeping. **This lock is only correct in a single process** (see 4.3): add a startup guard that logs a prominent warning (or refuses to start, behind a setting) if more than one worker is detected, and a code comment pointing at the single-worker deployment rule so nobody scales workers "for performance" and silently breaks it.
 - [ ] **Reconciliation (versioned summary, reload-on-disagreement):** extend the input classifier's labels to detect explicit visitor corrections of stated context; add an optional `summary_conflict: bool` field to the model's structured output so it can self-flag a noticed contradiction against the live window; implement `reload_and_reconcile(session, scope)` — fetches raw messages up to `summary_through_message_id` (or the disputed sub-range), regenerates just that scope from raw data via the summarizer, overwrites `summary_json` in place without advancing `summary_through_message_id`; log every reconciliation event (trigger type, before/after summary) for later review.
 - [ ] **Scheduled drift audit:** every `SUMMARY_AUDIT_INTERVAL` evictions (default 3), regenerate the summary from scratch off the full raw range and log a diff against the incrementally-merged version — a canary, not an auto-fix.
 - [ ] **Cache plumbing check:** with #4's cache-breakpoint support, place the breakpoint after the pinned+summary block; verify via `LLMResponse.usage` that cached-input tokens dominate on non-eviction turns.
@@ -737,7 +788,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **Tasks:**
 - [ ] `app/rag/ingest.py`: heading-aware chunker (split on `##`, merge tiny sections, hard-split > 500-token sections; keep `source_file` + `heading` metadata).
 - [ ] Embeddings client behind a small interface (`embed(texts) -> list[vector]`); add `EMBEDDINGS_MODEL` / key to config.
-- [ ] Write chunks + embeddings (float32 BLOB) to `kb_chunks`; full-replace per source file on re-run (idempotent).
+- [ ] Write chunks + embeddings (float32 bytes in the `LargeBinary` column — `BYTEA` on Postgres, see 4.7 rule 2) to `kb_chunks`; full-replace per source file on re-run (idempotent).
 - [ ] `scripts/ingest_kb.py` entrypoint; document "run after every knowledge/ edit" in the README; run automatically on deploy (revisited in #34).
 - [ ] Unit tests for the chunker (boundaries, merging, metadata).
 
@@ -934,7 +985,9 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **What this builds:** The pre-loop gate from 4.1/4.6: every message labeled `on_topic | off_topic | abusive` before the main agent runs; off-topic and abusive messages never touch the main loop.
 
 **Tasks:**
-- [ ] `app/safety/classifier.py`: a minimal, cheap LLM call (smallest/fastest model, its own hardened prompt, output constrained to a **single label token** — `A`/`B`/`C` with `max_tokens=1`; input is the current message plus a one-line context hint, never conversation history) — evaluated in this issue against the alternative (piggybacking on the main call); pick by measured accuracy + latency and record the decision.
+- [ ] `app/safety/classifier.py`: a minimal, cheap LLM call using `CLASSIFIER_MODEL` (`gpt-5.6-luna` per #2; its own hardened prompt, output constrained to a **single label token** — `A`/`B`/`C` with `max_tokens=1`; input is the current message plus a one-line context hint, never conversation history). This is a fully separate call site from the main loop (4.3) — its own message array, own prefix, own cache entry; it never receives the main loop's tools, system prompt, or booking state.
+- [ ] **No serial round trip on the happy path (see 4.6):** launch the classifier concurrently with turn-start work (memory load; and in RAG turns, alongside the query embedding) via `asyncio.gather`; gate only the *dispatch of the main provider call* on the label. Measure and log classifier latency separately; target: added wall-clock latency on `on_topic` turns ≈ 0 (fully overlapped) and never > ~100 ms.
+- [ ] Evaluate the piggyback alternative (main model emits the label as the first token of its own structured output, eliminating the extra call entirely) against the concurrent-separate-call design; pick by measured accuracy + effective latency + cost and record the decision. Note the trade-off: piggybacking spends main-loop tokens on junk turns; the separate call keeps blocked messages at near-zero cost.
 - [ ] Booking-related and meta questions about the agent itself ("how were you built?") are **on-topic** by definition — encode this in the classifier prompt.
 - [ ] `app/safety/refusals.py`: templated responses — friendly redirect (off-topic), terse decline (abusive). No LLM involvement in refusal text.
 - [ ] Handler wiring: off_topic → refusal + turn tag, done; abusive → refusal + tag + `sessions.flagged = true` + owner notification (via #22's notifier); on_topic → proceed to loop.
@@ -943,6 +996,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 
 **Acceptance criteria:**
 - CLI: "write me a Python scraper" → instant templated redirect, no main-loop tokens spent; turn tags visible in the `messages` table; classifier test set passes the bar.
+- Measured via #6's logs: median added latency of the classifier on `on_topic` turns is ~0 (overlapped), demonstrating the concurrent design works.
 
 ---
 
@@ -981,7 +1035,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 
 ### Milestone 6 — API contract finalization
 
-*Goal: the contract from 4.8 is frozen, documented, and frontend-ready.*
+*Goal: the contract from 4.8 is frozen, documented, and frontend-ready — including the streaming endpoint, so the future widget can render token-by-token from day one.*
 
 ---
 
@@ -1020,12 +1074,32 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **What this builds:** The document a stranger integrates from — the PRD's Milestone-6 exit criterion.
 
 **Tasks:**
-- [ ] `docs/api.md`: base URL, versioning policy, both endpoints, full request/response/error schemas with copy-pasteable curl examples for every `type`, session-handling guidance for a browser client (localStorage UUID pattern), timezone parameter semantics, rate-limit behavior, and the streaming-is-additive forward-compatibility note.
+- [ ] `docs/api.md`: base URL, versioning policy, all three endpoints (`/v1/chat`, `/v1/chat/stream`, `/health`), full request/response/error schemas with copy-pasteable curl examples for every `type`, the SSE event protocol (`delta`/`done`/`error`) with an `EventSource`/`fetch`-streaming browser example, session-handling guidance for a browser client (localStorage UUID pattern), timezone parameter semantics, rate-limit behavior, and the note that `done` always carries the full non-streaming envelope.
 - [ ] Verify FastAPI's generated `/docs` (OpenAPI) matches; fix schema annotations where it doesn't.
 - [ ] Have someone (or yourself, cold, a week later) build a 20-line HTML/fetch page against `docs/api.md` alone as a validation exercise — **not** shipped, just proof the docs suffice.
 
 **Acceptance criteria:**
 - The validation exercise succeeds without reading any source code.
+
+---
+
+#### Issue #36 — Streaming endpoint: `POST /v1/chat/stream` (SSE)
+**Labels:** `api`, `agent` · **Depends on:** #28 (envelope frozen), #4 (`complete_stream` in the provider interface)
+
+**What this builds:** The streaming variant of the chat endpoint per 4.8 — token-by-token delivery for the future widget, without forking the conversation logic. Perceived latency matters more than actual latency in chat; this is the single biggest UX lever available before a frontend exists.
+
+**Tasks:**
+- [ ] Refactor the `/v1/chat` handler so its core turn logic (session load → classifier → loop → persist → envelope) is a shared function; `chat.py` and `chat_stream.py` are thin transports over it. **One code path for correctness, two for delivery** — the state machine, safety layer, and memory system must not know or care which transport is in use.
+- [ ] `app/api/chat_stream.py`: FastAPI `StreamingResponse` with `media_type="text/event-stream"`; wire the provider's `complete_stream` (OpenAI SDK `stream=True`) for the *final answer phase only* — tool-call iterations run non-streamed exactly as in 4.2; deltas begin when the model produces user-facing text.
+- [ ] Emit the event protocol from 4.8: `delta` fragments, then exactly one `done` carrying the full standard envelope (assembled from the accumulated text + the turn's `type`/`data`), or one `error` in the standard error shape. Deterministic responses (turn-zero prefix, templated refusals, rate-limit/budget messages) emit a single `done` immediately.
+- [ ] Disconnect safety: if the client drops mid-stream, the server still completes the turn — full persistence, state transitions, and summarization run to completion; nothing is half-written. (The per-session lock from #11 already prevents a reconnect racing the in-flight turn.)
+- [ ] All middleware applies identically: rate limits count a stream as one message; the classifier gates it the same way; token accounting (#12) uses the final usage from the streamed response.
+- [ ] CLI support: `scripts/chat_cli.py --stream` renders deltas live — this is also the manual test rig.
+- [ ] Tests (FakeProvider scripted deltas): (a) delta sequence concatenates to exactly the `done.reply`; (b) `done` envelope is byte-identical to what `/v1/chat` returns for the same scripted turn (the consistency property, asserted directly); (c) refusal and rate-limit paths emit a single `done`/`error` with no deltas; (d) mid-stream disconnect → turn fully persisted; (e) a booking-proposal turn streams prose deltas and delivers `data.slots` in `done`.
+
+**Acceptance criteria:**
+- `curl -N` against `/v1/chat/stream` shows tokens arriving incrementally and a final `done` event matching the documented envelope.
+- The equivalence test (same turn, both endpoints, identical final envelope) passes — proving streaming stayed additive.
 
 ---
 
@@ -1042,7 +1116,7 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 
 **Tasks:**
 - [ ] Flows (FakeProvider + FakeCalendar, real DB + middleware): intro → Q&A → answered; unanswerable Q&A → honest decline; full booking happy path; booking with one rejection round; negotiation-cap → widen → email fallback; race-condition re-proposal; off-topic refusal mid-booking; abusive → flag; rate limits (chat + booking); token budget exhaustion; **long-conversation memory** (name given in turn 1, enough chat to cross the window high-water mark, name still recalled and structured summary populated correctly); **concurrent double-send** (two simultaneous requests on one session serialize cleanly — no booking-state or memory corruption).
-- [ ] Wire into CI (GitHub Actions): lint + mypy + unit + integration on every push.
+- [ ] Wire into CI (GitHub Actions): lint + mypy + unit + integration on every push. **The integration suite runs twice: once on SQLite (fast feedback) and once against a Postgres service container** (`services: postgres:16`, `DATABASE_URL=postgresql+asyncpg://...`) — this is the dialect-parity gate from 4.7 rule 7. A commit whose integration tests haven't passed on Postgres is not deployable.
 
 **Acceptance criteria:**
 - Full suite green in CI in < 2 minutes; a deliberately introduced contract violation fails the build.
@@ -1086,10 +1160,15 @@ Labels used: `infra`, `agent`, `rag`, `booking`, `safety`, `api`, `testing`, `de
 **What this builds:** The hosted HTTPS API — the actual deliverable of the phase.
 
 **Tasks:**
-- [ ] Choose host (Render/Railway/Fly.io); deploy from GitHub `main`; configure every env var from `.env.example`; persistent volume (or managed Postgres) for the DB — **verify the SQLite file survives redeploys**, else switch `DATABASE_URL` to Postgres (schema already compatible, #3).
+- [ ] **Provision the managed Postgres** (Neon / Supabase / Railway / Render PG — free tier is fine) **in the same region as the app host**; use the pooled connection string if the provider offers one; set `DATABASE_URL` (with SSL params) as the prod env var. Choose host (Render/Railway/Fly.io); deploy from GitHub `main`; configure every env var from `.env.example`. **Verify a redeploy loses no data** (create a session, redeploy, session still there) — with an external Postgres this should be trivially true; the check confirms nothing is accidentally pointing at a local SQLite file in prod (add a startup log line printing the active DB dialect + host, secrets redacted, so misconfiguration is visible in the first ten seconds).
+- [ ] **Run exactly one uvicorn worker** (`--workers 1`, and no host-level autoscaling to multiple instances) — the in-process per-session lock requires it (4.3, #11). Postgres removes the DB-side obstacle to scaling, but the lock is the blocker: record in `docs/deploy.md` that relaxing this requires swapping the lock for `pg_advisory_xact_lock` first.
+- [ ] **Backups:** confirm what the provider's free tier actually gives (retention window, point-in-time limits — free tiers are often 1–7 days only); add a scheduled `pg_dump` (host cron or GitHub Action, output to private storage) as a cheap independent backup of the system-of-record `messages`/`bookings` tables; document the restore procedure in `docs/deploy.md` and **test one restore**.
+- [ ] **Migrations trigger documented** (4.7 rule 9): `create_all` remains fine while changes are additive; note in `docs/deploy.md` that the first destructive/altering schema change on prod data must introduce Alembic before it ships.
+- [ ] Account for idle sleep on **both** free tiers: the web app (30–60 s cold start) and serverless Postgres scale-to-zero (first-query wake-up, absorbed by `pool_pre_ping` but adding latency). Measure the combined cold-start; either use the uptime monitor's pings (#33) as a keep-warm or accept and document the first-visitor delay.
 - [ ] Run KB ingestion as a release/startup step; schedule `cleanup_retention.py` on the host.
-- [ ] Smoke-test the deployed URL: health, intro, Q&A, and one full real booking end-to-end.
+- [ ] Smoke-test the deployed URL: health, intro, Q&A, one full real booking end-to-end, and a streamed turn via `/v1/chat/stream` (`curl -N` shows live deltas through the host's proxy — some proxies buffer SSE; verify and fix headers if needed, e.g. `X-Accel-Buffering: no`).
 - [ ] Run the full adversarial suite (#32) and groundedness suite (#16) **against production**; record scores.
+- [ ] **Secrets sweep, once, against the live deployment:** force one upstream error (e.g. a temporarily invalid model name) and confirm the resulting `/v1/chat` error envelope and server logs contain no key/token/credential value (the regression test in #6 covers this in CI; this step confirms it holds true against the real host's logging pipeline too, not just the local test harness — host log aggregators sometimes reformat or duplicate output in ways a local test can't see). Also confirm `git log` on the deployed commit has no secret ever committed (the pre-commit scanner from #1 should have prevented this, but check once before going live).
 - [ ] Document deploy + rollback steps in `docs/deploy.md`.
 
 **Acceptance criteria:**
@@ -1124,8 +1203,8 @@ M3  #13 → #14 → #15 → #16
 M4  #17 ─┐
     #18 ─┴→ #19 → #20 → #21 → #22 → #23
 M5  #24, #25, #26 → #27
-M6  #28 → #30, #29
+M6  #28 → #29, #30, #36
 M7  #31, #32, #33 → #34 → #35
 ```
 
-**Estimated effort (solo, part-time):** M1 ≈ a weekend · M2 ≈ 1 week of evenings (the memory system in #11 is the bulk of it) · M3 ≈ a weekend · M4 ≈ the longest, 1.5–2 weeks of evenings (OAuth + state machine + flow wiring) · M5 ≈ 1 week · M6 ≈ 2 evenings · M7 ≈ a weekend + suite iteration. Treat these as pacing hints, not commitments.
+**Estimated effort (solo, part-time):** M1 ≈ a weekend · M2 ≈ 1 week of evenings (the memory system in #11 is the bulk of it) · M3 ≈ a weekend · M4 ≈ the longest, 1.5–2 weeks of evenings (OAuth + state machine + flow wiring) · M5 ≈ 1 week · M6 ≈ 3–4 evenings (the handler refactor + SSE streaming in #36 is most of the addition) · M7 ≈ a weekend + suite iteration. Treat these as pacing hints, not commitments.
