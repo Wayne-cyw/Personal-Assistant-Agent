@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # return the fallback message, with no startup-time error to catch it.
     max_iterations: int = Field(default=5, ge=1, alias="MAX_ITERATIONS")
 
+    # Conversation memory (Engineering Guide 4.3, Issue #11).
+    summary_max_tokens: int = Field(default=150, ge=1, alias="SUMMARY_MAX_TOKENS")
+    pinned_facts_max: int = Field(default=5, ge=0, alias="PINNED_FACTS_MAX")
+    summary_audit_interval: int = Field(default=3, ge=1, alias="SUMMARY_AUDIT_INTERVAL")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by

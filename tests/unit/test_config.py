@@ -95,6 +95,9 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "SUMMARIZER_MODEL",
         "DATABASE_URL",
         "MAX_ITERATIONS",
+        "SUMMARY_MAX_TOKENS",
+        "PINNED_FACTS_MAX",
+        "SUMMARY_AUDIT_INTERVAL",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -107,6 +110,9 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.summarizer_model == "gpt-5.6-luna"
     assert settings.database_url == "sqlite+aiosqlite:///./agent.db"
     assert settings.max_iterations == 5
+    assert settings.summary_max_tokens == 150
+    assert settings.pinned_facts_max == 5
+    assert settings.summary_audit_interval == 3
 
 
 def test_max_iterations_zero_or_negative_rejected() -> None:
