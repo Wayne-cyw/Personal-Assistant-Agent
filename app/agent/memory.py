@@ -178,14 +178,23 @@ async def persist_turn(
     user_message: str,
     assistant_reply: str,
     tool_events: list[ToolEvent],
+    *,
+    user_already_persisted: bool = False,
 ) -> bool:
     """Append the turn to the messages log and run the eviction check.
     Returns True if the window has crossed WINDOW_HIGH_TOKENS and eviction
     should be scheduled — the actual summarization call runs separately
     (`run_eviction`), post-response, so this never adds LLM latency to the
     turn the caller is about to respond to.
+
+    `user_already_persisted=True` skips the user-message append: 4.3's "the
+    DB log is complete" invariant requires the user's message to survive
+    even a provider failure, so app/api/chat.py appends it eagerly before
+    calling the provider at all, rather than only here after a successful
+    reply.
     """
-    await append_message(db, session_id, "user", user_message)
+    if not user_already_persisted:
+        await append_message(db, session_id, "user", user_message)
     for event in tool_events:
         if not event.persist_receipt:
             continue

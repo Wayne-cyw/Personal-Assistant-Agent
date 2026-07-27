@@ -15,15 +15,43 @@ from app.agent.providers.base import (
     LLMResponse,
     Message,
     StreamEvent,
+    ToolCall,
     ToolDef,
     UpstreamError,
     Usage,
 )
 from app.agent.providers.fake import FakeProvider
-from app.api.chat import get_main_provider
+from app.api.chat import get_main_provider, get_summarizer_provider
 from app.db.models import Base, SessionRow
 from app.db.session import get_db
 from app.main import app
+
+
+class _OrderTrackingProvider:
+    """Sleeps before returning, appending to a shared `order` list around
+    the sleep — used to prove two concurrent requests actually serialize
+    (the per-session lock, Issue #11) rather than interleave. FakeProvider
+    resolves synchronously and can't create a race window on its own.
+    """
+
+    def __init__(self, order: list[str], seconds: float = 0.05) -> None:
+        self._order = order
+        self._seconds = seconds
+
+    async def complete(
+        self, messages: list[Message], tools: list[ToolDef], max_tokens: int
+    ) -> LLMResponse:
+        import asyncio
+
+        self._order.append("start")
+        await asyncio.sleep(self._seconds)
+        self._order.append("end")
+        return _response("ok")
+
+    def complete_stream(
+        self, messages: list[Message], tools: list[ToolDef], max_tokens: int
+    ) -> AsyncIterator[StreamEvent]:
+        raise NotImplementedError  # unused by this test
 
 
 class _RaisingProvider:
@@ -73,6 +101,7 @@ async def client(engine: AsyncEngine) -> AsyncGenerator[httpx.AsyncClient]:
     finally:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_main_provider, None)
+        app.dependency_overrides.pop(get_summarizer_provider, None)
 
 
 def _response(text: str) -> LLMResponse:
@@ -193,35 +222,55 @@ async def test_name_volunteered_on_turn_zero_is_captured_silently(
     assert session.visitor_name == "Priya"
 
 
-async def test_name_volunteered_after_turn_zero_is_captured_and_acknowledged_once(
+def _tool_call_response(name: str, arguments: dict[str, object]) -> LLMResponse:
+    return LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id="call_1", name=name, arguments=arguments)],
+        usage=Usage(input_tokens=1, output_tokens=1),
+        finish_reason="tool_calls",
+    )
+
+
+async def test_name_volunteered_after_turn_zero_is_captured_via_tool_call(
     client: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:
+    """Issue #11: post-turn-zero visitor-info capture is tool-based
+    (save_visitor_info), not the regex extractor — the model's own final
+    text is returned verbatim, with no code-appended acknowledgment suffix
+    (the model composes its own acknowledgment, having just seen the tool
+    result).
+    """
     await _prime_past_turn_zero(client, "sess-1")
-    fake = _use_fake_provider([_response("Nice to meet you."), _response("How can I help?")])
+    fake = _use_fake_provider(
+        [
+            _tool_call_response("save_visitor_info", {"name": "Priya"}),
+            _response("Nice to meet you, Priya!"),
+        ]
+    )
 
-    first = await client.post(
+    response = await client.post(
         "/v1/chat", json={"session_id": "sess-1", "message": "my name is Priya"}
     )
-    assert first.json()["reply"] == "Nice to meet you.\n\n(Thanks for sharing your name, Priya!)"
+    assert response.json()["reply"] == "Nice to meet you, Priya!"
 
     session = await _get_session(engine, "sess-1")
     assert session is not None
     assert session.visitor_name == "Priya"
-
-    # Repeating the name on a later turn must not re-acknowledge or overwrite.
-    second = await client.post(
-        "/v1/chat", json={"session_id": "sess-1", "message": "my name is Priya, just checking in"}
-    )
-    assert second.json()["reply"] == "How can I help?"  # no acknowledgment appended twice
-
     assert fake.calls  # sanity: the LLM path was actually exercised
 
 
-async def test_linkedin_url_captured_from_message(
+async def test_linkedin_captured_via_tool_call(
     client: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:
     await _prime_past_turn_zero(client, "sess-1")
-    _use_fake_provider([_response("Got it.")])
+    _use_fake_provider(
+        [
+            _tool_call_response(
+                "save_visitor_info", {"linkedin": "https://www.linkedin.com/in/priya-example"}
+            ),
+            _response("Got it."),
+        ]
+    )
 
     response = await client.post(
         "/v1/chat",
@@ -231,7 +280,7 @@ async def test_linkedin_url_captured_from_message(
         },
     )
 
-    assert response.json()["reply"] == "Got it.\n\n(Thanks for sharing your LinkedIn!)"
+    assert response.json()["reply"] == "Got it."
     session = await _get_session(engine, "sess-1")
     assert session is not None
     assert session.visitor_linkedin == "https://www.linkedin.com/in/priya-example"
@@ -250,9 +299,11 @@ async def test_uses_real_system_prompt_not_a_placeholder(client: httpx.AsyncClie
     assert system_message.content == SYSTEM_PROMPT
 
 
-async def test_history_window_covers_ten_full_turns(client: httpx.AsyncClient) -> None:
-    """Regression test: n passed to recent_messages must be row count (2 per
-    turn), not turn count — otherwise "last 10 turns" only covers 5.
+async def test_window_retains_all_turns_under_the_token_budget(client: httpx.AsyncClient) -> None:
+    """Issue #11: the window is token-budgeted (WINDOW_HIGH_TOKENS), not a
+    fixed turn count — a short conversation like this one stays entirely
+    under the default budget, so nothing is evicted and every turn remains
+    in context.
     """
     await _prime_past_turn_zero(client, "sess-1")
     fake = _use_fake_provider([_response(f"reply {i}") for i in range(11)])
@@ -264,6 +315,75 @@ async def test_history_window_covers_ten_full_turns(client: httpx.AsyncClient) -
     contents = [m.content for m in last_call_messages]
     assert "turn 0" in contents  # still in the 10-turn window as of turn 10 (0-indexed)
     assert "reply 0" in contents
+
+
+async def test_eviction_runs_as_background_task_and_updates_summary(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end proof that the FastAPI BackgroundTasks wiring (Issue #11)
+    actually runs: memory.py's eviction/summarization behavior itself is
+    covered thoroughly in tests/unit/test_memory.py — this only exercises
+    that app/api/chat.py schedules and the background task actually
+    executes through the real HTTP path.
+    """
+    from app.config import settings
+    from app.db import session as db_session
+
+    monkeypatch.setattr(settings, "window_high_tokens", 10)
+    monkeypatch.setattr(settings, "window_low_tokens", 5)
+    # run_eviction (Issue #11) opens its own DB session via
+    # get_session_factory() since it runs as a background task, after the
+    # request-scoped session is gone — point it at the test engine instead
+    # of the real (unconfigured) one.
+    monkeypatch.setattr(
+        db_session, "_session_factory", async_sessionmaker(engine, expire_on_commit=False)
+    )
+
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider([_response(f"reply {i}") for i in range(6)])
+    summary_json = (
+        '{"visitor_context": "chatting", "open_questions": [], '
+        '"commitments": [], "notes": []}'
+    )
+    summary_usage = Usage(input_tokens=1, output_tokens=1)
+    fake_summarizer = FakeProvider(
+        responses=[LLMResponse(text=summary_json, usage=summary_usage, finish_reason="stop")]
+    )
+    app.dependency_overrides[get_summarizer_provider] = lambda: fake_summarizer
+
+    for i in range(6):
+        await client.post("/v1/chat", json={"session_id": "sess-1", "message": f"turn {i}"})
+
+    session = await _get_session(engine, "sess-1")
+    assert session is not None
+    assert session.summary_json is not None
+    assert session.summary_json["visitor_context"] == "chatting"
+    assert fake_summarizer.calls  # the background task actually ran
+
+
+async def test_concurrent_same_session_requests_serialize_through_the_endpoint(
+    client: httpx.AsyncClient,
+) -> None:
+    """Proves app/api/chat.py actually applies session_turn_lock end to end
+    — the lock primitive itself, and its 429-on-timeout behavior, are
+    unit-tested directly in tests/unit/test_session_lock.py.
+    """
+    import asyncio
+
+    await _prime_past_turn_zero(client, "sess-1")
+    order: list[str] = []
+    app.dependency_overrides[get_main_provider] = lambda: _OrderTrackingProvider(order)
+
+    responses = await asyncio.gather(
+        client.post("/v1/chat", json={"session_id": "sess-1", "message": "first"}),
+        client.post("/v1/chat", json={"session_id": "sess-1", "message": "second"}),
+    )
+
+    assert all(r.status_code == 200 for r in responses)
+    # If the lock weren't applied, both "start"s would appear before either
+    # "end" (interleaved concurrent execution) instead of one turn fully
+    # completing before the other begins.
+    assert order == ["start", "end", "start", "end"]
 
 
 async def test_empty_session_id_returns_invalid_request_envelope(client: httpx.AsyncClient) -> None:

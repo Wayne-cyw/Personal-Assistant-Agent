@@ -1,19 +1,21 @@
 """POST /v1/chat handler.
 
-Walking skeleton (Issue #5, real system prompt wired in Issue #8, turn-zero
-prefix + visitor-info capture wired in Issue #9, real orchestration loop
-with tool-call execution wired in Issue #10): a deterministic, zero-LLM-token
-intro on a brand-new session, then SYSTEM_PROMPT + last-10-turns history +
-the user's message run through the tool-calling agent loop on every later
-turn. No memory system (#11), no classifier (#25) yet — those upgrade this
-handler in later issues without changing the envelope shape.
+Walking skeleton (Issue #5), real system prompt (Issue #8), turn-zero prefix
+(Issue #9), real orchestration loop with tool-call execution (Issue #10),
+and the full conversation memory system (Issue #11): a deterministic,
+zero-LLM-token intro on a brand-new session, then the memory-assembled
+context (pinned profile + summary + token-budgeted window + current
+message) run through the tool-calling agent loop on every later turn. Turn
+processing is serialized per session_id (4.3's concurrency guard). No
+classifier (#25) yet — that upgrades this handler in a later issue without
+changing the envelope shape.
 
-Scope note (Issue #10): only the final user message and final assistant
-reply are persisted to the messages table, same as before — any
-intermediate tool-call/tool-result exchange within a turn's loop is not
-written to the DB or replayed into later turns' history. That's consistent
-with "context assembly uses plain last-N history for now," per the issue;
-full tool-turn persistence/replay is part of Issue #11's memory system.
+Post-turn-zero visitor-info capture is now tool-based (save_visitor_info,
+app/tools/registry.py), replacing Issue #9's regex extractor for every turn
+except turn zero itself — turn zero spends zero LLM tokens by design, so a
+tool call is structurally impossible there, and the regex extractor remains
+the only option for that one turn (see `_maybe_capture_visitor_info_turn_
+zero`).
 """
 
 from __future__ import annotations
@@ -21,16 +23,17 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.intro import INTRO_MESSAGE
 from app.agent.loop import run_agent
+from app.agent.memory import assemble_messages, load_memory, persist_turn, run_eviction
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
-from app.agent.providers.base import Message as LLMMessage
+from app.agent.session_lock import session_turn_lock
 from app.agent.visitor_info import extract_linkedin_url, extract_name
 from app.config import settings
 from app.db.models import SessionRow
@@ -41,13 +44,11 @@ from app.db.session import (
     recent_messages,
     set_visitor_info,
 )
+from app.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-_HISTORY_TURNS = 10
-_HISTORY_ROWS = _HISTORY_TURNS * 2  # each turn is one user row + one assistant row
 
 
 class ResponseType(StrEnum):
@@ -77,96 +78,85 @@ def get_main_provider() -> LLMProvider:
     return get_provider("main")
 
 
-async def _maybe_capture_visitor_info(
-    db: AsyncSession, session: SessionRow, message: str
-) -> tuple[str | None, str | None]:
-    """Extract + persist a volunteered name/LinkedIn (Issue #9), capturing
-    each at most once per session — a field already set is never
-    overwritten. Returns whichever were newly captured this turn (None if
-    already set or not present in this message), so the caller can decide
-    whether to acknowledge.
+def get_summarizer_provider() -> LLMProvider:
+    """Mirrors get_main_provider — a separate call site/dependency (4.3's
+    role-isolation rule), independently overridable in tests.
+    """
+    return get_provider("summarizer")
 
-    Known limitation, not yet addressed: there is no correction path within
-    this issue's scope — a visitor cannot fix a wrong or mistyped capture
-    within the session (extract_name's own conservatism, requiring the
-    explicit "my name is X" phrasing, keeps the odds of this low, but it is
-    not zero). Detecting and reconciling a stale/wrong pinned value is
-    exactly Issue #11's `reload_and_reconcile` mechanism (Engineering Guide
-    4.3); building that here would be scope creep on a placeholder that
-    Issue #11 replaces outright with LLM tool-based capture.
+
+async def _maybe_capture_visitor_info_turn_zero(
+    db: AsyncSession, session: SessionRow, message: str
+) -> None:
+    """Turn zero's regex-based fallback (Issue #9): the only turn with zero
+    LLM calls by design, so the tool-based save_visitor_info path (Issue
+    #11, used for every later turn) is structurally unavailable here.
+    Capture-once — a field already set is never overwritten, since a false
+    positive from this conservative-but-imperfect regex has no correction
+    path on this turn (the reply must stay byte-identical to intro.md, so
+    nothing can be acknowledged or corrected here regardless).
     """
     newly_name = extract_name(message) if session.visitor_name is None else None
     newly_linkedin = extract_linkedin_url(message) if session.visitor_linkedin is None else None
     if newly_name or newly_linkedin:
         await set_visitor_info(db, session.id, name=newly_name, linkedin=newly_linkedin)
-    return newly_name, newly_linkedin
-
-
-def _acknowledgment_suffix(name: str | None, linkedin: str | None) -> str | None:
-    if name and linkedin:
-        return f"(Thanks for sharing your name and LinkedIn, {name}!)"
-    if name:
-        return f"(Thanks for sharing your name, {name}!)"
-    if linkedin:
-        return "(Thanks for sharing your LinkedIn!)"
-    return None
 
 
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
     http_request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     provider: LLMProvider = Depends(get_main_provider),
+    summarizer_provider: LLMProvider = Depends(get_summarizer_provider),
 ) -> ChatResponse:
     # Read by the logging middleware (Issue #6) after this handler returns.
     http_request.state.session_id = request.session_id
 
-    session = await get_or_create_session(db, request.session_id)
-    is_turn_zero = len(await recent_messages(db, request.session_id, n=1)) == 0
+    async with session_turn_lock(request.session_id):
+        session = await get_or_create_session(db, request.session_id)
+        is_turn_zero = len(await recent_messages(db, request.session_id, n=1)) == 0
 
-    # Extraction runs every turn, including turn zero (Issue #9: "this turn
-    # or any later one") — but turn zero's *reply* stays byte-identical to
-    # intro.md regardless, so any capture here is acknowledged silently.
-    newly_name, newly_linkedin = await _maybe_capture_visitor_info(db, session, request.message)
+        if is_turn_zero:
+            # Capture happens silently on turn zero even though this turn's
+            # reply stays byte-identical to intro.md regardless (Issue #9).
+            await _maybe_capture_visitor_info_turn_zero(db, session, request.message)
+            await append_message(db, request.session_id, "user", request.message)
+            await append_message(db, request.session_id, "assistant", INTRO_MESSAGE)
+            return ChatResponse(reply=INTRO_MESSAGE, type=ResponseType.MESSAGE, data=None)
 
-    if is_turn_zero:
+        memory = await load_memory(db, session)
+        messages = assemble_messages(memory, SYSTEM_PROMPT, request.message)
+
+        # The user's message is persisted before the provider call, per
+        # 4.3's "the DB log is complete" invariant — even a message that
+        # triggers an upstream failure (rate limit, outage) must remain in
+        # the audit log. persist_turn (below) is told not to re-append it.
         await append_message(db, request.session_id, "user", request.message)
-        await append_message(db, request.session_id, "assistant", INTRO_MESSAGE)
-        return ChatResponse(reply=INTRO_MESSAGE, type=ResponseType.MESSAGE, data=None)
 
-    history = await recent_messages(db, request.session_id, n=_HISTORY_ROWS)
+        tool_context = ToolContext(
+            db=db, session_id=request.session_id, summarizer_provider=summarizer_provider
+        )
+        result = await run_agent(
+            messages,
+            provider,
+            settings.max_tokens_per_turn,
+            max_iterations=settings.max_iterations,
+            tool_context=tool_context,
+        )
+        http_request.state.llm_tokens_in = result.input_tokens
+        http_request.state.llm_tokens_out = result.output_tokens
 
-    messages = [LLMMessage(role="system", content=SYSTEM_PROMPT)]
-    messages.extend(
-        LLMMessage(role=m.role, content=m.content)  # type: ignore[arg-type]
-        for m in history
-        if m.role in ("user", "assistant")  # tool-role replay needs pairing logic; Issue #11
-    )
-    messages.append(LLMMessage(role="user", content=request.message))
+        needs_eviction = await persist_turn(
+            db,
+            request.session_id,
+            request.message,
+            result.text,
+            result.tool_events,
+            user_already_persisted=True,
+        )
+        if needs_eviction:
+            background_tasks.add_task(run_eviction, request.session_id, summarizer_provider)
 
-    # The user's message is persisted before the provider call, per 4.3's
-    # "the DB log is complete" invariant — even a message that triggers an
-    # upstream failure (rate limit, outage) must remain in the audit log.
-    await append_message(db, request.session_id, "user", request.message)
-
-    result = await run_agent(
-        messages,
-        provider,
-        settings.max_tokens_per_turn,
-        max_iterations=settings.max_iterations,
-    )
-    http_request.state.llm_tokens_in = result.input_tokens
-    http_request.state.llm_tokens_out = result.output_tokens
-
-    reply_text = result.text
-    # Skip the acknowledgment on the iteration-cap fallback (Issue #10): it
-    # would read as an incongruous non sequitur appended to "I'm having
-    # trouble completing that right now."
-    ack = None if result.hit_iteration_cap else _acknowledgment_suffix(newly_name, newly_linkedin)
-    if ack:
-        reply_text = f"{reply_text}\n\n{ack}"
-
-    await append_message(db, request.session_id, "assistant", reply_text)
-
-    return ChatResponse(reply=reply_text, type=ResponseType.MESSAGE, data=None)
+        return ChatResponse(reply=result.text, type=ResponseType.MESSAGE, data=None)

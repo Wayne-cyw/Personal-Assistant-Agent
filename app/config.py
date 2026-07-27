@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     summary_max_tokens: int = Field(default=150, ge=1, alias="SUMMARY_MAX_TOKENS")
     pinned_facts_max: int = Field(default=5, ge=0, alias="PINNED_FACTS_MAX")
     summary_audit_interval: int = Field(default=3, ge=1, alias="SUMMARY_AUDIT_INTERVAL")
+    # 4.3: the per-session asyncio.Lock (app/agent/session_lock.py) is only
+    # correct with exactly one worker process. False (default): a detected
+    # second worker only logs a prominent warning. True: refuse to start.
+    # Full deploy-config enforcement is Issue #34 — this is the in-app guard
+    # 4.3 also calls for, using WEB_CONCURRENCY (the common gunicorn/uvicorn-
+    # worker-manager env var) as the best available signal a bare `uvicorn
+    # --workers N` invocation has no other way to surface to the process.
+    # Read here (not via os.environ in app/main.py) per Issue #2's rule that
+    # only this module reads the process environment directly.
+    enforce_single_worker: bool = Field(default=False, alias="ENFORCE_SINGLE_WORKER")
+    web_concurrency: int | None = Field(default=None, alias="WEB_CONCURRENCY")
 
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
@@ -82,6 +93,17 @@ class Settings(BaseSettings):
         # regardless of how the env var was cased.
         if isinstance(value, str):
             return value.upper()
+        return value
+
+    @field_validator("web_concurrency", mode="before")
+    @classmethod
+    def _ignore_malformed_web_concurrency(cls, value: object) -> object:
+        # WEB_CONCURRENCY is set by external tooling (gunicorn/uvicorn
+        # process managers) this app doesn't control the format of — a
+        # malformed value is a signal worth logging (app/main.py's startup
+        # guard), not grounds for crashing the whole app at construction.
+        if isinstance(value, str) and not value.strip().lstrip("-").isdigit():
+            return None
         return value
 
 
