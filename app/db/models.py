@@ -88,6 +88,9 @@ class SessionRow(Base):
     pinned_facts_json: Mapped[list[object] | None] = mapped_column(PortableJSON, default=None)
     summary_json: Mapped[dict[str, object] | None] = mapped_column(PortableJSON, default=None)
     summary_through_message_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Counts batched high-water-mark evictions (Issue #11), not individual
+    # turns — drives the SUMMARY_AUDIT_INTERVAL drift-audit canary (4.3).
+    eviction_count: Mapped[int] = mapped_column(Integer, default=0)
     flagged: Mapped[bool] = mapped_column(Boolean, default=False)
     token_budget_used: Mapped[int] = mapped_column(Integer, default=0)
 
