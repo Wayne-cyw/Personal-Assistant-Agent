@@ -89,6 +89,32 @@ def test_render_pinned_profile_includes_name_linkedin_and_facts() -> None:
     assert "hiring for backend" in rendered
 
 
+# --- assemble_messages: cache breakpoint placement --------------------------
+
+
+def test_cache_breakpoint_set_on_pinned_and_summary_block_when_present() -> None:
+    from app.agent.memory import Memory
+
+    memory = Memory(pinned_profile_text="Visitor profile:\nName: Priya", summary_text="")
+    messages = assemble_messages(memory, "SYSTEM", "hello")
+
+    pinned_message = messages[1]
+    assert pinned_message.content.startswith("Visitor profile:")
+    assert pinned_message.cache_breakpoint is True
+    # Nothing else carries the breakpoint marker.
+    assert all(m.cache_breakpoint is False for m in messages if m is not pinned_message)
+
+
+def test_no_cache_breakpoint_message_when_nothing_pinned_or_summarized() -> None:
+    from app.agent.memory import Memory
+
+    memory = Memory(pinned_profile_text="", summary_text="")
+    messages = assemble_messages(memory, "SYSTEM", "hello")
+
+    assert all(not m.cache_breakpoint for m in messages)
+    assert len(messages) == 2  # just system + current message
+
+
 # --- _split_for_eviction ------------------------------------------------
 
 
