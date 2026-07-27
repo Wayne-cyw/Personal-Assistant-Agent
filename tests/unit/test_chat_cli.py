@@ -180,3 +180,35 @@ def test_send_turn_missing_reply_field_does_not_crash() -> None:
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
     result = send_turn(client, "sess-1", "hi", None)  # must not raise KeyError
     assert result == ""
+
+
+def test_send_turn_json_array_body_does_not_crash() -> None:
+    """Valid JSON that isn't an object (e.g. a misbehaving proxy) must not
+    crash _format_error's dict.get() calls.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json=[1, 2, 3])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    result = send_turn(client, "sess-1", "hi", None)  # must not raise AttributeError
+    assert "unexpected response shape" in result
+    assert "502" in result
+
+
+def test_send_turn_json_null_body_does_not_crash() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"null")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    result = send_turn(client, "sess-1", "hi", None)  # must not raise AttributeError
+    assert "unexpected response shape" in result
+
+
+def test_render_data_booking_proposal_with_non_dict_slot_does_not_crash() -> None:
+    """A misbehaving proxy could plausibly send a list of strings instead of
+    slot objects; rendering must degrade gracefully, not raise.
+    """
+    data: dict[str, object] = {"slots": ["not-a-dict", 42]}
+    rendered = _render_data("booking_proposal", data)
+    assert rendered == "Available times:\n  1. not-a-dict\n  2. 42"

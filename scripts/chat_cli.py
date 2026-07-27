@@ -17,18 +17,17 @@ _TIMEOUT_SECONDS = 90.0  # generous: covers documented free-tier cold starts (Te
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
 
-def _render_slots(slots: list[dict[str, object]]) -> str:
-    lines = []
-    for i, slot in enumerate(slots, start=1):
-        label = slot.get("label") or f"{slot.get('start_iso')} - {slot.get('end_iso')}"
-        lines.append(f"  {i}. {label}")
-    return "\n".join(lines)
-
-
 def _render_slot_label(slot: object) -> str:
     if isinstance(slot, dict):
         return str(slot.get("label") or f"{slot.get('start_iso')} - {slot.get('end_iso')}")
     return str(slot)
+
+
+def _render_slots(slots: list[object]) -> str:
+    lines = []
+    for i, slot in enumerate(slots, start=1):
+        lines.append(f"  {i}. {_render_slot_label(slot)}")
+    return "\n".join(lines)
 
 
 def _render_data(response_type: str, data: dict[str, object] | None) -> str | None:
@@ -104,6 +103,14 @@ def send_turn(client: httpx.Client, session_id: str, message: str, timezone: str
         body = response.json()
     except ValueError:  # json.JSONDecodeError subclasses ValueError
         return f"error: server returned a non-JSON response (status {response.status_code})"
+    if not isinstance(body, dict):
+        # Valid JSON but not an object (e.g. a proxy/gateway returning a
+        # bare list or null) — same "don't trust the wire" reasoning as the
+        # non-JSON case above; _format_error/_format_response both assume a
+        # dict.
+        return (
+            f"error: server returned an unexpected response shape (status {response.status_code})"
+        )
 
     if response.status_code >= 400:
         return _format_error(body)
