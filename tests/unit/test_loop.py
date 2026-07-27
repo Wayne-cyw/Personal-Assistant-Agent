@@ -1,10 +1,39 @@
 import logging
+from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import pytest
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.agent.loop import FALLBACK_MESSAGE, run_agent
 from app.agent.providers.base import LLMResponse, Message, ToolCall, Usage
 from app.agent.providers.fake import FakeProvider
+from app.db.models import Base
+from app.db.session import get_or_create_session
+from app.tools.context import ToolContext
+
+
+@pytest.fixture
+async def engine(tmp_path: Path) -> AsyncGenerator[AsyncEngine]:
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+    engine = create_async_engine(db_url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def tool_context(engine: AsyncEngine) -> AsyncGenerator[ToolContext]:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        summarizer = FakeProvider(responses=[])
+        yield ToolContext(db=db, session_id="sess-1", summarizer_provider=summarizer)
 
 
 def _usage(input_tokens: int = 10, output_tokens: int = 5) -> Usage:
@@ -18,7 +47,7 @@ def _messages() -> list[Message]:
     ]
 
 
-async def test_tool_call_then_final_answer() -> None:
+async def test_tool_call_then_final_answer(tool_context: ToolContext) -> None:
     """(a) tool call -> result -> final answer."""
     tool_call_response = LLMResponse(
         text="",
@@ -33,7 +62,9 @@ async def test_tool_call_then_final_answer() -> None:
     )
     provider = FakeProvider(responses=[tool_call_response, final_response])
 
-    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert result.text == "Today is the date the tool returned."
     assert result.hit_iteration_cap is False
@@ -54,8 +85,16 @@ async def test_tool_call_then_final_answer() -> None:
     assert not any(m.role == "tool" for m in first_call_messages)
     assert len(first_call_messages) < len(second_call_messages)
 
+    # Issue #11: run_agent reports every tool call it made so the caller can
+    # persist a receipt of each.
+    assert len(result.tool_events) == 1
+    assert result.tool_events[0].name == "get_current_date"
+    assert result.tool_events[0].persist_receipt is True
 
-async def test_multiple_tool_calls_in_one_turn_all_get_matching_results() -> None:
+
+async def test_multiple_tool_calls_in_one_turn_all_get_matching_results(
+    tool_context: ToolContext,
+) -> None:
     """Regression test: when the model makes several tool calls in a single
     response, each must get its own tool-result message with the matching
     tool_call_id, in order — an ordering/ID-matching bug here would be easy
@@ -75,13 +114,16 @@ async def test_multiple_tool_calls_in_one_turn_all_get_matching_results() -> Non
     final_response = LLMResponse(text="all done", usage=_usage(), finish_reason="stop")
     provider = FakeProvider(responses=[multi_call_response, final_response])
 
-    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert result.text == "all done"
     second_call_messages = provider.calls[1]
     tool_result_messages = [m for m in second_call_messages if m.role == "tool"]
     assert [m.tool_call_id for m in tool_result_messages] == ["call_1", "call_2", "call_3"]
     assert all("date" in m.content for m in tool_result_messages)
+    assert len(result.tool_events) == 3
 
     # Exactly one assistant message carrying all three tool_calls, followed
     # immediately by the three tool results, in order — the shape the
@@ -92,7 +134,28 @@ async def test_multiple_tool_calls_in_one_turn_all_get_matching_results() -> Non
     assert [tc.id for tc in assistant_msg.tool_calls] == ["call_1", "call_2", "call_3"]
 
 
-async def test_token_usage_accumulates_across_iterations() -> None:
+async def test_meta_tool_call_reported_with_persist_receipt_false(
+    tool_context: ToolContext,
+) -> None:
+    tool_call_response = LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id="call_1", name="save_visitor_info", arguments={"name": "Sam"})],
+        usage=_usage(),
+        finish_reason="tool_calls",
+    )
+    final_response = LLMResponse(text="nice to meet you", usage=_usage(), finish_reason="stop")
+    provider = FakeProvider(responses=[tool_call_response, final_response])
+
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
+
+    assert len(result.tool_events) == 1
+    assert result.tool_events[0].name == "save_visitor_info"
+    assert result.tool_events[0].persist_receipt is False
+
+
+async def test_token_usage_accumulates_across_iterations(tool_context: ToolContext) -> None:
     tool_call_response = LLMResponse(
         text="",
         tool_calls=[ToolCall(id="call_1", name="get_current_date", arguments={})],
@@ -106,13 +169,15 @@ async def test_token_usage_accumulates_across_iterations() -> None:
     )
     provider = FakeProvider(responses=[tool_call_response, final_response])
 
-    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert result.input_tokens == 25
     assert result.output_tokens == 5
 
 
-async def test_infinite_tool_loop_hits_cap_and_returns_fallback() -> None:
+async def test_infinite_tool_loop_hits_cap_and_returns_fallback(tool_context: ToolContext) -> None:
     """(b) an infinite-tool-loop script hits the cap and returns the
     fallback message.
     """
@@ -124,14 +189,18 @@ async def test_infinite_tool_loop_hits_cap_and_returns_fallback() -> None:
     )
     provider = FakeProvider(responses=[always_calls_tool] * 5)
 
-    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert result.text == FALLBACK_MESSAGE
     assert result.hit_iteration_cap is True
     assert len(provider.calls) == 5  # never exceeds max_iterations
 
 
-async def test_iteration_cap_hit_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+async def test_iteration_cap_hit_is_logged(
+    caplog: pytest.LogCaptureFixture, tool_context: ToolContext
+) -> None:
     """Engineering Guide 4.2: "if the cap is hit ... the incident is
     logged" — this is the only production signal that the model is looping
     on tool calls instead of reaching a final answer within budget.
@@ -145,7 +214,9 @@ async def test_iteration_cap_hit_is_logged(caplog: pytest.LogCaptureFixture) -> 
     provider = FakeProvider(responses=[always_calls_tool] * 3)
 
     with caplog.at_level(logging.WARNING):
-        await run_agent(_messages(), provider, max_tokens=100, max_iterations=3)
+        await run_agent(
+            _messages(), provider, max_tokens=100, max_iterations=3, tool_context=tool_context
+        )
 
     assert any(
         record.levelno == logging.WARNING and "iteration" in record.getMessage().lower()
@@ -153,7 +224,9 @@ async def test_iteration_cap_hit_is_logged(caplog: pytest.LogCaptureFixture) -> 
     )
 
 
-async def test_unknown_tool_name_surfaces_as_tool_result_not_exception() -> None:
+async def test_unknown_tool_name_surfaces_as_tool_result_not_exception(
+    tool_context: ToolContext,
+) -> None:
     """(c) invalid args surface as a tool-result error, not an exception —
     an unknown tool name is the loop-level analogue of "invalid" (the
     per-field schema-validation case is covered directly against
@@ -169,7 +242,9 @@ async def test_unknown_tool_name_surfaces_as_tool_result_not_exception() -> None
     final_response = LLMResponse(text="recovered", usage=_usage(), finish_reason="stop")
     provider = FakeProvider(responses=[unknown_tool_response, final_response])
 
-    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert result.text == "recovered"
     tool_result = provider.calls[1][-1]  # last message before the 2nd LLM call is the tool result
@@ -177,22 +252,29 @@ async def test_unknown_tool_name_surfaces_as_tool_result_not_exception() -> None
     assert "error" in tool_result.content
 
 
-async def test_final_answer_with_no_tool_calls_returns_immediately() -> None:
+async def test_final_answer_with_no_tool_calls_returns_immediately(
+    tool_context: ToolContext,
+) -> None:
     response = LLMResponse(text="hi!", usage=_usage(), finish_reason="stop")
     provider = FakeProvider(responses=[response])
 
-    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert result.text == "hi!"
     assert len(provider.calls) == 1
+    assert result.tool_events == []
 
 
-async def test_original_messages_list_not_mutated() -> None:
+async def test_original_messages_list_not_mutated(tool_context: ToolContext) -> None:
     original = _messages()
     original_len = len(original)
     response = LLMResponse(text="hi", usage=_usage(), finish_reason="stop")
     provider = FakeProvider(responses=[response])
 
-    await run_agent(original, provider, max_tokens=100, max_iterations=5)
+    await run_agent(
+        original, provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
 
     assert len(original) == original_len
