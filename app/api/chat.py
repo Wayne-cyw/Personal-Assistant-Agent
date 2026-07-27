@@ -1,10 +1,12 @@
 """POST /v1/chat handler.
 
-Walking skeleton (Issue #5, real system prompt wired in Issue #8): the real
-SYSTEM_PROMPT + last-10-turns history + the user's message, sent straight to
-the LLM, both turns persisted. No memory system (#11), no classifier (#25),
-no orchestration loop with tools (#10), no turn-zero prefix (#9) yet — those
-upgrade this handler in later issues without changing the envelope shape.
+Walking skeleton (Issue #5, real system prompt wired in Issue #8, turn-zero
+prefix + visitor-info capture wired in Issue #9): a deterministic,
+zero-LLM-token intro on a brand-new session, then SYSTEM_PROMPT +
+last-10-turns history + the user's message on every later turn. No memory
+system (#11), no classifier (#25), no orchestration loop with tools (#10)
+yet — those upgrade this handler in later issues without changing the
+envelope shape.
 """
 
 from __future__ import annotations
@@ -16,12 +18,21 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.intro import INTRO_MESSAGE
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
 from app.agent.providers.base import Message as LLMMessage
+from app.agent.visitor_info import extract_linkedin_url, extract_name
 from app.config import settings
-from app.db.session import append_message, get_db, get_or_create_session, recent_messages
+from app.db.models import SessionRow
+from app.db.session import (
+    append_message,
+    get_db,
+    get_or_create_session,
+    recent_messages,
+    set_visitor_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +69,41 @@ def get_main_provider() -> LLMProvider:
     return get_provider("main")
 
 
+async def _maybe_capture_visitor_info(
+    db: AsyncSession, session: SessionRow, message: str
+) -> tuple[str | None, str | None]:
+    """Extract + persist a volunteered name/LinkedIn (Issue #9), capturing
+    each at most once per session — a field already set is never
+    overwritten. Returns whichever were newly captured this turn (None if
+    already set or not present in this message), so the caller can decide
+    whether to acknowledge.
+
+    Known limitation, not yet addressed: there is no correction path within
+    this issue's scope — a visitor cannot fix a wrong or mistyped capture
+    within the session (extract_name's own conservatism, requiring the
+    explicit "my name is X" phrasing, keeps the odds of this low, but it is
+    not zero). Detecting and reconciling a stale/wrong pinned value is
+    exactly Issue #11's `reload_and_reconcile` mechanism (Engineering Guide
+    4.3); building that here would be scope creep on a placeholder that
+    Issue #11 replaces outright with LLM tool-based capture.
+    """
+    newly_name = extract_name(message) if session.visitor_name is None else None
+    newly_linkedin = extract_linkedin_url(message) if session.visitor_linkedin is None else None
+    if newly_name or newly_linkedin:
+        await set_visitor_info(db, session.id, name=newly_name, linkedin=newly_linkedin)
+    return newly_name, newly_linkedin
+
+
+def _acknowledgment_suffix(name: str | None, linkedin: str | None) -> str | None:
+    if name and linkedin:
+        return f"(Thanks for sharing your name and LinkedIn, {name}!)"
+    if name:
+        return f"(Thanks for sharing your name, {name}!)"
+    if linkedin:
+        return "(Thanks for sharing your LinkedIn!)"
+    return None
+
+
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -68,7 +114,19 @@ async def chat(
     # Read by the logging middleware (Issue #6) after this handler returns.
     http_request.state.session_id = request.session_id
 
-    await get_or_create_session(db, request.session_id)
+    session = await get_or_create_session(db, request.session_id)
+    is_turn_zero = len(await recent_messages(db, request.session_id, n=1)) == 0
+
+    # Extraction runs every turn, including turn zero (Issue #9: "this turn
+    # or any later one") — but turn zero's *reply* stays byte-identical to
+    # intro.md regardless, so any capture here is acknowledged silently.
+    newly_name, newly_linkedin = await _maybe_capture_visitor_info(db, session, request.message)
+
+    if is_turn_zero:
+        await append_message(db, request.session_id, "user", request.message)
+        await append_message(db, request.session_id, "assistant", INTRO_MESSAGE)
+        return ChatResponse(reply=INTRO_MESSAGE, type=ResponseType.MESSAGE, data=None)
+
     history = await recent_messages(db, request.session_id, n=_HISTORY_ROWS)
 
     messages = [LLMMessage(role="system", content=SYSTEM_PROMPT)]
@@ -90,6 +148,11 @@ async def chat(
     http_request.state.llm_tokens_in = response.usage.input_tokens
     http_request.state.llm_tokens_out = response.usage.output_tokens
 
-    await append_message(db, request.session_id, "assistant", response.text)
+    reply_text = response.text
+    ack = _acknowledgment_suffix(newly_name, newly_linkedin)
+    if ack:
+        reply_text = f"{reply_text}\n\n{ack}"
 
-    return ChatResponse(reply=response.text, type=ResponseType.MESSAGE, data=None)
+    await append_message(db, request.session_id, "assistant", reply_text)
+
+    return ChatResponse(reply=reply_text, type=ResponseType.MESSAGE, data=None)

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.agent.intro import INTRO_MESSAGE
 from app.agent.providers.base import (
     LLMResponse,
     Message,
@@ -20,7 +21,7 @@ from app.agent.providers.base import (
 )
 from app.agent.providers.fake import FakeProvider
 from app.api.chat import get_main_provider
-from app.db.models import Base
+from app.db.models import Base, SessionRow
 from app.db.session import get_db
 from app.main import app
 
@@ -85,11 +86,32 @@ def _use_fake_provider(responses: list[LLMResponse]) -> FakeProvider:
     return fake
 
 
+async def _get_session(engine: AsyncEngine, session_id: str) -> SessionRow | None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as db:
+        return await db.get(SessionRow, session_id)
+
+
+async def _prime_past_turn_zero(client: httpx.AsyncClient, session_id: str) -> None:
+    """Every session's first message gets the deterministic intro reply
+    (Issue #9), not an LLM call — send and discard one throwaway turn-zero
+    message so the rest of a test can exercise the real LLM-driven path.
+    """
+    response = await client.post(
+        "/v1/chat", json={"session_id": session_id, "message": "(priming turn zero)"}
+    )
+    assert response.status_code == 200
+
+
 async def test_two_turn_conversation_remembers_first_turn(client: httpx.AsyncClient) -> None:
+    await _prime_past_turn_zero(client, "sess-1")
     fake = _use_fake_provider([_response("Nice to meet you, Sam."), _response("Your name is Sam.")])
 
+    # "call me Sam" deliberately avoids the Issue #9 name-extraction patterns
+    # ("my name is"/"I'm") so this test stays focused on history/memory, not
+    # visitor-info capture (covered separately below).
     first = await client.post(
-        "/v1/chat", json={"session_id": "sess-1", "message": "my name is Sam"}
+        "/v1/chat", json={"session_id": "sess-1", "message": "call me Sam"}
     )
     assert first.status_code == 200
     assert first.json() == {"reply": "Nice to meet you, Sam.", "type": "message", "data": None}
@@ -102,14 +124,123 @@ async def test_two_turn_conversation_remembers_first_turn(client: httpx.AsyncCli
 
     second_call_messages = fake.calls[1]
     contents = [m.content for m in second_call_messages]
-    assert "my name is Sam" in contents
+    assert "call me Sam" in contents
     assert "Nice to meet you, Sam." in contents
     assert "what's my name?" in contents
+
+
+async def test_fresh_session_first_reply_is_byte_identical_to_intro(
+    client: httpx.AsyncClient,
+) -> None:
+    _use_fake_provider([_response("unused — turn zero must not call the LLM")])
+
+    response = await client.post(
+        "/v1/chat", json={"session_id": "sess-new", "message": "hello?"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"reply": INTRO_MESSAGE, "type": "message", "data": None}
+
+
+async def test_turn_zero_spends_zero_llm_tokens(client: httpx.AsyncClient) -> None:
+    fake = _use_fake_provider([_response("unused")])
+
+    await client.post("/v1/chat", json={"session_id": "sess-new", "message": "hello?"})
+
+    assert fake.calls == []
+
+
+async def test_turn_zero_question_is_answered_on_next_send(client: httpx.AsyncClient) -> None:
+    """Issue #9: if the caller's first payload already contains a question,
+    the prefix is still returned for that call; the question is answered on
+    the next send, and the first message remains in history for that reply.
+    """
+    fake = _use_fake_provider([_response("Yes, they know Rust.")])
+
+    first = await client.post(
+        "/v1/chat", json={"session_id": "sess-new", "message": "does the owner know Rust?"}
+    )
+    assert first.status_code == 200
+    assert first.json()["reply"] == INTRO_MESSAGE
+
+    second = await client.post(
+        "/v1/chat", json={"session_id": "sess-new", "message": "well?"}
+    )
+    assert second.status_code == 200
+    assert second.json()["reply"] == "Yes, they know Rust."
+
+    contents = [m.content for m in fake.calls[0]]
+    assert "does the owner know Rust?" in contents
+    assert "well?" in contents
+
+
+async def test_name_volunteered_on_turn_zero_is_captured_silently(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Turn zero's reply must stay byte-identical to intro.md even if a name
+    was volunteered in that same first message (Issue #9) — capture happens,
+    acknowledgment does not.
+    """
+    _use_fake_provider([_response("unused — turn zero must not call the LLM")])
+
+    response = await client.post(
+        "/v1/chat", json={"session_id": "sess-new", "message": "hi, my name is Priya"}
+    )
+
+    assert response.json()["reply"] == INTRO_MESSAGE  # no appended acknowledgment
+    session = await _get_session(engine, "sess-new")
+    assert session is not None
+    assert session.visitor_name == "Priya"
+
+
+async def test_name_volunteered_after_turn_zero_is_captured_and_acknowledged_once(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    await _prime_past_turn_zero(client, "sess-1")
+    fake = _use_fake_provider([_response("Nice to meet you."), _response("How can I help?")])
+
+    first = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "my name is Priya"}
+    )
+    assert first.json()["reply"] == "Nice to meet you.\n\n(Thanks for sharing your name, Priya!)"
+
+    session = await _get_session(engine, "sess-1")
+    assert session is not None
+    assert session.visitor_name == "Priya"
+
+    # Repeating the name on a later turn must not re-acknowledge or overwrite.
+    second = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "my name is Priya, just checking in"}
+    )
+    assert second.json()["reply"] == "How can I help?"  # no acknowledgment appended twice
+
+    assert fake.calls  # sanity: the LLM path was actually exercised
+
+
+async def test_linkedin_url_captured_from_message(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider([_response("Got it.")])
+
+    response = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "here's my linkedin: https://www.linkedin.com/in/priya-example",
+        },
+    )
+
+    assert response.json()["reply"] == "Got it.\n\n(Thanks for sharing your LinkedIn!)"
+    session = await _get_session(engine, "sess-1")
+    assert session is not None
+    assert session.visitor_linkedin == "https://www.linkedin.com/in/priya-example"
 
 
 async def test_uses_real_system_prompt_not_a_placeholder(client: httpx.AsyncClient) -> None:
     from app.agent.prompts import SYSTEM_PROMPT
 
+    await _prime_past_turn_zero(client, "sess-1")
     fake = _use_fake_provider([_response("hi")])
 
     await client.post("/v1/chat", json={"session_id": "sess-1", "message": "hello"})
@@ -123,6 +254,7 @@ async def test_history_window_covers_ten_full_turns(client: httpx.AsyncClient) -
     """Regression test: n passed to recent_messages must be row count (2 per
     turn), not turn count — otherwise "last 10 turns" only covers 5.
     """
+    await _prime_past_turn_zero(client, "sess-1")
     fake = _use_fake_provider([_response(f"reply {i}") for i in range(11)])
 
     for i in range(11):
@@ -147,6 +279,7 @@ async def test_user_message_persisted_even_when_provider_fails(client: httpx.Asy
     """4.3: the DB log is complete — a message that triggers an upstream
     failure must still be recorded, even though no reply exists for it.
     """
+    await _prime_past_turn_zero(client, "sess-1")
     app.dependency_overrides[get_main_provider] = lambda: _RaisingProvider(
         UpstreamError(status_code=503, error_type="APIStatusError", message="boom")
     )
@@ -188,6 +321,7 @@ async def test_missing_field_returns_invalid_request_envelope(client: httpx.Asyn
 
 
 async def test_upstream_error_returns_503_envelope(client: httpx.AsyncClient) -> None:
+    await _prime_past_turn_zero(client, "sess-1")
     app.dependency_overrides[get_main_provider] = lambda: _RaisingProvider(
         UpstreamError(status_code=503, error_type="APIStatusError", message="boom")
     )
@@ -208,6 +342,7 @@ async def test_upstream_error_returns_503_envelope(client: httpx.AsyncClient) ->
 async def test_unhandled_exception_returns_500_envelope_without_leaking_details(
     client: httpx.AsyncClient,
 ) -> None:
+    await _prime_past_turn_zero(client, "sess-1")
     app.dependency_overrides[get_main_provider] = lambda: _RaisingProvider(
         RuntimeError("sensitive internal detail that must never reach the client")
     )
