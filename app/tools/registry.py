@@ -75,6 +75,19 @@ async def execute_tool(call: ToolCall) -> dict[str, object]:
     except ValidationError as exc:
         logger.warning("invalid arguments for tool %s: %s", call.name, exc)
         return {"error": f"Invalid arguments for {call.name}: {exc.errors()}"}
+    except Exception as exc:
+        # Pydantic v2 only wraps ValueError/TypeError/AssertionError raised
+        # inside a @field_validator into ValidationError — any other
+        # exception type a future tool's validator raises (e.g. a network
+        # call inside a validator) would otherwise propagate raw and crash
+        # the whole turn, exactly the failure class this function exists to
+        # prevent. No current tool has a custom validator, but the registry
+        # is generic, so this is guarded the same way handler failures are.
+        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error(
+            "tool %s argument validation raised unexpectedly\n%s", call.name, redact(tb_text)
+        )
+        return {"error": f"Invalid arguments for {call.name}."}
 
     try:
         return await tool.handler(args)

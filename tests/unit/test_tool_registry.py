@@ -1,7 +1,7 @@
 from collections.abc import Generator
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import app.tools.registry as registry_module
 from app.agent.providers.base import ToolCall, ToolDef
@@ -92,6 +92,51 @@ async def test_execute_tool_wrong_type_arg_returns_structured_error_not_exceptio
     )
     result = await execute_tool(call)  # must not raise
     assert "error" in result
+
+
+class _ArgsWithMisbehavingValidator(BaseModel):
+    """Pydantic v2 only wraps ValueError/TypeError/AssertionError raised by a
+    @field_validator into ValidationError — any other exception type
+    propagates raw from model_validate(). Regression fixture for that gap.
+    """
+
+    x: int
+
+    @field_validator("x")
+    @classmethod
+    def _check(cls, _value: int) -> int:
+        raise RuntimeError("validator raised a non-ValueError exception")
+
+
+async def _unused_handler(_args: BaseModel) -> dict[str, object]:
+    return {"ok": True}
+
+
+@pytest.fixture
+def tool_with_misbehaving_validator() -> Generator[None]:
+    registry_module._REGISTRY["test_tool_with_misbehaving_validator"] = _RegisteredTool(
+        definition=ToolDef(
+            name="test_tool_with_misbehaving_validator",
+            description="test-only",
+            parameters=_ArgsWithMisbehavingValidator.model_json_schema(),
+        ),
+        args_model=_ArgsWithMisbehavingValidator,
+        handler=_unused_handler,
+    )
+    yield
+    del registry_module._REGISTRY["test_tool_with_misbehaving_validator"]
+
+
+async def test_execute_tool_validator_raising_non_value_error_returns_structured_error(
+    tool_with_misbehaving_validator: None,
+) -> None:
+    call = ToolCall(
+        id="call_1", name="test_tool_with_misbehaving_validator", arguments={"x": 1}
+    )
+    result = await execute_tool(call)  # must not raise
+    assert "error" in result
+    assert isinstance(result["error"], str)
+    assert "test_tool_with_misbehaving_validator" in result["error"]
 
 
 class _EmptyArgs(BaseModel):

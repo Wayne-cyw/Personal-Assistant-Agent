@@ -12,10 +12,13 @@ until #18), so every registered tool is always offered.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 
 from app.agent.providers.base import LLMProvider, Message
 from app.tools.registry import TOOL_DEFS, execute_tool
+
+logger = logging.getLogger(__name__)
 
 FALLBACK_MESSAGE = (
     "I'm having trouble completing that right now — could you rephrase, or "
@@ -71,6 +74,13 @@ async def run_agent(
                 Message(role="tool", content=json.dumps(result), tool_call_id=call.id)
             )
 
+    # 4.2's hard-cap contract: "if the cap is hit ... the incident is
+    # logged" — this is the only signal that Luna is looping on tool calls
+    # instead of reaching a final answer within budget.
+    logger.warning(
+        "agent hit the %d-iteration cap without a final answer; returning fallback",
+        max_iterations,
+    )
     return AgentResult(
         text=FALLBACK_MESSAGE,
         input_tokens=total_input_tokens,

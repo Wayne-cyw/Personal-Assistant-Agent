@@ -1,3 +1,7 @@
+import logging
+
+import pytest
+
 from app.agent.loop import FALLBACK_MESSAGE, run_agent
 from app.agent.providers.base import LLMResponse, Message, ToolCall, Usage
 from app.agent.providers.fake import FakeProvider
@@ -125,6 +129,28 @@ async def test_infinite_tool_loop_hits_cap_and_returns_fallback() -> None:
     assert result.text == FALLBACK_MESSAGE
     assert result.hit_iteration_cap is True
     assert len(provider.calls) == 5  # never exceeds max_iterations
+
+
+async def test_iteration_cap_hit_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Engineering Guide 4.2: "if the cap is hit ... the incident is
+    logged" — this is the only production signal that the model is looping
+    on tool calls instead of reaching a final answer within budget.
+    """
+    always_calls_tool = LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id="call_x", name="get_current_date", arguments={})],
+        usage=_usage(),
+        finish_reason="tool_calls",
+    )
+    provider = FakeProvider(responses=[always_calls_tool] * 3)
+
+    with caplog.at_level(logging.WARNING):
+        await run_agent(_messages(), provider, max_tokens=100, max_iterations=3)
+
+    assert any(
+        record.levelno == logging.WARNING and "iteration" in record.getMessage().lower()
+        for record in caplog.records
+    )
 
 
 async def test_unknown_tool_name_surfaces_as_tool_result_not_exception() -> None:
