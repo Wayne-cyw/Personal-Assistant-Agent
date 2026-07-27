@@ -160,7 +160,10 @@ async def chat(
     http_request.state.llm_tokens_out = result.output_tokens
 
     reply_text = result.text
-    ack = _acknowledgment_suffix(newly_name, newly_linkedin)
+    # Skip the acknowledgment on the iteration-cap fallback (Issue #10): it
+    # would read as an incongruous non sequitur appended to "I'm having
+    # trouble completing that right now."
+    ack = None if result.hit_iteration_cap else _acknowledgment_suffix(newly_name, newly_linkedin)
     if ack:
         reply_text = f"{reply_text}\n\n{ack}"
 

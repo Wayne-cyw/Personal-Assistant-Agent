@@ -262,6 +262,30 @@ async def test_complete_stream_accumulates_tool_call_fragments() -> None:
     assert done.tool_calls[0].arguments == {"tz": "UTC"}
 
 
+async def test_complete_stream_handles_truncated_tool_call_json_gracefully() -> None:
+    """Regression test: a budget-tier model can emit tool-call arguments
+    truncated right at the token limit, producing invalid JSON. This must
+    degrade to a tool-result the caller's Pydantic validation naturally
+    rejects (Issue #10's "invalid args -> structured error, not an
+    exception"), not raise json.JSONDecodeError and 500 the whole turn.
+    """
+    provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
+    truncated_delta = _FakeToolCallDelta(
+        0, id="call_1", name="get_current_date", arguments='{"tz": "UT'  # cut off mid-value
+    )
+    choice = _FakeStreamChoice(_FakeDelta(tool_calls=[truncated_delta]), finish_reason="tool_calls")
+    chunks = [_FakeChunk(choices=[choice])]
+    mock_create = AsyncMock(return_value=_FakeAsyncStream(chunks))
+
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        events = [event async for event in provider.complete_stream(_messages(), [], 100)]
+
+    done = events[-1].response
+    assert done is not None
+    assert len(done.tool_calls) == 1
+    assert done.tool_calls[0].arguments == {"_malformed_arguments": '{"tz": "UT'}
+
+
 async def test_complete_stream_sanitizes_error_on_create() -> None:
     provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
     mock_create = AsyncMock(side_effect=_fake_status_error(500))
@@ -305,6 +329,55 @@ async def test_complete_parses_usage_and_cached_tokens() -> None:
     assert response.usage.input_tokens == 20
     assert response.usage.output_tokens == 4
     assert response.usage.cached_input_tokens == 5
+
+
+def _fake_chat_completion_with_tool_call(name: str, arguments: str) -> Any:
+    class _Function:
+        pass
+
+    func = _Function()
+    func.name = name  # type: ignore[attr-defined]
+    func.arguments = arguments  # type: ignore[attr-defined]
+
+    class _ToolCall:
+        pass
+
+    tc = _ToolCall()
+    tc.id = "call_1"  # type: ignore[attr-defined]
+    tc.type = "function"  # type: ignore[attr-defined]
+    tc.function = func  # type: ignore[attr-defined]
+
+    class _Msg:
+        content = ""
+        tool_calls = [tc]
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = "tool_calls"
+
+    class _Completion:
+        choices = [_Choice()]
+        usage = None
+
+    return _Completion()
+
+
+async def test_complete_handles_truncated_tool_call_json_gracefully() -> None:
+    """Non-streaming counterpart of the same regression: a malformed/
+    truncated tool-call arguments string must not raise json.JSONDecodeError
+    and turn a self-correctable tool-result error into a 500 for the whole
+    turn (Issue #10 acceptance criteria).
+    """
+    provider = OpenAIProvider(api_key="test-key", model="gpt-5.6-luna")
+    mock_create = AsyncMock(
+        return_value=_fake_chat_completion_with_tool_call("get_current_date", '{"tz": "UT')
+    )
+
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        response = await provider.complete(_messages(), tools=[], max_tokens=100)
+
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].arguments == {"_malformed_arguments": '{"tz": "UT'}
 
 
 async def test_get_provider_resolves_model_per_role() -> None:

@@ -42,6 +42,51 @@ async def test_tool_call_then_final_answer() -> None:
     assert tool_result_messages[0].tool_call_id == "call_1"
     assert "date" in tool_result_messages[0].content
 
+    # Regression: FakeProvider.calls must store a snapshot per call, not a
+    # reference to the loop's mutated-in-place working list — otherwise the
+    # first call's recorded messages would retroactively "gain" the tool
+    # call/result that were only appended after it was made.
+    first_call_messages = provider.calls[0]
+    assert not any(m.role == "tool" for m in first_call_messages)
+    assert len(first_call_messages) < len(second_call_messages)
+
+
+async def test_multiple_tool_calls_in_one_turn_all_get_matching_results() -> None:
+    """Regression test: when the model makes several tool calls in a single
+    response, each must get its own tool-result message with the matching
+    tool_call_id, in order — an ordering/ID-matching bug here would be easy
+    to introduce and easy to miss without a test exercising more than one
+    call per response.
+    """
+    multi_call_response = LLMResponse(
+        text="",
+        tool_calls=[
+            ToolCall(id="call_1", name="get_current_date", arguments={}),
+            ToolCall(id="call_2", name="get_current_date", arguments={}),
+            ToolCall(id="call_3", name="get_current_date", arguments={}),
+        ],
+        usage=_usage(),
+        finish_reason="tool_calls",
+    )
+    final_response = LLMResponse(text="all done", usage=_usage(), finish_reason="stop")
+    provider = FakeProvider(responses=[multi_call_response, final_response])
+
+    result = await run_agent(_messages(), provider, max_tokens=100, max_iterations=5)
+
+    assert result.text == "all done"
+    second_call_messages = provider.calls[1]
+    tool_result_messages = [m for m in second_call_messages if m.role == "tool"]
+    assert [m.tool_call_id for m in tool_result_messages] == ["call_1", "call_2", "call_3"]
+    assert all("date" in m.content for m in tool_result_messages)
+
+    # Exactly one assistant message carrying all three tool_calls, followed
+    # immediately by the three tool results, in order — the shape the
+    # OpenAI provider's message serialization expects.
+    assistant_msg = second_call_messages[-4]
+    assert assistant_msg.role == "assistant"
+    assert assistant_msg.tool_calls is not None
+    assert [tc.id for tc in assistant_msg.tool_calls] == ["call_1", "call_2", "call_3"]
+
 
 async def test_token_usage_accumulates_across_iterations() -> None:
     tool_call_response = LLMResponse(

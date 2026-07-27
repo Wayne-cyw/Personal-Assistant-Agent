@@ -8,6 +8,7 @@ calendar) register here the same way in later issues (#15, #17).
 from __future__ import annotations
 
 import logging
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from datetime import UTC, datetime
 from pydantic import BaseModel, ValidationError
 
 from app.agent.providers.base import ToolCall, ToolDef
+from app.safety.pii import redact
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +54,16 @@ TOOL_DEFS: list[ToolDef] = [tool.definition for tool in _REGISTRY.values()]
 
 async def execute_tool(call: ToolCall) -> dict[str, object]:
     """Dispatch a tool call, validating arguments against its Pydantic
-    schema. Invalid args (unknown tool, schema mismatch) return a
-    structured error dict *to the model as the tool result* — so it can
-    self-correct — rather than raising; the failure is also logged
-    server-side.
+    schema. Invalid args (unknown tool, schema mismatch) *and* a failure
+    inside the handler itself (a future tool making a real network call —
+    RAG embeddings, calendar API — can fail for reasons unrelated to
+    argument validation) both return a structured error dict *to the model
+    as the tool result* — so it can self-correct — rather than raising;
+    every failure is also logged server-side. Letting a handler exception
+    escape here would turn one bad tool call into a 500 for the whole turn,
+    rather than a self-correctable tool result (Engineering Guide 4.2: tool
+    results are structured, in code, never inferred by letting the caller's
+    exception handling improvise).
     """
     tool = _REGISTRY.get(call.name)
     if tool is None:
@@ -68,4 +76,15 @@ async def execute_tool(call: ToolCall) -> dict[str, object]:
         logger.warning("invalid arguments for tool %s: %s", call.name, exc)
         return {"error": f"Invalid arguments for {call.name}: {exc.errors()}"}
 
-    return await tool.handler(args)
+    try:
+        return await tool.handler(args)
+    except Exception as exc:
+        # Sanitized the same way as app/api/errors.py's generic-exception
+        # handler: a future tool making a real network call (calendar API,
+        # embeddings) can raise an exception carrying credentials in a
+        # header or connection string, so the traceback is redact()ed
+        # before logging rather than passed through raw via
+        # logger.exception(exc_info=exc).
+        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error("tool %s raised during execution\n%s", call.name, redact(tb_text))
+        return {"error": f"{call.name} failed to execute."}

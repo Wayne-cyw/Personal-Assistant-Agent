@@ -47,7 +47,9 @@ class Settings(BaseSettings):
 
     # Orchestration loop (Engineering Guide 4.2, Issue #10): hard cap on
     # tool-call round-trips per turn before falling back to a static message.
-    max_iterations: int = Field(default=5, alias="MAX_ITERATIONS")
+    # ge=1: a misconfigured 0 would silently skip every LLM call and always
+    # return the fallback message, with no startup-time error to catch it.
+    max_iterations: int = Field(default=5, ge=1, alias="MAX_ITERATIONS")
 
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string

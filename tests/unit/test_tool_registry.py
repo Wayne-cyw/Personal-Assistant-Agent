@@ -92,3 +92,53 @@ async def test_execute_tool_wrong_type_arg_returns_structured_error_not_exceptio
     )
     result = await execute_tool(call)  # must not raise
     assert "error" in result
+
+
+class _EmptyArgs(BaseModel):
+    pass
+
+
+async def _raising_handler(_args: BaseModel) -> dict[str, object]:
+    raise RuntimeError("Authorization: Bearer sk-dummy-secret-value-77777")
+
+
+@pytest.fixture
+def tool_that_raises() -> Generator[None]:
+    """A tool whose handler itself fails — not an argument-validation
+    failure. Regression test for a handler-level exception (e.g. a future
+    RAG/calendar tool's network call failing) reaching execute_tool.
+    """
+    registry_module._REGISTRY["test_tool_that_raises"] = _RegisteredTool(
+        definition=ToolDef(
+            name="test_tool_that_raises", description="test-only", parameters={}
+        ),
+        args_model=_EmptyArgs,
+        handler=_raising_handler,
+    )
+    yield
+    del registry_module._REGISTRY["test_tool_that_raises"]
+
+
+async def test_execute_tool_handler_exception_returns_structured_error_not_raised(
+    tool_that_raises: None,
+) -> None:
+    call = ToolCall(id="call_1", name="test_tool_that_raises", arguments={})
+    result = await execute_tool(call)  # must not raise
+    assert "error" in result
+    assert isinstance(result["error"], str)
+    assert "test_tool_that_raises" in result["error"]
+
+
+async def test_execute_tool_handler_exception_never_leaks_secret_via_logging(
+    tool_that_raises: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    call = ToolCall(id="call_1", name="test_tool_that_raises", arguments={})
+
+    result = await execute_tool(call)
+
+    assert "sk-dummy-secret-value-77777" not in str(result)
+    log_output = "\n".join(r.getMessage() for r in caplog.records)
+    assert "sk-dummy-secret-value-77777" not in log_output
