@@ -67,6 +67,25 @@ class Settings(BaseSettings):
     enforce_single_worker: bool = Field(default=False, alias="ENFORCE_SINGLE_WORKER")
     web_concurrency: int | None = Field(default=None, alias="WEB_CONCURRENCY")
 
+    # Cost-control guardrails (Engineering Guide 4.6 layer 4, Issue #12).
+    # A tighter, chat-reply-specific cap than max_tokens_per_turn — pairs
+    # with #8's brevity rule (2-4 sentences by default). max_tokens_per_turn
+    # remains the outer ceiling enforced on every provider call, including
+    # this one (app/api/chat.py takes min(chat_max_output_tokens,
+    # max_tokens_per_turn)); this is the tighter, ordinary-chat-turn value
+    # in the common case where it's the smaller of the two.
+    chat_max_output_tokens: int = Field(default=500, ge=1, alias="CHAT_MAX_OUTPUT_TOKENS")
+    # Per-session lifetime token budget. No number is given in the
+    # Engineering Guide; 50,000 is a deliberately generous default (dozens
+    # of ordinary turns plus a few evictions) that a real deployment should
+    # tune against observed cost, not a value with any special significance.
+    session_token_budget: int = Field(default=50_000, ge=1, alias="SESSION_TOKEN_BUDGET")
+    # Required, no default (same pattern as openai_api_key): the wrap-up
+    # message shown once a session hits its budget names this address
+    # explicitly, so shipping a placeholder here would leak into a real
+    # visitor-facing response.
+    owner_contact_email: str = Field(alias="OWNER_CONTACT_EMAIL")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by

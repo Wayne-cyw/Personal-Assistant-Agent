@@ -11,6 +11,7 @@ import os
 import pytest
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
+os.environ.setdefault("OWNER_CONTACT_EMAIL", "owner@example.com")
 
 
 @pytest.fixture(autouse=True)

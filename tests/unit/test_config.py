@@ -21,6 +21,13 @@ def test_missing_openai_api_key_raises_naming_the_var(monkeypatch: pytest.Monkey
     assert "OPENAI_API_KEY" in str(exc_info.value)
 
 
+def test_missing_owner_contact_email_raises_naming_the_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OWNER_CONTACT_EMAIL", raising=False)
+    with pytest.raises(ValidationError) as exc_info:
+        _settings(OPENAI_API_KEY="key")
+    assert "OWNER_CONTACT_EMAIL" in str(exc_info.value)
+
+
 def test_invalid_llm_provider_value_rejected() -> None:
     with pytest.raises(ValidationError):
         _settings(LLM_PROVIDER="not-a-real-provider", OPENAI_API_KEY="key")
@@ -39,6 +46,8 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.window_low_tokens == 1500
     assert settings.allowed_origins == []
     assert settings.log_level == "INFO"
+    assert settings.chat_max_output_tokens == 500
+    assert settings.session_token_budget == 50_000
 
 
 def test_allowed_origins_parses_comma_separated_string() -> None:
@@ -100,6 +109,8 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "SUMMARY_AUDIT_INTERVAL",
         "ENFORCE_SINGLE_WORKER",
         "WEB_CONCURRENCY",
+        "CHAT_MAX_OUTPUT_TOKENS",
+        "SESSION_TOKEN_BUDGET",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -117,6 +128,8 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.summary_audit_interval == 3
     assert settings.enforce_single_worker is False
     assert settings.web_concurrency is None
+    assert settings.chat_max_output_tokens == 500
+    assert settings.session_token_budget == 50_000
 
 
 def test_web_concurrency_parses_numeric_env_var() -> None:
@@ -145,6 +158,13 @@ def test_max_iterations_zero_or_negative_rejected() -> None:
         _settings(OPENAI_API_KEY="key", MAX_ITERATIONS="-1")
 
 
+def test_chat_max_output_tokens_and_session_token_budget_zero_or_negative_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", CHAT_MAX_OUTPUT_TOKENS="0")
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", SESSION_TOKEN_BUDGET="0")
+
+
 def test_numeric_overrides_are_coerced_to_int() -> None:
     settings = _settings(
         OPENAI_API_KEY="key",
@@ -168,6 +188,7 @@ def test_every_credential_and_model_name_is_env_overridable() -> None:
         LLM_MODEL="gpt-5.6-terra",
         CLASSIFIER_MODEL="gpt-5.6-luna-classifier-test",
         SUMMARIZER_MODEL="gpt-5.6-luna-summarizer-test",
+        OWNER_CONTACT_EMAIL="owner-test@example.com",
     )
 
     assert settings.openai_api_key == "sk-test-arbitrary"
@@ -175,6 +196,7 @@ def test_every_credential_and_model_name_is_env_overridable() -> None:
     assert settings.llm_model == "gpt-5.6-terra"
     assert settings.classifier_model == "gpt-5.6-luna-classifier-test"
     assert settings.summarizer_model == "gpt-5.6-luna-summarizer-test"
+    assert settings.owner_contact_email == "owner-test@example.com"
 
 
 def test_log_level_normalized_to_uppercase() -> None:
