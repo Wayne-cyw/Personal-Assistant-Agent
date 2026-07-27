@@ -165,3 +165,26 @@ async def recent_messages(db: AsyncSession, session_id: str, n: int) -> list[Mes
     )
     result = await db.execute(stmt)
     return list(reversed(result.scalars().all()))
+
+
+async def set_visitor_info(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    name: str | None = None,
+    linkedin: str | None = None,
+) -> SessionRow:
+    """Set visitor_name/visitor_linkedin on the session row (Issue #9).
+    Only overwrites a field when a non-None value is passed — callers decide
+    whether a field is already set before calling this (e.g. capture-once
+    semantics), this function does not check.
+    """
+    row = await db.get(SessionRow, session_id)
+    assert row is not None, f"set_visitor_info called for unknown session_id={session_id!r}"
+    if name is not None:
+        row.visitor_name = name
+    if linkedin is not None:
+        row.visitor_linkedin = linkedin
+    await db.commit()
+    await db.refresh(row)
+    return row
