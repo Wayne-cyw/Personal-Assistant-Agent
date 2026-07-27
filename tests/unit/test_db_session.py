@@ -18,6 +18,7 @@ from app.db import session as db_session
 from app.db.models import Base
 from app.db.session import (
     add_pinned_fact,
+    add_token_budget_used,
     advance_summary,
     append_message,
     get_engine,
@@ -277,6 +278,29 @@ async def test_set_visitor_info_overwrites_unconditionally(
     async with session_factory() as db:
         row = await get_or_create_session(db, "sess-1")
         assert row.visitor_name == "Priya Patel"
+
+
+async def test_add_token_budget_used_accumulates_across_calls(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        first_total = await add_token_budget_used(db, "sess-1", 100)
+        second_total = await add_token_budget_used(db, "sess-1", 50)
+
+    assert first_total == 100
+    assert second_total == 150
+    async with session_factory() as db:
+        row = await get_or_create_session(db, "sess-1")
+        assert row.token_budget_used == 150
+
+
+async def test_add_token_budget_used_unknown_session_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        with pytest.raises(ValueError, match="unknown-session"):
+            await add_token_budget_used(db, "unknown-session", 10)
 
 
 def test_no_sync_db_access_outside_session_module() -> None:

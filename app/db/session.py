@@ -268,6 +268,23 @@ async def advance_summary(
     await db.commit()
 
 
+async def add_token_budget_used(db: AsyncSession, session_id: str, tokens: int) -> int:
+    """Add `tokens` (a cost-weighted count — app/agent/tokens.py's
+    effective_tokens) to sessions.token_budget_used (Issue #12), returning
+    the new total. Called from every real LLM call site that spends
+    against a session's budget: the main loop (app/api/chat.py) and every
+    summarizer call (app/agent/memory.py's run_eviction/run_reconciliation)
+    — a summarizer call is real spend against the same session even though
+    it isn't the visitor-facing turn that triggered it.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        raise ValueError(f"add_token_budget_used called for unknown session_id={session_id!r}")
+    row.token_budget_used += tokens
+    await db.commit()
+    return row.token_budget_used
+
+
 async def increment_eviction_count(db: AsyncSession, session_id: str) -> int:
     """Bump sessions.eviction_count by one after a real eviction (Issue
     #11), returning the new value — drives the SUMMARY_AUDIT_INTERVAL
