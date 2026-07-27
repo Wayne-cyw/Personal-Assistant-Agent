@@ -1,10 +1,10 @@
 """POST /v1/chat handler.
 
-Walking skeleton (Issue #5): placeholder system prompt + last-10-turns
-history + the user's message, sent straight to the LLM, both turns
-persisted. No memory system (#11), no classifier (#25), no orchestration
-loop with tools (#10), no turn-zero prefix (#9) yet — those upgrade this
-handler in later issues without changing the envelope shape.
+Walking skeleton (Issue #5, real system prompt wired in Issue #8): the real
+SYSTEM_PROMPT + last-10-turns history + the user's message, sent straight to
+the LLM, both turns persisted. No memory system (#11), no classifier (#25),
+no orchestration loop with tools (#10), no turn-zero prefix (#9) yet — those
+upgrade this handler in later issues without changing the envelope shape.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
 from app.agent.providers.base import Message as LLMMessage
@@ -28,11 +29,6 @@ router = APIRouter()
 
 _HISTORY_TURNS = 10
 _HISTORY_ROWS = _HISTORY_TURNS * 2  # each turn is one user row + one assistant row
-
-_PLACEHOLDER_SYSTEM_PROMPT = (
-    "You are a helpful assistant. This is a placeholder system prompt; "
-    "Issue #8 replaces it with the real persona and scope rules."
-)
 
 
 class ResponseType(StrEnum):
@@ -75,7 +71,7 @@ async def chat(
     await get_or_create_session(db, request.session_id)
     history = await recent_messages(db, request.session_id, n=_HISTORY_ROWS)
 
-    messages = [LLMMessage(role="system", content=_PLACEHOLDER_SYSTEM_PROMPT)]
+    messages = [LLMMessage(role="system", content=SYSTEM_PROMPT)]
     messages.extend(
         LLMMessage(role=m.role, content=m.content)  # type: ignore[arg-type]
         for m in history
