@@ -44,6 +44,12 @@ select = ["E", "F", "I", "UP", "B"]
 # defaults; B008 otherwise flags every dependency-injected route handler.
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body"]
 
+[tool.ruff.lint.per-file-ignores]
+# Prompt text is prose, not code; wrapping it at 100 chars mid-sentence
+# would hurt readability for no benefit (line length is irrelevant to the
+# model consuming it as one string).
+"app/agent/prompts.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

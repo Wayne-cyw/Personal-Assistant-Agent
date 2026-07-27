@@ -107,6 +107,18 @@ async def test_two_turn_conversation_remembers_first_turn(client: httpx.AsyncCli
     assert "what's my name?" in contents
 
 
+async def test_uses_real_system_prompt_not_a_placeholder(client: httpx.AsyncClient) -> None:
+    from app.agent.prompts import SYSTEM_PROMPT
+
+    fake = _use_fake_provider([_response("hi")])
+
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "hello"})
+
+    system_message = fake.calls[0][0]
+    assert system_message.role == "system"
+    assert system_message.content == SYSTEM_PROMPT
+
+
 async def test_history_window_covers_ten_full_turns(client: httpx.AsyncClient) -> None:
     """Regression test: n passed to recent_messages must be row count (2 per
     turn), not turn count — otherwise "last 10 turns" only covers 5.
