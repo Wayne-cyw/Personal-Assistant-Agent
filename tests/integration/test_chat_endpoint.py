@@ -364,12 +364,18 @@ async def test_eviction_runs_as_background_task_and_updates_summary(
 async def test_flag_summary_conflict_reconciles_as_background_task_not_synchronously(
     client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Issue #11 review fix: flag_summary_conflict must not call the
-    summarizer synchronously inside the turn (that would add a full extra
-    LLM round trip to the user-facing response, contradicting 4.3's
-    zero-added-latency rule for memory bookkeeping) — it only records
-    intent, and app/api/chat.py schedules the actual reconciliation as a
-    post-response background task, mirroring eviction.
+    """End-to-end proof that app/api/chat.py's post-response scheduling for
+    flag_summary_conflict actually works: the summary is corrected after a
+    real HTTP round trip through the endpoint, with the tool-call turn's
+    reply being the model's own final text (not anything reconciliation-
+    related). This does NOT by itself prove no *synchronous* summarizer
+    call happened first — httpx's ASGI transport runs FastAPI
+    BackgroundTasks within the same client.post() call either way, so a
+    synchronous-call regression here would look identical from the outside.
+    That property (flag_summary_conflict never touches the summarizer
+    inline) is what tests/unit/test_tool_registry.py's
+    test_flag_summary_conflict_does_not_touch_the_summarizer directly
+    proves, by asserting zero calls immediately after execute_tool.
     """
     from app.db import session as db_session
 
@@ -415,9 +421,9 @@ async def test_flag_summary_conflict_reconciles_as_background_task_not_synchrono
         "/v1/chat", json={"session_id": "sess-1", "message": "actually never mind"}
     )
 
-    # The reply is the model's own final text — no synchronous
-    # reconciliation call happened in between, so this response wasn't
-    # delayed by one.
+    # The reply is the model's own final text, not anything
+    # reconciliation-related — see the docstring above for what this test
+    # does and doesn't prove about synchronicity.
     assert response.json()["reply"] == "Got it, noted."
 
     session = await _get_session(engine, "sess-1")

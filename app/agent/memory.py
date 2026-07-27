@@ -283,33 +283,50 @@ async def _summarize(
     return None
 
 
+def _memory_lock_key(session_id: str) -> str:
+    """A namespaced lock key distinct from app/api/chat.py's own
+    `session_turn_lock(session_id)` hold during live-turn processing.
+
+    Background memory bookkeeping (eviction, reconciliation) only needs to
+    be serialized against *itself* — two such operations for the same
+    session both write summary_json/summary_through_message_id and can
+    race each other — it does not need to be serialized against live-turn
+    processing, since a live turn never writes those fields. Sharing the
+    live-turn lock key would work for the eviction-vs-eviction race too,
+    but at the cost of blocking (and, past the wait window, 429-ing) a
+    visitor's next message for as long as a background summarizer call is
+    in flight — directly contradicting 4.3's "memory bookkeeping adds zero
+    user-facing latency" guarantee. Namespacing the key avoids that
+    entirely while still closing the original race.
+    """
+    return f"mem:{session_id}"
+
+
 async def run_eviction(session_id: str, summarizer_provider: LLMProvider) -> None:
     """The actual eviction + summarization work, scheduled by
     app/api/chat.py as a FastAPI background task so it runs post-response
     (4.3: "adding zero user-facing latency"). Opens its own DB session —
     the request-scoped one is closed by the time a background task runs.
 
-    Runs under the per-session lock (app/agent/session_lock.py), same as
-    the request that scheduled it — by the time this background task
-    actually executes, that request's own lock hold has already been
-    released (FastAPI runs background tasks after the response is sent),
-    so re-acquiring here is what actually serializes this against a second,
-    rapid-fire turn on the same session that might otherwise schedule its
-    own concurrent run_eviction. Without this, two eviction runs racing on
-    the same session's summary_through_message_id boundary can regress it
-    (a later, larger eviction's advance gets overwritten by an earlier,
-    smaller one that reads stale state and commits after) — silently
-    re-exposing already-summarized turns in the live window and violating
-    4.3's "each turn still summarized at most once, ever" guarantee.
+    Runs under a namespaced per-session lock (see _memory_lock_key) so two
+    eviction runs racing on the same session's summary_through_message_id
+    boundary can't regress it (a later, larger eviction's advance getting
+    overwritten by an earlier, smaller one that reads stale state and
+    commits after) — silently re-exposing already-summarized turns in the
+    live window and violating 4.3's "each turn still summarized at most
+    once, ever" guarantee — without contending with live-turn processing.
 
     If the lock is still held (SessionBusyError) after the wait window —
-    e.g. a live turn or another eviction is already in flight — this skips
-    gracefully rather than raising out of the background task: the window
-    just stays over budget until the next turn's persist_turn re-triggers
-    eviction, which is a cost/latency concern, not a correctness one.
+    e.g. another eviction or a reconciliation is already in flight for this
+    session — this skips gracefully rather than raising out of the
+    background task: the window just stays over budget until the next
+    turn's persist_turn re-triggers eviction, which is a cost/latency
+    concern, not a correctness one (unlike run_reconciliation's skip case
+    below, eviction's trigger condition is recomputed from durable state
+    every turn, so a skipped run is never silently lost).
     """
     try:
-        async with session_turn_lock(session_id):
+        async with session_turn_lock(_memory_lock_key(session_id)):
             await _run_eviction_locked(session_id, summarizer_provider)
     except SessionBusyError:
         logger.warning(
@@ -417,18 +434,31 @@ async def run_reconciliation(
     scheduled by app/api/chat.py for each of ToolContext.
     pending_reconciliations after run_agent returns — mirrors run_eviction:
     own DB session (the request-scoped one is gone by the time this runs),
-    same per-session lock (reconciliation also mutates summary_json, so it
-    needs the same race protection eviction does), same graceful skip if
-    the lock is still held after the wait window.
+    the same namespaced per-session lock (see _memory_lock_key —
+    reconciliation also mutates summary_json, so it needs the same race
+    protection eviction does, against eviction as well as against another
+    reconciliation), same graceful skip if the lock is still held after the
+    wait window.
+
+    Unlike eviction, a skipped reconciliation here is *not* automatically
+    retried: there is no durable "reconciliation pending" state anywhere,
+    so if this is skipped, the visitor's flagged correction is simply not
+    applied unless the model happens to call flag_summary_conflict again on
+    a later turn. Accepted as a rare-contention corner case rather than
+    building a durable retry queue for what is a self-correction layer on
+    top of an already-correct incremental summary, not the source of truth
+    (the verbatim messages log always is) — but worth flagging explicitly
+    rather than leaving the old, inaccurate "will retry" log message.
     """
     try:
-        async with session_turn_lock(session_id):
+        async with session_turn_lock(_memory_lock_key(session_id)):
             async with get_session_factory()() as db:
                 await reload_and_reconcile(
                     db, session_id, summarizer_provider, trigger=trigger, detail=detail
                 )
     except SessionBusyError:
         logger.warning(
-            "reconciliation for session %s skipped: session busy, will retry next trigger",
+            "reconciliation for session %s skipped (session busy): the flagged correction "
+            "was not applied and will not be retried automatically",
             session_id,
         )

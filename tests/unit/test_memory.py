@@ -28,7 +28,7 @@ from app.agent.memory import (
 )
 from app.agent.providers.base import LLMResponse, Usage
 from app.agent.providers.fake import FakeProvider
-from app.agent.session_lock import SessionBusyError
+from app.agent.session_lock import SessionBusyError, session_turn_lock
 from app.config import settings
 from app.db import session as db_session
 from app.db.models import Base, SessionRow
@@ -358,6 +358,42 @@ async def test_run_eviction_skips_gracefully_when_session_busy(
         await run_eviction("s1", FakeProvider(responses=[]))  # must not raise
 
     assert any("skipped" in r.getMessage() for r in caplog.records)
+
+
+async def test_background_eviction_does_not_block_a_concurrent_live_turn(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression test for a second review pass's finding: run_eviction
+    must use a lock key namespaced separately from
+    app/api/chat.py's live-turn session_turn_lock(session_id) hold — a live
+    turn never writes summary_json/summary_through_message_id, so it has
+    nothing to race with a background eviction on, and must not be forced
+    to wait behind one (that would violate 4.3's "memory bookkeeping adds
+    zero user-facing latency" guarantee just as badly as the original
+    synchronous-reconciliation bug did).
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "s1")
+        await persist_turn(db, "s1", "hi", "hello!", [])
+
+    async def hold_eviction_lock_for(seconds: float) -> None:
+        async with session_turn_lock(memory_module._memory_lock_key("s1")):
+            await asyncio.sleep(seconds)
+
+    # A live turn's own lock (app/api/chat.py's, unnamespaced) must succeed
+    # immediately even while a background eviction "holds" the memory-only
+    # lock for the same session — proving the two don't contend.
+    eviction_hold = asyncio.create_task(hold_eviction_lock_for(1.0))
+    await asyncio.sleep(0.01)  # let the hold actually acquire first
+    start = asyncio.get_running_loop().time()
+    async with session_turn_lock("s1"):
+        pass
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert elapsed < 0.5  # nowhere near the eviction hold's 1s duration
+    eviction_hold.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await eviction_hold
 
 
 # --- (d) prefix stability between evictions --------------------------------
