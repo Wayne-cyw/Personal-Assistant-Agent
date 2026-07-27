@@ -1,7 +1,6 @@
 import json
 
 import httpx
-import pytest
 
 from scripts.chat_cli import (
     _build_payload,
@@ -50,15 +49,37 @@ def test_render_data_booking_proposal_as_numbered_list() -> None:
     assert rendered == "Available times:\n  1. Aug 1, 10:00 AM\n  2. Aug 1, 2:00 PM"
 
 
-def test_render_data_booking_confirmed() -> None:
+def test_render_data_booking_confirmed_includes_slot_and_timezone() -> None:
     data: dict[str, object] = {
         "booking_id": "42",
-        "slot": {},
-        "timezone": "UTC",
+        "slot": {"start_iso": "2026-08-01T10:00:00", "label": "Aug 1, 10:00 AM"},
+        "timezone": "America/Toronto",
         "next_steps": "Check your email.",
     }
     rendered = _render_data("booking_confirmed", data)
-    assert rendered == "Booking confirmed (id: 42). Check your email."
+    assert rendered == (
+        "Booking confirmed for Aug 1, 10:00 AM (America/Toronto), id: 42. Check your email."
+    )
+
+
+def test_render_data_booking_confirmation_request_uses_slot_label_not_raw_dict() -> None:
+    data: dict[str, object] = {
+        "slot": {
+            "slot_id": "1",
+            "start_iso": "2026-08-01T10:00:00",
+            "end_iso": "2026-08-01T10:30:00",
+            "label": "Aug 1, 10:00 AM",
+        },
+        "timezone": "America/Toronto",
+        "name": "Sam",
+        "email": "sam@example.com",
+    }
+    rendered = _render_data("booking_confirmation_request", data)
+    assert rendered is not None
+    assert "{'slot_id'" not in rendered  # must not print a raw dict repr
+    assert "Aug 1, 10:00 AM" in rendered
+    assert "Sam" in rendered
+    assert "sam@example.com" in rendered
 
 
 def test_render_data_none_for_plain_message() -> None:
@@ -119,10 +140,43 @@ def test_send_turn_error_envelope() -> None:
     assert result == "error [invalid_request]: The request was invalid."
 
 
-def test_send_turn_connect_error_propagates() -> None:
+def test_send_turn_connect_error_formatted_not_raised() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
-    with pytest.raises(httpx.ConnectError):
-        send_turn(client, "sess-1", "hi", None)
+    result = send_turn(client, "sess-1", "hi", None)  # must not raise
+    assert "could not connect" in result
+    assert "is the server running" in result
+
+
+def test_send_turn_timeout_formatted_not_raised() -> None:
+    """A read timeout (e.g. a free-tier cold start per the Tech Stack table)
+    must not kill the whole REPL session.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    result = send_turn(client, "sess-1", "hi", None)  # must not raise
+    assert result.startswith("error: request failed")
+
+
+def test_send_turn_non_json_response_formatted_not_raised() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, content=b"<html>Bad Gateway</html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    result = send_turn(client, "sess-1", "hi", None)  # must not raise
+    assert "non-JSON response" in result
+    assert "502" in result
+
+
+def test_send_turn_missing_reply_field_does_not_crash() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"type": "message", "data": None})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    result = send_turn(client, "sess-1", "hi", None)  # must not raise KeyError
+    assert result == ""
