@@ -268,6 +268,22 @@ async def advance_summary(
     await db.commit()
 
 
+async def increment_eviction_count(db: AsyncSession, session_id: str) -> int:
+    """Bump sessions.eviction_count by one after a real eviction (Issue
+    #11), returning the new value — drives the SUMMARY_AUDIT_INTERVAL
+    scheduling check in app/agent/memory.py's run_eviction. A dedicated
+    function rather than a direct ORM mutation in memory.py, per this
+    module's own rule that every DB write goes through a named repo
+    function here.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        raise ValueError(f"increment_eviction_count called for unknown session_id={session_id!r}")
+    row.eviction_count += 1
+    await db.commit()
+    return row.eviction_count
+
+
 async def overwrite_summary_content(
     db: AsyncSession, session_id: str, *, summary_json: dict[str, object]
 ) -> None:

@@ -23,7 +23,7 @@ from app.agent.providers.base import (
 from app.agent.providers.fake import FakeProvider
 from app.api.chat import get_main_provider, get_summarizer_provider
 from app.db.models import Base, SessionRow
-from app.db.session import get_db
+from app.db.session import advance_summary, get_db
 from app.main import app
 
 
@@ -358,6 +358,73 @@ async def test_eviction_runs_as_background_task_and_updates_summary(
     assert session is not None
     assert session.summary_json is not None
     assert session.summary_json["visitor_context"] == "chatting"
+    assert fake_summarizer.calls  # the background task actually ran
+
+
+async def test_flag_summary_conflict_reconciles_as_background_task_not_synchronously(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #11 review fix: flag_summary_conflict must not call the
+    summarizer synchronously inside the turn (that would add a full extra
+    LLM round trip to the user-facing response, contradicting 4.3's
+    zero-added-latency rule for memory bookkeeping) — it only records
+    intent, and app/api/chat.py schedules the actual reconciliation as a
+    post-response background task, mirroring eviction.
+    """
+    from app.db import session as db_session
+
+    monkeypatch.setattr(
+        db_session, "_session_factory", async_sessionmaker(engine, expire_on_commit=False)
+    )
+
+    await _prime_past_turn_zero(client, "sess-1")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as db:
+        await advance_summary(
+            db,
+            "sess-1",
+            summary_json={
+                "visitor_context": "stale",
+                "open_questions": [],
+                "commitments": [],
+                "notes": [],
+            },
+            summary_through_message_id=1,
+        )
+
+    _use_fake_provider(
+        [
+            _tool_call_response(
+                "flag_summary_conflict",
+                {"explanation": "visitor said they're no longer interested"},
+            ),
+            _response("Got it, noted."),
+        ]
+    )
+    corrected_json = (
+        '{"visitor_context": "corrected", "open_questions": [], '
+        '"commitments": [], "notes": []}'
+    )
+    summary_usage = Usage(input_tokens=1, output_tokens=1)
+    fake_summarizer = FakeProvider(
+        responses=[LLMResponse(text=corrected_json, usage=summary_usage, finish_reason="stop")]
+    )
+    app.dependency_overrides[get_summarizer_provider] = lambda: fake_summarizer
+
+    response = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "actually never mind"}
+    )
+
+    # The reply is the model's own final text — no synchronous
+    # reconciliation call happened in between, so this response wasn't
+    # delayed by one.
+    assert response.json()["reply"] == "Got it, noted."
+
+    session = await _get_session(engine, "sess-1")
+    assert session is not None
+    assert session.summary_json is not None
+    assert session.summary_json["visitor_context"] == "corrected"
+    assert session.summary_through_message_id == 1  # unchanged — content corrected, not coverage
     assert fake_summarizer.calls  # the background task actually ran
 
 

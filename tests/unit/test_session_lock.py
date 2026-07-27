@@ -3,19 +3,11 @@ import contextlib
 
 import pytest
 
-import app.agent.session_lock as session_lock_module
 from app.agent.session_lock import SessionBusyError, session_turn_lock
 
-
-@pytest.fixture(autouse=True)
-def _reset_locks() -> None:
-    # _locks is process-global and keyed by session_id; each test gets its
-    # own event loop (pytest-asyncio, function scope), and an asyncio.Lock
-    # created under a previous test's loop raises RuntimeError if reused
-    # under a new one. Real deployments never hit this — the process has
-    # exactly one event loop for its whole lifetime (4.3) — it's purely a
-    # test-isolation artifact of reusing the same session_id across tests.
-    session_lock_module._locks.clear()
+# tests/conftest.py's autouse _reset_session_locks fixture clears
+# app.agent.session_lock._locks before every test in the suite — see its
+# docstring for why that's needed even within this file alone.
 
 
 async def test_lock_is_reentrant_free_sequential_acquire_release() -> None:

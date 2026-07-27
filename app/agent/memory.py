@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.prompts import SUMMARIZER_SYSTEM_PROMPT
 from app.agent.providers.base import LLMProvider, UpstreamError
 from app.agent.providers.base import Message as LLMMessage
+from app.agent.session_lock import SessionBusyError, session_turn_lock
 from app.agent.tokens import count_tokens
 from app.config import settings
 from app.db.models import Message as MessageRow
@@ -43,6 +44,7 @@ from app.db.session import (
     advance_summary,
     append_message,
     get_session_factory,
+    increment_eviction_count,
     messages_after,
     messages_up_to,
     overwrite_summary_content,
@@ -286,7 +288,36 @@ async def run_eviction(session_id: str, summarizer_provider: LLMProvider) -> Non
     app/api/chat.py as a FastAPI background task so it runs post-response
     (4.3: "adding zero user-facing latency"). Opens its own DB session —
     the request-scoped one is closed by the time a background task runs.
+
+    Runs under the per-session lock (app/agent/session_lock.py), same as
+    the request that scheduled it — by the time this background task
+    actually executes, that request's own lock hold has already been
+    released (FastAPI runs background tasks after the response is sent),
+    so re-acquiring here is what actually serializes this against a second,
+    rapid-fire turn on the same session that might otherwise schedule its
+    own concurrent run_eviction. Without this, two eviction runs racing on
+    the same session's summary_through_message_id boundary can regress it
+    (a later, larger eviction's advance gets overwritten by an earlier,
+    smaller one that reads stale state and commits after) — silently
+    re-exposing already-summarized turns in the live window and violating
+    4.3's "each turn still summarized at most once, ever" guarantee.
+
+    If the lock is still held (SessionBusyError) after the wait window —
+    e.g. a live turn or another eviction is already in flight — this skips
+    gracefully rather than raising out of the background task: the window
+    just stays over budget until the next turn's persist_turn re-triggers
+    eviction, which is a cost/latency concern, not a correctness one.
     """
+    try:
+        async with session_turn_lock(session_id):
+            await _run_eviction_locked(session_id, summarizer_provider)
+    except SessionBusyError:
+        logger.warning(
+            "eviction for session %s skipped: session busy, will retry next turn", session_id
+        )
+
+
+async def _run_eviction_locked(session_id: str, summarizer_provider: LLMProvider) -> None:
     async with get_session_factory()() as db:
         session = await db.get(SessionRow, session_id)
         if session is None:
@@ -309,10 +340,9 @@ async def run_eviction(session_id: str, summarizer_provider: LLMProvider) -> Non
             summary_json=new_summary.model_dump(),
             summary_through_message_id=evicted[-1].id,
         )
-        session.eviction_count += 1
-        await db.commit()
+        new_count = await increment_eviction_count(db, session_id)
 
-        if session.eviction_count % settings.summary_audit_interval == 0:
+        if new_count % settings.summary_audit_interval == 0:
             await _run_drift_audit(db, session_id, summarizer_provider)
 
 
@@ -378,3 +408,27 @@ async def reload_and_reconcile(
         new_summary.model_dump(),
     )
     return new_summary
+
+
+async def run_reconciliation(
+    session_id: str, summarizer_provider: LLMProvider, *, trigger: str, detail: str = ""
+) -> None:
+    """Background-task entry point for reload_and_reconcile (Issue #11),
+    scheduled by app/api/chat.py for each of ToolContext.
+    pending_reconciliations after run_agent returns — mirrors run_eviction:
+    own DB session (the request-scoped one is gone by the time this runs),
+    same per-session lock (reconciliation also mutates summary_json, so it
+    needs the same race protection eviction does), same graceful skip if
+    the lock is still held after the wait window.
+    """
+    try:
+        async with session_turn_lock(session_id):
+            async with get_session_factory()() as db:
+                await reload_and_reconcile(
+                    db, session_id, summarizer_provider, trigger=trigger, detail=detail
+                )
+    except SessionBusyError:
+        logger.warning(
+            "reconciliation for session %s skipped: session busy, will retry next trigger",
+            session_id,
+        )

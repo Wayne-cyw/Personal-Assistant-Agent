@@ -16,7 +16,6 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, ValidationError
 
-from app.agent.memory import reload_and_reconcile
 from app.agent.providers.base import ToolCall, ToolDef
 from app.agent.visitor_info import extract_linkedin_url
 from app.config import settings
@@ -46,12 +45,15 @@ class SaveVisitorInfoArgs(BaseModel):
 
 
 def _sanitize_short_text(value: str, max_length: int) -> str:
-    # Strip non-printable characters and collapse whitespace before
-    # clamping — a pinned-profile field is rendered verbatim into every
-    # future prompt (Engineering Guide 4.6: visitor-volunteered strings are
-    # data, and a multi-line/oddly-formatted value shouldn't be able to
-    # smuggle extra structure into that block).
-    cleaned = "".join(ch for ch in value if ch.isprintable() or ch == " ")
+    # Replace (not delete) non-printable characters before collapsing
+    # whitespace and clamping — a pinned-profile field is rendered verbatim
+    # into every future prompt (Engineering Guide 4.6: visitor-volunteered
+    # strings are data, and a multi-line/oddly-formatted value shouldn't be
+    # able to smuggle extra structure into that block). Replacing with a
+    # space rather than deleting matters: deleting a newline glues the
+    # words on either side of it together ("no\nthing" -> "nothing"),
+    # silently changing the text's meaning instead of just its formatting.
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in value)
     cleaned = " ".join(cleaned.split())
     return cleaned[:max_length]
 
@@ -103,15 +105,15 @@ class FlagSummaryConflictArgs(BaseModel):
 
 
 async def _flag_summary_conflict(args: BaseModel, context: ToolContext) -> dict[str, object]:
+    """Records the conflict for app/api/chat.py to schedule as a background
+    reconciliation (app/agent/memory.py's run_reconciliation) rather than
+    running reload_and_reconcile here — that makes a real summarizer LLM
+    call, and reconciliation must not add user-facing latency to the turn
+    any more than eviction does (Engineering Guide 4.3).
+    """
     assert isinstance(args, FlagSummaryConflictArgs)
-    result = await reload_and_reconcile(
-        context.db,
-        context.session_id,
-        context.summarizer_provider,
-        trigger="model_detected",
-        detail=args.explanation,
-    )
-    return {"reconciled": result is not None}
+    context.pending_reconciliations.append(args.explanation)
+    return {"acknowledged": True}
 
 
 @dataclass

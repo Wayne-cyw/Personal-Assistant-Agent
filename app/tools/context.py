@@ -9,7 +9,7 @@ rather than a bespoke parameter per tool.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,3 +25,11 @@ class ToolContext:
     # per 4.3's "fully isolated call sites" rule, so it's threaded
     # separately rather than reusing whatever provider the main loop got.
     summarizer_provider: LLMProvider
+    # flag_summary_conflict (app/tools/registry.py) appends the model's
+    # explanation here instead of running reconciliation synchronously —
+    # reload_and_reconcile makes a real summarizer LLM call, and 4.3's
+    # memory-bookkeeping design principle is that none of that ever adds
+    # user-facing latency to the turn. app/api/chat.py reads this after
+    # run_agent returns and schedules app/agent/memory.py's
+    # run_reconciliation as a post-response background task per entry.
+    pending_reconciliations: list[str] = field(default_factory=list)

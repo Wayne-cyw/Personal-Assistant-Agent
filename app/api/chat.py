@@ -29,7 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.intro import INTRO_MESSAGE
 from app.agent.loop import run_agent
-from app.agent.memory import assemble_messages, load_memory, persist_turn, run_eviction
+from app.agent.memory import (
+    assemble_messages,
+    load_memory,
+    persist_turn,
+    run_eviction,
+    run_reconciliation,
+)
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
@@ -158,5 +164,18 @@ async def chat(
         )
         if needs_eviction:
             background_tasks.add_task(run_eviction, request.session_id, summarizer_provider)
+
+        # flag_summary_conflict (app/tools/registry.py) only records intent
+        # on tool_context during the loop above — the actual reconciliation
+        # call runs here as a background task, same as eviction, so it
+        # never adds a summarizer round trip to this response.
+        for explanation in tool_context.pending_reconciliations:
+            background_tasks.add_task(
+                run_reconciliation,
+                request.session_id,
+                summarizer_provider,
+                trigger="model_detected",
+                detail=explanation,
+            )
 
         return ChatResponse(reply=result.text, type=ResponseType.MESSAGE, data=None)

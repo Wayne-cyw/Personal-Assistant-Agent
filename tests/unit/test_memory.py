@@ -1,3 +1,6 @@
+import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -9,6 +12,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import app.agent.memory as memory_module
 from app.agent.memory import (
     ToolEvent,
     _one_line_receipt,
@@ -20,13 +24,15 @@ from app.agent.memory import (
     reload_and_reconcile,
     render_pinned_profile,
     run_eviction,
+    run_reconciliation,
 )
 from app.agent.providers.base import LLMResponse, Usage
 from app.agent.providers.fake import FakeProvider
+from app.agent.session_lock import SessionBusyError
 from app.config import settings
 from app.db import session as db_session
 from app.db.models import Base, SessionRow
-from app.db.session import get_or_create_session, set_visitor_info
+from app.db.session import advance_summary, get_or_create_session, set_visitor_info
 
 
 @pytest.fixture
@@ -298,6 +304,62 @@ async def test_second_eviction_summarizer_receives_only_newly_evicted_turns(
     assert "question 6" in second_call_user_content or "question 7" in second_call_user_content
 
 
+async def test_concurrent_evictions_on_the_same_session_serialize_not_race(
+    monkeypatch: pytest.MonkeyPatch, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Regression test for a race a code review caught: without the
+    per-session lock, two run_eviction calls racing on the same session can
+    each read a stale summary_through_message_id and commit
+    advance_summary independently — the second's stale, smaller advance can
+    overwrite the first's, regressing the boundary backward and causing
+    already-summarized turns to be silently re-exposed in the live window
+    (violating "each turn summarized at most once, ever"). With the lock,
+    the second call only runs after the first has fully committed, sees the
+    already-advanced boundary, and finds nothing left to evict.
+    """
+    monkeypatch.setattr(settings, "window_low_tokens", 5)
+    fake = FakeProvider(
+        responses=[
+            _summary_response(_summary_json("first")),
+            _summary_response(_summary_json("second")),
+        ]
+    )
+
+    async with session_factory() as db:
+        await get_or_create_session(db, "s1")
+        for i in range(6):
+            await persist_turn(db, "s1", f"question {i}", f"answer {i}", [])
+
+    await asyncio.gather(run_eviction("s1", fake), run_eviction("s1", fake))
+
+    # Only one eviction actually found anything to evict and called the
+    # summarizer — the second, serialized behind the lock, saw the
+    # already-advanced boundary and had nothing left to do.
+    assert len(fake.calls) == 1
+
+    async with session_factory() as db:
+        session = await get_or_create_session(db, "s1")
+    assert session.eviction_count == 1
+    assert session.summary_json is not None
+    assert session.summary_json["visitor_context"] == "first"
+
+
+async def test_run_eviction_skips_gracefully_when_session_busy(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    @contextlib.asynccontextmanager
+    async def _always_busy(session_id: str, **_kwargs: object) -> AsyncGenerator[None]:
+        raise SessionBusyError(session_id)
+        yield  # pragma: no cover — unreachable; makes this an async generator function
+
+    monkeypatch.setattr(memory_module, "session_turn_lock", _always_busy)
+
+    with caplog.at_level(logging.WARNING):
+        await run_eviction("s1", FakeProvider(responses=[]))  # must not raise
+
+    assert any("skipped" in r.getMessage() for r in caplog.records)
+
+
 # --- (d) prefix stability between evictions --------------------------------
 
 
@@ -427,3 +489,55 @@ async def test_reload_and_reconcile_no_summary_yet_is_a_noop(
         result = await reload_and_reconcile(db, "s1", fake, trigger="model_detected")
     assert result is None
     assert fake.calls == []
+
+
+# --- run_reconciliation: background-task entry point -------------------------
+
+
+async def test_run_reconciliation_opens_own_session_and_updates_summary(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Issue #11 review fix: flag_summary_conflict (app/tools/registry.py)
+    no longer calls reload_and_reconcile synchronously inside the turn — it
+    only records intent, and app/api/chat.py schedules this function as a
+    post-response background task instead, mirroring run_eviction.
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "s1")
+        await advance_summary(
+            db,
+            "s1",
+            summary_json={
+                "visitor_context": "stale",
+                "open_questions": [],
+                "commitments": [],
+                "notes": [],
+            },
+            summary_through_message_id=0,
+        )
+    fake = FakeProvider(responses=[_summary_response(_summary_json("corrected"))])
+
+    await run_reconciliation("s1", fake, trigger="model_detected", detail="visitor corrected role")
+
+    async with session_factory() as db:
+        session = await get_or_create_session(db, "s1")
+    assert session.summary_json is not None
+    assert session.summary_json["visitor_context"] == "corrected"
+    assert session.summary_through_message_id == 0  # unchanged
+
+
+async def test_run_reconciliation_skips_gracefully_when_session_busy(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    @contextlib.asynccontextmanager
+    async def _always_busy(session_id: str, **_kwargs: object) -> AsyncGenerator[None]:
+        raise SessionBusyError(session_id)
+        yield  # pragma: no cover — unreachable; makes this an async generator function
+
+    monkeypatch.setattr(memory_module, "session_turn_lock", _always_busy)
+
+    with caplog.at_level(logging.WARNING):
+        # must not raise
+        await run_reconciliation("s1", FakeProvider(responses=[]), trigger="model_detected")
+
+    assert any("skipped" in r.getMessage() for r in caplog.records)
