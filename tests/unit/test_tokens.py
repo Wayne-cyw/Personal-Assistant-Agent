@@ -43,3 +43,13 @@ def test_effective_tokens_discounts_cached_input_at_ten_percent() -> None:
 def test_effective_tokens_fully_cached_input_is_mostly_discounted() -> None:
     result = effective_tokens(input_tokens=1000, cached_input_tokens=1000, output_tokens=0)
     assert result == 100  # 1000 * 0.1
+
+
+def test_effective_tokens_clamps_malformed_cached_greater_than_input() -> None:
+    """Regression test: a malformed provider response with cached_input_
+    tokens > input_tokens (not something this app controls) must not
+    produce a negative uncached count that silently under-charges the
+    budget this feeds — clamped to 0 rather than going negative.
+    """
+    result = effective_tokens(input_tokens=10, cached_input_tokens=50, output_tokens=5)
+    assert result == 10  # 0 uncached + 50*0.1 + 5 = 10, never negative

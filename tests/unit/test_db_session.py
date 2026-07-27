@@ -295,6 +295,33 @@ async def test_add_token_budget_used_accumulates_across_calls(
         assert row.token_budget_used == 150
 
 
+async def test_add_token_budget_used_concurrent_writers_do_not_lose_increments(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression test for a code review finding: app/api/chat.py's main-
+    loop usage and app/agent/memory.py's background summarizer usage are
+    charged to the same session from two call sites that are deliberately
+    *not* serialized against each other (different session_turn_lock
+    namespaces — live-turn vs "mem:"-prefixed). A naive read-modify-write
+    (`row.token_budget_used += tokens; commit()`) loses increments under
+    exactly this kind of concurrent write; the atomic `SET x = x + n`
+    UPDATE this function uses must not.
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+
+    async def add_many(amount: int, times: int) -> None:
+        for _ in range(times):
+            async with session_factory() as db:
+                await add_token_budget_used(db, "sess-1", amount)
+
+    await asyncio.gather(add_many(1, 50), add_many(2, 50))
+
+    async with session_factory() as db:
+        row = await get_or_create_session(db, "sess-1")
+    assert row.token_budget_used == 1 * 50 + 2 * 50  # every increment landed, none lost
+
+
 async def test_add_token_budget_used_unknown_session_raises(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -272,17 +272,30 @@ async def add_token_budget_used(db: AsyncSession, session_id: str, tokens: int) 
     """Add `tokens` (a cost-weighted count — app/agent/tokens.py's
     effective_tokens) to sessions.token_budget_used (Issue #12), returning
     the new total. Called from every real LLM call site that spends
-    against a session's budget: the main loop (app/api/chat.py) and every
-    summarizer call (app/agent/memory.py's run_eviction/run_reconciliation)
-    — a summarizer call is real spend against the same session even though
-    it isn't the visitor-facing turn that triggered it.
+    against a session's budget: the main loop (app/api/chat.py, under its
+    own session_turn_lock(session_id)) and every summarizer call
+    (app/agent/memory.py's run_eviction/run_reconciliation, background
+    tasks running under a deliberately *different* lock namespace,
+    session_turn_lock(f"mem:{{session_id}}") — see _memory_lock_key's
+    docstring for why). Those two call sites are not serialized against
+    each other, so this is an atomic single-statement `SET x = x + n`
+    UPDATE (4.7 rule 3's pattern for exactly this class of counter) rather
+    than a read-modify-write in Python — the latter would lose an
+    increment whenever a live turn's usage and a background summarizer's
+    usage get charged concurrently for the same session.
     """
-    row = await db.get(SessionRow, session_id)
+    stmt = (
+        update(SessionRow)
+        .where(SessionRow.id == session_id)
+        .values(token_budget_used=SessionRow.token_budget_used + tokens)
+        .returning(SessionRow.token_budget_used)
+    )
+    result = await db.execute(stmt)
+    row = result.first()
     if row is None:
         raise ValueError(f"add_token_budget_used called for unknown session_id={session_id!r}")
-    row.token_budget_used += tokens
     await db.commit()
-    return row.token_budget_used
+    return int(row[0])
 
 
 async def increment_eviction_count(db: AsyncSession, session_id: str) -> int:
@@ -291,14 +304,23 @@ async def increment_eviction_count(db: AsyncSession, session_id: str) -> int:
     scheduling check in app/agent/memory.py's run_eviction. A dedicated
     function rather than a direct ORM mutation in memory.py, per this
     module's own rule that every DB write goes through a named repo
-    function here.
+    function here. Atomic `SET x = x + 1`, same as add_token_budget_used —
+    every current caller already runs under the "mem:" lock namespace, so
+    this isn't currently exposed to a cross-lock-domain race, but there's
+    no reason for this counter to be less safe than that one.
     """
-    row = await db.get(SessionRow, session_id)
+    stmt = (
+        update(SessionRow)
+        .where(SessionRow.id == session_id)
+        .values(eviction_count=SessionRow.eviction_count + 1)
+        .returning(SessionRow.eviction_count)
+    )
+    result = await db.execute(stmt)
+    row = result.first()
     if row is None:
         raise ValueError(f"increment_eviction_count called for unknown session_id={session_id!r}")
-    row.eviction_count += 1
     await db.commit()
-    return row.eviction_count
+    return int(row[0])
 
 
 async def overwrite_summary_content(

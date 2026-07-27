@@ -145,6 +145,11 @@ async def chat(
         # a session that has already spent its lifetime budget gets a
         # static wrap-up message and zero LLM calls — but the message
         # itself is still logged, per 4.3's "DB log is complete" invariant.
+        # Deliberately permanent for the rest of the session's life once
+        # crossed (token_budget_used only ever increases, and there's no
+        # reset path) — the plain reading of "lifetime budget" in the issue
+        # body, and simpler than trying to distinguish "trivial" turns that
+        # might still deserve a real reply from ones that don't.
         if session.token_budget_used >= settings.session_token_budget:
             await append_message(db, request.session_id, "user", request.message)
             reply_text = _session_budget_exceeded_message()

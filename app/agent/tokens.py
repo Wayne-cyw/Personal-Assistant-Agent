@@ -70,8 +70,13 @@ def effective_tokens(*, input_tokens: int, cached_input_tokens: int, output_toke
     `input_tokens` (matching Usage's field semantics in
     app/agent/providers/base.py), so it's discounted rather than added on
     top of the full input count.
+
+    Defensively clamped at 0: a malformed provider response with
+    cached_input_tokens > input_tokens (an SDK bug, not something this app
+    controls) would otherwise silently produce a negative uncached count,
+    *reducing* what a cost/safety guardrail charges rather than erroring.
     """
-    uncached_input = input_tokens - cached_input_tokens
+    uncached_input = max(0, input_tokens - cached_input_tokens)
     weighted_cached = cached_input_tokens * CACHED_INPUT_DISCOUNT
     return round(uncached_input + weighted_cached + output_tokens)
 

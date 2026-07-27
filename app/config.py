@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -124,6 +124,28 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip().lstrip("-").isdigit():
             return None
         return value
+
+    @model_validator(mode="after")
+    def _check_max_tokens_per_turn_supports_summarization(self) -> Settings:
+        # Mirrors app/agent/memory.py's _SUMMARIZER_MAX_TOKENS_FLOOR
+        # (duplicated here, not imported, to avoid a config<->memory
+        # circular import — keep the two in sync if either changes).
+        # _summarize() clamps its own call to
+        # min(its own computed budget, max_tokens_per_turn) — Issue #12's
+        # "enforce MAX_TOKENS_PER_TURN on every provider call" rule. Below
+        # this floor, that clamp guarantees every summarizer call is too
+        # small to emit valid JSON, so every eviction fails, retries once,
+        # and burns real tokens with no way to ever succeed (a fail-fast
+        # startup error here is cheap insurance against that silent,
+        # unbounded-retry cost).
+        min_reasonable = 300
+        if self.max_tokens_per_turn < min_reasonable:
+            raise ValueError(
+                f"MAX_TOKENS_PER_TURN={self.max_tokens_per_turn} is too low for the memory "
+                f"summarizer to ever produce valid JSON (needs at least {min_reasonable}) — "
+                "every eviction would fail and retry indefinitely. Raise MAX_TOKENS_PER_TURN."
+            )
+        return self
 
 
 settings = Settings()  # type: ignore[call-arg]  # values come from env, not call args

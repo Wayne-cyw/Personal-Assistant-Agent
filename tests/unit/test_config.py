@@ -165,6 +165,17 @@ def test_chat_max_output_tokens_and_session_token_budget_zero_or_negative_reject
         _settings(OPENAI_API_KEY="key", SESSION_TOKEN_BUDGET="0")
 
 
+def test_max_tokens_per_turn_too_low_for_summarizer_rejected() -> None:
+    """Regression test: MAX_TOKENS_PER_TURN below the summarizer's minimum
+    floor (app/agent/memory.py's _summarize clamps its own call to
+    min(its budget, MAX_TOKENS_PER_TURN)) would make every eviction fail
+    and retry forever, burning real tokens with no way to ever succeed —
+    caught at startup instead.
+    """
+    with pytest.raises(ValidationError, match="MAX_TOKENS_PER_TURN"):
+        _settings(OPENAI_API_KEY="key", MAX_TOKENS_PER_TURN="100")
+
+
 def test_numeric_overrides_are_coerced_to_int() -> None:
     settings = _settings(
         OPENAI_API_KEY="key",
