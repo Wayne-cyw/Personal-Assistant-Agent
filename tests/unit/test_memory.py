@@ -18,6 +18,7 @@ from app.agent.memory import (
     _one_line_receipt,
     _parse_summary_json,
     _split_for_eviction,
+    _summarize,
     assemble_messages,
     load_memory,
     persist_turn,
@@ -272,6 +273,65 @@ async def test_eviction_folds_exactly_the_evicted_range_and_lands_at_or_under_lo
     assert "none" in summarizer_input  # no prior summary on the first fold
 
 
+async def test_eviction_charges_summarizer_usage_to_token_budget(
+    monkeypatch: pytest.MonkeyPatch, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Issue #12: a summarizer call is real spend against the session even
+    though it isn't the visitor-facing turn that triggered it — effective_
+    tokens_from_usage's cached-token discount applies here exactly as it
+    does to the main loop's usage.
+    """
+    monkeypatch.setattr(settings, "window_low_tokens", 5)
+    usage = Usage(input_tokens=100, output_tokens=20, cached_input_tokens=50)
+    fake = FakeProvider(
+        responses=[
+            LLMResponse(
+                text=_summary_json("first fold"), usage=usage, finish_reason="stop"
+            )
+        ]
+    )
+
+    async with session_factory() as db:
+        await get_or_create_session(db, "s1")
+        for i in range(6):
+            await persist_turn(db, "s1", f"question {i}", f"answer {i}", [])
+
+    await run_eviction("s1", fake)
+
+    async with session_factory() as db:
+        session = await get_or_create_session(db, "s1")
+    # 50 uncached input + 50 cached * 0.1 + 20 output = 75.
+    assert session.token_budget_used == 75
+
+
+async def test_malformed_summarizer_output_still_charges_token_budget(
+    monkeypatch: pytest.MonkeyPatch, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """A failed/retried summarizer attempt still spent real tokens — the
+    budget must be charged even when the fold itself is skipped.
+    """
+    monkeypatch.setattr(settings, "window_low_tokens", 5)
+    usage = Usage(input_tokens=100, output_tokens=20)
+    fake = FakeProvider(
+        responses=[
+            LLMResponse(text="not json", usage=usage, finish_reason="stop"),
+            LLMResponse(text="still not json", usage=usage, finish_reason="stop"),
+        ]
+    )
+
+    async with session_factory() as db:
+        await get_or_create_session(db, "s1")
+        for i in range(6):
+            await persist_turn(db, "s1", f"question {i}", f"answer {i}", [])
+
+    await run_eviction("s1", fake)  # must not raise
+
+    async with session_factory() as db:
+        session = await get_or_create_session(db, "s1")
+    assert session.token_budget_used == 240  # both attempts: (100 + 20) * 2
+    assert session.summary_json is None  # the fold itself was still skipped
+
+
 async def test_second_eviction_summarizer_receives_only_newly_evicted_turns(
     monkeypatch: pytest.MonkeyPatch, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
@@ -473,6 +533,55 @@ async def test_malformed_summarizer_output_skips_gracefully_after_retry(
     assert len(fake.calls) == 2  # exactly one retry
 
 
+class _MaxTokensCapturingProvider:
+    """Records the max_tokens each complete() call was given — FakeProvider
+    doesn't expose this, and Issue #12's clamp is specifically about what
+    value reaches the provider call.
+    """
+
+    def __init__(self, response: LLMResponse) -> None:
+        self.seen_max_tokens: list[int] = []
+        self._response = response
+
+    async def complete(
+        self, messages: list[object], tools: list[object], max_tokens: int
+    ) -> LLMResponse:
+        self.seen_max_tokens.append(max_tokens)
+        return self._response
+
+    def complete_stream(
+        self, messages: list[object], tools: list[object], max_tokens: int
+    ) -> object:
+        raise NotImplementedError  # unused by this test
+
+
+async def test_summarize_max_tokens_clamped_to_max_tokens_per_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #12: MAX_TOKENS_PER_TURN is the outer ceiling enforced on every
+    provider call, including the summarizer's own tighter budget.
+    """
+    monkeypatch.setattr(settings, "max_tokens_per_turn", 50)  # tighter than the summarizer's own
+    provider = _MaxTokensCapturingProvider(_summary_response(_summary_json("x")))
+
+    await _summarize(provider, existing_summary=None, turns=[])  # type: ignore[arg-type]
+
+    assert provider.seen_max_tokens == [50]
+
+
+async def test_summarize_max_tokens_uses_own_budget_when_looser_than_max_tokens_per_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "max_tokens_per_turn", 10_000)  # far looser than needed
+    provider = _MaxTokensCapturingProvider(_summary_response(_summary_json("x")))
+
+    await _summarize(provider, existing_summary=None, turns=[])  # type: ignore[arg-type]
+
+    # The summarizer's own floor/multiplier-derived budget, well under the
+    # generous max_tokens_per_turn ceiling.
+    assert provider.seen_max_tokens == [max(300, settings.summary_max_tokens * 2)]
+
+
 # --- (h) reconciliation ------------------------------------------------------
 
 
@@ -560,6 +669,44 @@ async def test_run_reconciliation_opens_own_session_and_updates_summary(
     assert session.summary_json is not None
     assert session.summary_json["visitor_context"] == "corrected"
     assert session.summary_through_message_id == 0  # unchanged
+    assert session.token_budget_used == 2  # the summarizer call's own usage (1 in + 1 out)
+
+
+async def test_drift_audit_runs_on_schedule_and_charges_its_own_usage(
+    monkeypatch: pytest.MonkeyPatch, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Trigger 3 (4.3): with SUMMARY_AUDIT_INTERVAL=1, the very first
+    eviction should immediately trigger a from-scratch drift-audit
+    regeneration — a second real summarizer call, whose usage must also be
+    charged to the session's token budget even though it's a canary that
+    never overwrites summary_json.
+    """
+    monkeypatch.setattr(settings, "window_low_tokens", 5)
+    monkeypatch.setattr(settings, "summary_audit_interval", 1)
+    fake = FakeProvider(
+        responses=[
+            _summary_response(_summary_json("eviction fold")),
+            _summary_response(_summary_json("eviction fold")),  # drift audit: no divergence
+        ]
+    )
+
+    async with session_factory() as db:
+        await get_or_create_session(db, "s1")
+        for i in range(6):
+            await persist_turn(db, "s1", f"question {i}", f"answer {i}", [])
+
+    await run_eviction("s1", fake)
+
+    assert len(fake.calls) == 2  # eviction fold + drift audit, both real calls
+    async with session_factory() as db:
+        session = await get_or_create_session(db, "s1")
+    assert session.token_budget_used == 4  # two calls * (1 in + 1 out) each
+    assert session.summary_json == {  # unchanged by the audit itself
+        "visitor_context": "eviction fold",
+        "open_questions": [],
+        "commitments": [],
+        "notes": [],
+    }
 
 
 async def test_run_reconciliation_skips_gracefully_when_session_busy(

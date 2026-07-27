@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 
+from app.agent.providers.base import Usage
+
 logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN_ESTIMATE = 4
@@ -72,3 +74,15 @@ def effective_tokens(*, input_tokens: int, cached_input_tokens: int, output_toke
     uncached_input = input_tokens - cached_input_tokens
     weighted_cached = cached_input_tokens * CACHED_INPUT_DISCOUNT
     return round(uncached_input + weighted_cached + output_tokens)
+
+
+def effective_tokens_from_usage(usage: Usage) -> int:
+    """Convenience wrapper over effective_tokens for the common case of
+    already holding a provider Usage object (every summarizer call site in
+    app/agent/memory.py) rather than loose ints.
+    """
+    return effective_tokens(
+        input_tokens=usage.input_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        output_tokens=usage.output_tokens,
+    )
