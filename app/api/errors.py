@@ -17,6 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.agent.providers.base import UpstreamError
+from app.agent.session_lock import SessionBusyError
 from app.safety.pii import redact
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,13 @@ def register_exception_handlers(app: FastAPI) -> None:
         _request: Request, _exc: RequestValidationError
     ) -> JSONResponse:
         return _error_response(ErrorCode.INVALID_REQUEST)
+
+    @app.exception_handler(SessionBusyError)
+    async def _handle_session_busy(_request: Request, exc: SessionBusyError) -> JSONResponse:
+        # str(exc) is just the session_id (Issue #11) — no secret-bearing
+        # payload risk here, unlike the generic-exception handler below.
+        logger.info("session turn lock busy", extra={"session_id": str(exc)})
+        return _error_response(ErrorCode.RATE_LIMITED)
 
     @app.exception_handler(UpstreamError)
     async def _handle_upstream_error(_request: Request, exc: UpstreamError) -> JSONResponse:
