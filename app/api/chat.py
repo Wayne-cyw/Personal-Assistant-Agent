@@ -1,12 +1,19 @@
 """POST /v1/chat handler.
 
 Walking skeleton (Issue #5, real system prompt wired in Issue #8, turn-zero
-prefix + visitor-info capture wired in Issue #9): a deterministic,
-zero-LLM-token intro on a brand-new session, then SYSTEM_PROMPT +
-last-10-turns history + the user's message on every later turn. No memory
-system (#11), no classifier (#25), no orchestration loop with tools (#10)
-yet — those upgrade this handler in later issues without changing the
-envelope shape.
+prefix + visitor-info capture wired in Issue #9, real orchestration loop
+with tool-call execution wired in Issue #10): a deterministic, zero-LLM-token
+intro on a brand-new session, then SYSTEM_PROMPT + last-10-turns history +
+the user's message run through the tool-calling agent loop on every later
+turn. No memory system (#11), no classifier (#25) yet — those upgrade this
+handler in later issues without changing the envelope shape.
+
+Scope note (Issue #10): only the final user message and final assistant
+reply are persisted to the messages table, same as before — any
+intermediate tool-call/tool-result exchange within a turn's loop is not
+written to the DB or replayed into later turns' history. That's consistent
+with "context assembly uses plain last-N history for now," per the issue;
+full tool-turn persistence/replay is part of Issue #11's memory system.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.intro import INTRO_MESSAGE
+from app.agent.loop import run_agent
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
@@ -133,7 +141,7 @@ async def chat(
     messages.extend(
         LLMMessage(role=m.role, content=m.content)  # type: ignore[arg-type]
         for m in history
-        if m.role in ("user", "assistant")  # tool-role replay needs pairing logic; Issue #10
+        if m.role in ("user", "assistant")  # tool-role replay needs pairing logic; Issue #11
     )
     messages.append(LLMMessage(role="user", content=request.message))
 
@@ -142,14 +150,20 @@ async def chat(
     # upstream failure (rate limit, outage) must remain in the audit log.
     await append_message(db, request.session_id, "user", request.message)
 
-    response = await provider.complete(
-        messages=messages, tools=[], max_tokens=settings.max_tokens_per_turn
+    result = await run_agent(
+        messages,
+        provider,
+        settings.max_tokens_per_turn,
+        max_iterations=settings.max_iterations,
     )
-    http_request.state.llm_tokens_in = response.usage.input_tokens
-    http_request.state.llm_tokens_out = response.usage.output_tokens
+    http_request.state.llm_tokens_in = result.input_tokens
+    http_request.state.llm_tokens_out = result.output_tokens
 
-    reply_text = response.text
-    ack = _acknowledgment_suffix(newly_name, newly_linkedin)
+    reply_text = result.text
+    # Skip the acknowledgment on the iteration-cap fallback (Issue #10): it
+    # would read as an incongruous non sequitur appended to "I'm having
+    # trouble completing that right now."
+    ack = None if result.hit_iteration_cap else _acknowledgment_suffix(newly_name, newly_linkedin)
     if ack:
         reply_text = f"{reply_text}\n\n{ack}"
 

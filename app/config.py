@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     window_high_tokens: int = Field(default=3000, alias="WINDOW_HIGH_TOKENS")
     window_low_tokens: int = Field(default=1500, alias="WINDOW_LOW_TOKENS")
 
+    # Orchestration loop (Engineering Guide 4.2, Issue #10): hard cap on
+    # tool-call round-trips per turn before falling back to a static message.
+    # ge=1: a misconfigured 0 would silently skip every LLM call and always
+    # return the fallback message, with no startup-time error to catch it.
+    max_iterations: int = Field(default=5, ge=1, alias="MAX_ITERATIONS")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by

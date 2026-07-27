@@ -20,12 +20,17 @@ class FakeProvider:
     async def complete(
         self, messages: list[Message], tools: list[ToolDef], max_tokens: int
     ) -> LLMResponse:
-        self.calls.append(messages)
+        # Copy, not a reference: a caller that reuses/mutates the same list
+        # across multiple calls (e.g. the orchestration loop's tool-call
+        # round trips, Issue #10) would otherwise leave every entry in
+        # self.calls pointing at the same, later-mutated list — silently
+        # corrupting any assertion against an earlier call's exact contents.
+        self.calls.append(list(messages))
         return next(self._responses)
 
     async def complete_stream(
         self, messages: list[Message], tools: list[ToolDef], max_tokens: int
     ) -> AsyncIterator[StreamEvent]:
-        self.calls.append(messages)
+        self.calls.append(list(messages))
         for event in next(self._streams):
             yield event

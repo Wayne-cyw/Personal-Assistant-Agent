@@ -155,12 +155,31 @@ def _consume_chunk(
     return choice.finish_reason, delta_text
 
 
+def _parse_tool_call_arguments(raw_arguments: str) -> dict[str, object]:
+    """A budget-tier model (gpt-5.6-luna, the pinned model — see Issue #10's
+    own note about validating its tool-calling reliability) can plausibly
+    emit truncated or malformed JSON arguments, e.g. cut off right at the
+    max_completion_tokens boundary. This must degrade to a value that
+    execute_tool's Pydantic validation naturally rejects — producing the
+    self-correctable tool-result error Issue #10's acceptance criteria call
+    for — rather than raising json.JSONDecodeError and turning one bad tool
+    call into a 500 for the entire turn.
+    """
+    try:
+        parsed = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError:
+        return {"_malformed_arguments": raw_arguments}
+    if not isinstance(parsed, dict):
+        return {"_malformed_arguments": raw_arguments}
+    return parsed
+
+
 def _finalize_tool_calls(tool_call_parts: dict[int, dict[str, str]]) -> list[ToolCall]:
     return [
         ToolCall(
             id=parts["id"],
             name=parts["name"],
-            arguments=json.loads(parts["arguments"] or "{}"),
+            arguments=_parse_tool_call_arguments(parts["arguments"]),
         )
         for _index, parts in sorted(tool_call_parts.items())
     ]
@@ -226,7 +245,7 @@ def _parse_response(raw: ChatCompletion) -> LLMResponse:
                 ToolCall(
                     id=tc.id,
                     name=tc.function.name,
-                    arguments=json.loads(tc.function.arguments or "{}"),
+                    arguments=_parse_tool_call_arguments(tc.function.arguments),
                 )
             )
     usage = _usage_from_openai(raw.usage) if raw.usage is not None else Usage(
