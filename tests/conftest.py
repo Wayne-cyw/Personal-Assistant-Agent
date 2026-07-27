@@ -12,6 +12,9 @@ import pytest
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("OWNER_CONTACT_EMAIL", "owner@example.com")
+os.environ.setdefault("GOOGLE_CLIENT_ID", "test-client-id")
+os.environ.setdefault("GOOGLE_CLIENT_SECRET", "test-client-secret")
+os.environ.setdefault("GOOGLE_REFRESH_TOKEN", "test-refresh-token")
 
 
 @pytest.fixture(autouse=True)
