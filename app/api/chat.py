@@ -77,6 +77,15 @@ async def _maybe_capture_visitor_info(
     overwritten. Returns whichever were newly captured this turn (None if
     already set or not present in this message), so the caller can decide
     whether to acknowledge.
+
+    Known limitation, not yet addressed: there is no correction path within
+    this issue's scope — a visitor cannot fix a wrong or mistyped capture
+    within the session (extract_name's own conservatism, requiring the
+    explicit "my name is X" phrasing, keeps the odds of this low, but it is
+    not zero). Detecting and reconciling a stale/wrong pinned value is
+    exactly Issue #11's `reload_and_reconcile` mechanism (Engineering Guide
+    4.3); building that here would be scope creep on a placeholder that
+    Issue #11 replaces outright with LLM tool-based capture.
     """
     newly_name = extract_name(message) if session.visitor_name is None else None
     newly_linkedin = extract_linkedin_url(message) if session.visitor_linkedin is None else None

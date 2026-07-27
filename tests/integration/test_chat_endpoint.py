@@ -200,7 +200,7 @@ async def test_name_volunteered_after_turn_zero_is_captured_and_acknowledged_onc
     fake = _use_fake_provider([_response("Nice to meet you."), _response("How can I help?")])
 
     first = await client.post(
-        "/v1/chat", json={"session_id": "sess-1", "message": "I'm Priya"}
+        "/v1/chat", json={"session_id": "sess-1", "message": "my name is Priya"}
     )
     assert first.json()["reply"] == "Nice to meet you.\n\n(Thanks for sharing your name, Priya!)"
 
@@ -210,7 +210,7 @@ async def test_name_volunteered_after_turn_zero_is_captured_and_acknowledged_onc
 
     # Repeating the name on a later turn must not re-acknowledge or overwrite.
     second = await client.post(
-        "/v1/chat", json={"session_id": "sess-1", "message": "I'm Priya, just checking in"}
+        "/v1/chat", json={"session_id": "sess-1", "message": "my name is Priya, just checking in"}
     )
     assert second.json()["reply"] == "How can I help?"  # no acknowledgment appended twice
 

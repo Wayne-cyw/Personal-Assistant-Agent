@@ -23,8 +23,14 @@ def _load_intro_message(path: Path) -> str:
             "knowledge/intro.md (the turn-zero prefix message) before the "
             "app can start."
         )
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
+    text = path.read_text(encoding="utf-8")
+    # Only the file's own single trailing newline (a text-file formatting
+    # convention every editor adds, not content) is removed — everything
+    # else is preserved exactly, so the turn-zero reply is byte-identical
+    # to the file's actual content (Issue #9 acceptance criteria).
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text.strip():
         raise RuntimeError(f"{path} is empty. The turn-zero prefix message cannot be blank.")
     if len(text) > MAX_LENGTH:
         raise RuntimeError(

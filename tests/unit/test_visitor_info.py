@@ -9,14 +9,6 @@ def test_extract_name_my_names() -> None:
     assert extract_name("my name's Sam Rivera") == "Sam Rivera"
 
 
-def test_extract_name_im() -> None:
-    assert extract_name("I'm Alex") == "Alex"
-
-
-def test_extract_name_i_am() -> None:
-    assert extract_name("I am Jordan Lee") == "Jordan Lee"
-
-
 def test_extract_name_none_when_absent() -> None:
     assert extract_name("what can you help with?") is None
 
@@ -28,10 +20,26 @@ def test_extract_name_does_not_match_call_me() -> None:
     assert extract_name("call me Sam") is None
 
 
-def test_extract_name_lowercase_word_not_captured() -> None:
-    # "i'm not sure" — "not" isn't capitalized, so it wouldn't look like a name anyway,
-    # but this also guards against matching filler words after "I'm".
-    assert extract_name("i'm not sure what you mean") is None
+def test_extract_name_does_not_match_im_x() -> None:
+    """"I'm X" is deliberately NOT matched — it has an unacceptably high
+    false-positive rate in ordinary conversation on this exact site (see
+    the module docstring): "I'm interested in booking a call" would
+    otherwise capture "Interested" as a name.
+    """
+    assert extract_name("I'm Alex") is None
+    assert extract_name("I am Jordan Lee") is None
+
+
+def test_extract_name_common_im_phrasings_do_not_produce_false_positives() -> None:
+    false_positive_prone = [
+        "I'm Interested in booking a call",
+        "I'm Curious about your projects",
+        "I'm New here, just exploring",
+        "I'm Looking for a backend engineer",
+        "I'm Currently Exploring Options",
+    ]
+    for message in false_positive_prone:
+        assert extract_name(message) is None, f"false positive on: {message!r}"
 
 
 def test_extract_linkedin_url_basic() -> None:
@@ -61,3 +69,31 @@ def test_extract_linkedin_url_none_when_absent() -> None:
 
 def test_extract_linkedin_url_rejects_non_linkedin_domain() -> None:
     assert extract_linkedin_url("https://evil.com/linkedin.com/in/fake") is None
+
+
+def test_extract_linkedin_url_scheme_less_paste_at_start() -> None:
+    assert extract_linkedin_url("linkedin.com/in/jane-doe") == "linkedin.com/in/jane-doe"
+
+
+def test_extract_linkedin_url_scheme_less_paste_after_whitespace() -> None:
+    text = "here's my profile linkedin.com/in/jane-doe thanks"
+    assert extract_linkedin_url(text) == "linkedin.com/in/jane-doe"
+
+
+def test_extract_linkedin_url_locale_subdomain() -> None:
+    assert extract_linkedin_url("https://uk.linkedin.com/in/jane-doe") == (
+        "https://uk.linkedin.com/in/jane-doe"
+    )
+
+
+def test_extract_linkedin_url_with_query_string() -> None:
+    text = "https://www.linkedin.com/in/jane-doe?originalSubdomain=uk"
+    assert extract_linkedin_url(text) == text
+
+
+def test_extract_linkedin_url_scheme_less_still_rejects_embedded_spoof() -> None:
+    """The scheme-less pattern only matches at start-of-message or after
+    whitespace — "evil.com/linkedin.com/in/fake" has "linkedin.com"
+    preceded by "/", not whitespace or start, so it must not match.
+    """
+    assert extract_linkedin_url("visit evil.com/linkedin.com/in/fake now") is None

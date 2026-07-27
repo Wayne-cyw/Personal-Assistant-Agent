@@ -180,7 +180,8 @@ async def set_visitor_info(
     semantics), this function does not check.
     """
     row = await db.get(SessionRow, session_id)
-    assert row is not None, f"set_visitor_info called for unknown session_id={session_id!r}"
+    if row is None:
+        raise ValueError(f"set_visitor_info called for unknown session_id={session_id!r}")
     if name is not None:
         row.visitor_name = name
     if linkedin is not None:
