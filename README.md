@@ -27,3 +27,7 @@ docker run --rm -d --name personal-agent-pg \
 
 POSTGRES_TEST_URL=postgresql+asyncpg://agent:agent@localhost:5432/agent make test
 ```
+
+### Model notes
+
+**`gpt-5.6-luna` function-calling reliability (Issue #10):** the orchestration loop (`app/agent/loop.py`) and its automated tests (`tests/unit/test_loop.py`) are fully verified against `FakeProvider`, which doesn't exercise real model behavior. No `OPENAI_API_KEY` was available in the environment this issue was built in, so Luna's actual tool-calling reliability at this budget tier has **not yet been observed against a live model** — the CLI acceptance check ("what day is it?" → tool call → correct date) and the config-only escalation path to `gpt-5.6-terra` (`LLM_MODEL=gpt-5.6-terra` for the main loop only, per the Tech Stack table) are both implemented and ready to exercise, but still need a real run before this note can be replaced with actual observations. Whoever runs that first live session should update this note with what they saw (successful/malformed tool calls, retry behavior, anything else worth flagging) rather than leave it as a placeholder.

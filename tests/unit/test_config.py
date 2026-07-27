@@ -89,7 +89,14 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     so a comment on a blank-value line was previously taken literally as
     part of the value.
     """
-    for var in ("LLM_MODEL", "CLASSIFIER_MODEL", "SUMMARIZER_MODEL", "DATABASE_URL"):
+    optional_vars = (
+        "LLM_MODEL",
+        "CLASSIFIER_MODEL",
+        "SUMMARIZER_MODEL",
+        "DATABASE_URL",
+        "MAX_ITERATIONS",
+    )
+    for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
     env_example = Path(__file__).parents[2] / ".env.example"
 
@@ -99,6 +106,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.classifier_model == "gpt-5.6-luna"
     assert settings.summarizer_model == "gpt-5.6-luna"
     assert settings.database_url == "sqlite+aiosqlite:///./agent.db"
+    assert settings.max_iterations == 5
 
 
 def test_numeric_overrides_are_coerced_to_int() -> None:
