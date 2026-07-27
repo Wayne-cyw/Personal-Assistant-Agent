@@ -51,3 +51,24 @@ def count_tokens(text: str) -> int:
     if encoding is None:
         return max(1, len(text) // _CHARS_PER_TOKEN_ESTIMATE) if text else 0
     return len(encoding.encode(text))  # type: ignore[attr-defined]
+
+
+# Engineering Guide 4.3: "cached input is billed at roughly 10% of the
+# standard rate, automatically." Used to weight sessions.token_budget_used
+# (Issue #12) by real cost rather than raw count, so a heavily-cached turn
+# doesn't eat into the budget as fast as an uncached one of the same size.
+CACHED_INPUT_DISCOUNT = 0.1
+
+
+def effective_tokens(*, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> int:
+    """A cost-weighted token count for budget accounting (Issue #12) —
+    distinct from count_tokens (a pre-call estimate for the eviction
+    trigger), this consumes real, provider-reported LLMResponse.usage
+    figures. `cached_input_tokens` is assumed to already be a subset of
+    `input_tokens` (matching Usage's field semantics in
+    app/agent/providers/base.py), so it's discounted rather than added on
+    top of the full input count.
+    """
+    uncached_input = input_tokens - cached_input_tokens
+    weighted_cached = cached_input_tokens * CACHED_INPUT_DISCOUNT
+    return round(uncached_input + weighted_cached + output_tokens)
