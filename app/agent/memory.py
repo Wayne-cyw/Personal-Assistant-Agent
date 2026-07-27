@@ -298,6 +298,15 @@ def _memory_lock_key(session_id: str) -> str:
     in flight — directly contradicting 4.3's "memory bookkeeping adds zero
     user-facing latency" guarantee. Namespacing the key avoids that
     entirely while still closing the original race.
+
+    Note for Issue #18 (booking state machine): 4.3's concurrency-guard
+    description reads as one shared lock domain covering "the booking
+    state machine as well as memory bookkeeping." Whoever builds #18
+    should follow this same split-by-namespace precedent for any
+    background booking work rather than reusing the bare session_id key —
+    otherwise it either reintroduces this latency problem (if it shares
+    the live-turn key) or silently fails to serialize against memory
+    bookkeeping (if it invents a third, uncoordinated key).
     """
     return f"mem:{session_id}"
 
