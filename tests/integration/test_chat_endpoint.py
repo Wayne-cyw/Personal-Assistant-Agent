@@ -22,9 +22,11 @@ from app.agent.providers.base import (
 )
 from app.agent.providers.fake import FakeProvider
 from app.api.chat import get_main_provider, get_summarizer_provider
+from app.api.health import _reset_calendar_health_cache, get_health_calendar_client
 from app.db.models import Base, SessionRow
 from app.db.session import advance_summary, get_db
 from app.main import app
+from app.tools.fake_calendar import FakeCalendar
 
 
 class _OrderTrackingProvider:
@@ -625,10 +627,31 @@ async def test_unhandled_exception_returns_500_envelope_without_leaking_details(
 
 
 async def test_health_endpoint(client: httpx.AsyncClient) -> None:
-    response = await client.get("/health")
+    _reset_calendar_health_cache()
+    app.dependency_overrides[get_health_calendar_client] = lambda: FakeCalendar()
+    try:
+        response = await client.get("/health")
+    finally:
+        app.dependency_overrides.pop(get_health_calendar_client, None)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok", "llm": "unchecked"}
+    assert response.json() == {"status": "ok", "db": "ok", "llm": "unchecked", "calendar": "ok"}
+
+
+async def test_health_endpoint_reports_calendar_error(client: httpx.AsyncClient) -> None:
+    from app.tools.calendar import CalendarError
+
+    _reset_calendar_health_cache()
+    app.dependency_overrides[get_health_calendar_client] = lambda: FakeCalendar(
+        fail_with=CalendarError("token revoked")
+    )
+    try:
+        response = await client.get("/health")
+    finally:
+        app.dependency_overrides.pop(get_health_calendar_client, None)
+
+    assert response.status_code == 200
+    assert response.json()["calendar"] == "error"
 
 
 async def test_openapi_schema_includes_chat_contract(client: httpx.AsyncClient) -> None:
