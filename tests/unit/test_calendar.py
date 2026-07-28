@@ -1,3 +1,5 @@
+import asyncio
+import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -169,3 +171,93 @@ async def test_delete_event_http_error_raises_calendar_error(
     with pytest.raises(CalendarError) as exc_info:
         await client.delete_event("does-not-exist")
     assert exc_info.value.status_code == 404
+
+
+# --- naive-datetime rejection -----------------------------------------------
+
+
+async def test_get_free_busy_rejects_naive_start(client: GoogleCalendarClient) -> None:
+    naive = datetime(2026, 8, 3, 9, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await client.get_free_busy(naive, _dt(17))
+
+
+async def test_get_free_busy_rejects_naive_end(client: GoogleCalendarClient) -> None:
+    naive = datetime(2026, 8, 3, 17, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await client.get_free_busy(_dt(9), naive)
+
+
+async def test_create_event_rejects_naive_datetimes(client: GoogleCalendarClient) -> None:
+    naive = datetime(2026, 8, 3, 10, 0)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await client.create_event(
+            naive, _dt(11), Attendee(name="Priya", email="priya@example.com"), "Intro call"
+        )
+
+
+# --- malformed responses degrade to CalendarError, not a raw KeyError -------
+
+
+async def test_get_free_busy_missing_busy_key_raises_calendar_error(
+    client: GoogleCalendarClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-calendar "errors" entry (permission/notFound) instead of
+    "busy" is a real Google API response shape — must not surface as a raw
+    KeyError past this module's own CalendarError contract.
+    """
+    mock_service = MagicMock()
+    mock_service.freebusy.return_value.query.return_value.execute.return_value = {
+        "calendars": {"primary": {"errors": [{"domain": "global", "reason": "notFound"}]}}
+    }
+    monkeypatch.setattr(client, "_build_service", lambda: mock_service)
+
+    with pytest.raises(CalendarError):
+        await client.get_free_busy(_dt(9), _dt(17))
+
+
+async def test_create_event_missing_id_in_response_raises_calendar_error(
+    client: GoogleCalendarClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mock_service = MagicMock()
+    mock_service.events.return_value.insert.return_value.execute.return_value = {
+        "status": "confirmed"  # no "id"
+    }
+    monkeypatch.setattr(client, "_build_service", lambda: mock_service)
+
+    with pytest.raises(CalendarError):
+        await client.create_event(
+            _dt(10), _dt(11), Attendee(name="Priya", email="priya@example.com"), "Intro call"
+        )
+
+
+# --- non-blocking (Engineering Guide 4.7 rule 1, applied to this SDK) ------
+
+
+async def test_get_free_busy_does_not_block_the_event_loop(
+    client: GoogleCalendarClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole sync call chain (service construction through .execute())
+    must run in a worker thread via asyncio.to_thread — a concurrent, fast
+    asyncio task must not be stalled behind a slow (blocking, synchronous)
+    Calendar API call.
+    """
+
+    def _slow_build_service() -> MagicMock:
+        time.sleep(0.2)  # simulates a slow blocking network call
+        mock_service = MagicMock()
+        mock_service.freebusy.return_value.query.return_value.execute.return_value = {
+            "calendars": {"primary": {"busy": []}}
+        }
+        return mock_service
+
+    monkeypatch.setattr(client, "_build_service", _slow_build_service)
+
+    async def fast_task() -> float:
+        start = time.monotonic()
+        await asyncio.sleep(0.01)
+        return time.monotonic() - start
+
+    _, fast_duration = await asyncio.gather(client.get_free_busy(_dt(9), _dt(17)), fast_task())
+
+    assert fast_duration < 0.1  # nowhere near the 0.2s blocking call's duration

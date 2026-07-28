@@ -1,16 +1,15 @@
+import asyncio
+from datetime import datetime
+
 import pytest
 
 import app.api.health as health_module
-from app.api.health import _check_calendar, _reset_calendar_health_cache
-from app.tools.calendar import CalendarError
+from app.api.health import _check_calendar
+from app.tools.calendar import BusyInterval, CalendarError
 from app.tools.fake_calendar import FakeCalendar
 
-
-@pytest.fixture(autouse=True)
-def _reset_cache() -> None:
-    _reset_calendar_health_cache()
-    yield
-    _reset_calendar_health_cache()
+# tests/conftest.py's autouse _reset_calendar_health_cache fixture resets
+# the module-global cache/lock before every test in the suite.
 
 
 async def test_check_calendar_ok_when_free_busy_succeeds() -> None:
@@ -53,3 +52,37 @@ async def test_check_calendar_re_checks_after_cache_expires(
     result = await _check_calendar(fake_failing)
 
     assert result == "error"
+
+
+class _CountingSlowCalendar:
+    """Records how many times get_free_busy was actually called, with a
+    real await in between so concurrent callers can interleave.
+    """
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def get_free_busy(self, _start: datetime, _end: datetime) -> list[BusyInterval]:
+        self.call_count += 1
+        await asyncio.sleep(0.05)
+        return []
+
+    async def create_event(self, *args: object, **kwargs: object) -> str:
+        raise NotImplementedError
+
+    async def delete_event(self, event_id: str) -> None:
+        raise NotImplementedError
+
+
+async def test_concurrent_checks_on_a_stale_cache_only_call_the_api_once() -> None:
+    """Regression test: two /health requests arriving as the cache goes
+    stale must not both fire a real Calendar API call — the point of
+    caching in the first place. Without the lock in _check_calendar, both
+    concurrent calls observe the stale cache before either writes it back.
+    """
+    fake = _CountingSlowCalendar()
+
+    results = await asyncio.gather(_check_calendar(fake), _check_calendar(fake))  # type: ignore[arg-type]
+
+    assert results == ["ok", "ok"]
+    assert fake.call_count == 1

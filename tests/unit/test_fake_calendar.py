@@ -23,6 +23,24 @@ async def test_get_free_busy_returns_only_overlapping_intervals() -> None:
     assert result == [BusyInterval(start=_dt(9), end=_dt(10))]
 
 
+async def test_get_free_busy_excludes_touching_but_non_overlapping_intervals() -> None:
+    """Boundary case: a busy interval that ends exactly when the query
+    window starts (or starts exactly when it ends) does not overlap —
+    half-open interval semantics, matching how calendar slots are never
+    double-booked at the exact boundary second.
+    """
+    fake = FakeCalendar(
+        busy=[
+            BusyInterval(start=_dt(7), end=_dt(9)),  # ends exactly at query start
+            BusyInterval(start=_dt(12), end=_dt(14)),  # starts exactly at query end
+        ]
+    )
+
+    result = await fake.get_free_busy(_dt(9), _dt(12))
+
+    assert result == []
+
+
 async def test_create_event_returns_unique_ids_and_tracks_state() -> None:
     fake = FakeCalendar()
     attendee = Attendee(name="Priya", email="priya@example.com")

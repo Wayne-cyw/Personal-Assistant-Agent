@@ -81,6 +81,16 @@ def _status_code_from(exc: HttpError) -> int | None:
         return None
 
 
+def _require_aware(value: datetime, name: str) -> None:
+    # Same naive-datetime guard app/db/models.py applies to DB writes
+    # (Engineering Guide 4.7 rule 2) — a naive datetime silently means
+    # different absolute instants depending on which timezone the caller
+    # assumed, and the booking flow (Issues #19-22) that will call this
+    # wrapper is timezone-sensitive by design.
+    if value.tzinfo is None:
+        raise ValueError(f"{name} must be a timezone-aware datetime, got a naive one")
+
+
 class GoogleCalendarClient:
     """The real implementation, wrapping `google-api-python-client`."""
 
@@ -115,21 +125,36 @@ class GoogleCalendarClient:
         try:
             response = service.freebusy().query(body=body).execute()  # type: ignore[attr-defined]
         except HttpError as exc:
-            raise CalendarError(
-                "free/busy query failed", status_code=_status_code_from(exc)
-            ) from None
+            status = _status_code_from(exc)
+            logger.warning("free/busy query failed (status=%s)", status)
+            raise CalendarError("free/busy query failed", status_code=status) from None
         except GoogleAuthError:
+            logger.warning("calendar authentication failed during free/busy query")
             raise CalendarError("calendar authentication failed") from None
-        busy_raw = response["calendars"][settings.google_calendar_id]["busy"]
-        return [
-            BusyInterval(
-                start=datetime.fromisoformat(item["start"]),
-                end=datetime.fromisoformat(item["end"]),
+        try:
+            busy_raw = response["calendars"][settings.google_calendar_id]["busy"]
+            return [
+                BusyInterval(
+                    start=datetime.fromisoformat(item["start"]),
+                    end=datetime.fromisoformat(item["end"]),
+                )
+                for item in busy_raw
+            ]
+        except (KeyError, TypeError, ValueError):
+            # A per-calendar "errors" entry (permission/notFound) instead
+            # of "busy" hits this — a malformed/unexpected response shape
+            # is a failure the same as an HTTP error, not something that
+            # should propagate as a raw KeyError past this module's own
+            # CalendarError contract.
+            logger.warning(
+                "free/busy response for calendar %s was missing or malformed",
+                settings.google_calendar_id,
             )
-            for item in busy_raw
-        ]
+            raise CalendarError("free/busy response was missing or malformed") from None
 
     async def get_free_busy(self, start: datetime, end: datetime) -> list[BusyInterval]:
+        _require_aware(start, "start")
+        _require_aware(end, "end")
         return await asyncio.to_thread(self._get_free_busy_sync, start, end)
 
     def _create_event_sync(
@@ -151,17 +176,24 @@ class GoogleCalendarClient:
                 .execute()
             )
         except HttpError as exc:
-            raise CalendarError(
-                "event creation failed", status_code=_status_code_from(exc)
-            ) from None
+            status = _status_code_from(exc)
+            logger.warning("event creation failed (status=%s)", status)
+            raise CalendarError("event creation failed", status_code=status) from None
         except GoogleAuthError:
+            logger.warning("calendar authentication failed during event creation")
             raise CalendarError("calendar authentication failed") from None
-        event_id: str = event["id"]
+        try:
+            event_id: str = event["id"]
+        except (KeyError, TypeError):
+            logger.warning("event creation response was missing an id")
+            raise CalendarError("event creation response was missing an id") from None
         return event_id
 
     async def create_event(
         self, start: datetime, end: datetime, attendee: Attendee, description: str
     ) -> str:
+        _require_aware(start, "start")
+        _require_aware(end, "end")
         return await asyncio.to_thread(self._create_event_sync, start, end, attendee, description)
 
     def _delete_event_sync(self, event_id: str) -> None:
@@ -171,10 +203,11 @@ class GoogleCalendarClient:
                 calendarId=settings.google_calendar_id, eventId=event_id
             ).execute()
         except HttpError as exc:
-            raise CalendarError(
-                "event deletion failed", status_code=_status_code_from(exc)
-            ) from None
+            status = _status_code_from(exc)
+            logger.warning("event deletion failed (status=%s)", status)
+            raise CalendarError("event deletion failed", status_code=status) from None
         except GoogleAuthError:
+            logger.warning("calendar authentication failed during event deletion")
             raise CalendarError("calendar authentication failed") from None
 
     async def delete_event(self, event_id: str) -> None:

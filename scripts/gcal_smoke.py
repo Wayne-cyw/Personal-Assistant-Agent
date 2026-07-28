@@ -36,9 +36,19 @@ async def main() -> None:
     )
     print(f"Created event: {event_id}")
 
-    print("Deleting it...")
-    await client.delete_event(event_id)
-    print("Deleted. Smoke test passed.")
+    # try/finally from here on: once the event exists, always attempt
+    # cleanup — including if this script is interrupted (Ctrl+C) or
+    # anything else goes wrong before reaching the delete call below.
+    try:
+        print("Deleting it...")
+        await client.delete_event(event_id)
+        print("Deleted. Smoke test passed.")
+    except BaseException:
+        print(
+            f"WARNING: cleanup failed or was interrupted — event {event_id} may still be on "
+            "the calendar. Delete it manually if so."
+        )
+        raise
 
 
 if __name__ == "__main__":
