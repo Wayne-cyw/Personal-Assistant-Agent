@@ -102,6 +102,24 @@ class BookingState:
     proposal_rounds: int = 0
     contact_name: str | None = None
     contact_email: str | None = None
+    # Every slot ever offered and then superseded by a later round (Issue
+    # #20 review fix) — accumulated across the whole negotiation, not just
+    # the immediately-preceding round. Without this, a round-3 widened
+    # window could re-offer a slot from round 1 that the visitor already
+    # explicitly rejected twice: RE_PROPOSE/WIDEN_WINDOW both *replace*
+    # proposed_slots_json with the fresh round's results, so an exclude
+    # list built only from `proposed_slots_json` only ever sees the single
+    # most recent round.
+    excluded_slots_json: list[dict[str, object]] | None = None
+
+
+def _accumulate_excluded(state: BookingState) -> list[dict[str, object]]:
+    """The outgoing round's proposed_slots_json is about to be superseded
+    (the visitor is rejecting it by triggering a re-propose/widen) — fold it
+    into the running excluded-slots accumulator so a later round never
+    re-offers it (see BookingState.excluded_slots_json's docstring).
+    """
+    return list(state.excluded_slots_json or []) + list(state.proposed_slots_json or [])
 
 
 class InvalidTransition(Exception):
@@ -170,6 +188,7 @@ def transition(state: BookingState, event: Event) -> BookingState:
             state,
             proposed_slots_json=list(event.slots or []),
             proposal_rounds=state.proposal_rounds + 1,
+            excluded_slots_json=_accumulate_excluded(state),
         )
 
     if kind is EventKind.WIDEN_WINDOW:
@@ -181,6 +200,7 @@ def transition(state: BookingState, event: Event) -> BookingState:
             state,
             proposed_slots_json=list(event.slots or []),
             proposal_rounds=state.proposal_rounds + 1,
+            excluded_slots_json=_accumulate_excluded(state),
         )
 
     if kind is EventKind.EMAIL_FALLBACK:

@@ -15,10 +15,18 @@ from __future__ import annotations
 import re
 
 _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
-# A bare 1-5 digit, not part of a longer number (so "slot 12" or a year like
-# "2026" doesn't false-match) and not the hour of a clock time (so "2:00"
-# doesn't get read as index 2) — negative lookaround on both sides.
-_NUMBER_RE = re.compile(r"(?<!\d)([1-5])(?![\d:])")
+# A single combined pattern (not "try digits, then fall back to ordinal
+# words") so the leftmost mention wins regardless of which form it takes —
+# e.g. "third one, not the second" must resolve to "third" (it appears
+# first), not "second" (an earlier bug here iterated _ORDINAL_WORDS in
+# fixed dict order, which happened to check "second" before "third"
+# regardless of which one actually appeared first in the text). A bare 1-5
+# digit excludes a longer number (so "slot 12" or a year like "2026" doesn't
+# false-match) and the hour of a clock time (so "2:00" doesn't get read as
+# index 2) via negative lookaround on both sides.
+_INDEX_RE = re.compile(
+    r"(?<!\d)(?P<digit>[1-5])(?![\d:])|\b(?P<ordinal>first|second|third|fourth|fifth)\b"
+)
 # Labels render weekdays via strftime("%a") — "Mon", "Tue", "Wed", etc.
 # (app/booking/slots.py's _format_label) — so matching has to normalize a
 # visitor's full-name-or-abbreviation mention ("Wednesday", "Wed", "wed") to
@@ -88,13 +96,12 @@ def match_selection(
 
 
 def _extract_index(text: str) -> int | None:
-    number_match = _NUMBER_RE.search(text)
-    if number_match:
-        return int(number_match.group(1))
-    for word, value in _ORDINAL_WORDS.items():
-        if word in text:
-            return value
-    return None
+    match = _INDEX_RE.search(text)
+    if match is None:
+        return None
+    if match.group("digit"):
+        return int(match.group("digit"))
+    return _ORDINAL_WORDS[match.group("ordinal")]
 
 
 def _label_matches(text: str, label: str) -> bool:

@@ -125,6 +125,11 @@ class BookingState(Base):
     selected_slot_json: Mapped[dict[str, object] | None] = mapped_column(PortableJSON, default=None)
     hold_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     proposal_rounds: Mapped[int] = mapped_column(Integer, default=0)
+    # Every slot offered and then superseded across the whole negotiation
+    # (Issue #20 review fix) — see app.booking.state.BookingState's own
+    # field docstring for why this can't just be re-derived from
+    # proposed_slots_json (which only ever holds the current round).
+    excluded_slots_json: Mapped[list[object] | None] = mapped_column(PortableJSON, default=None)
     contact_name: Mapped[str | None] = mapped_column(Text, default=None)
     contact_email: Mapped[str | None] = mapped_column(Text, default=None)
     updated_at: Mapped[datetime] = mapped_column(

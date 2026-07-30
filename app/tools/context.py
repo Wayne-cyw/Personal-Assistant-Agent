@@ -43,3 +43,15 @@ class ToolContext:
     # run_agent returns and schedules app/agent/memory.py's
     # run_reconciliation as a post-response background task per entry.
     pending_reconciliations: list[str] = field(default_factory=list)
+    # Set by calendar_find_slots' handler the first time it runs, and
+    # checked on every subsequent call within the same ToolContext (Issue
+    # #20 review fix): a negotiation round is meant to correspond to one
+    # visitor turn, but nothing else stops the model from emitting several
+    # calendar_find_slots tool calls within a single response (or across
+    # several run_agent iterations of the same turn) — each of which would
+    # otherwise independently advance proposal_rounds, letting one turn
+    # burn through the whole negotiation cap (2 rounds + 1 widen) without
+    # the visitor ever having rejected a real proposal. One ToolContext is
+    # constructed per HTTP request in app/api/chat.py and reused for the
+    # entire run_agent call, so this correctly scopes "once per turn."
+    calendar_find_slots_used_this_turn: bool = False

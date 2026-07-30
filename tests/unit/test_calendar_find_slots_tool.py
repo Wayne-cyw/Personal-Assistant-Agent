@@ -7,6 +7,7 @@ tested in tests/unit/test_booking_state.py).
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -85,15 +86,29 @@ async def db(engine: AsyncEngine) -> AsyncGenerator[AsyncSession]:
         yield session
 
 
-@pytest.fixture
-def context(db: AsyncSession) -> ToolContext:
+def _new_context(
+    db: AsyncSession, *, caller_timezone: str | None = "America/Toronto"
+) -> ToolContext:
+    """One ToolContext per simulated turn — app/api/chat.py constructs a
+    fresh ToolContext per HTTP request, and calendar_find_slots_used_this_
+    turn (Issue #20 review fix) is scoped to a single ToolContext instance,
+    so a test simulating several separate visitor turns must build a new
+    one for each, exactly like the real handler does. Reusing one context
+    across simulated turns would trip the once-per-turn guard as if the
+    model had called calendar_find_slots twice in a single turn.
+    """
     return ToolContext(
         db=db,
         session_id=SID,
         summarizer_provider=FakeProvider(responses=[]),
         calendar_client=FakeCalendar(),
-        caller_timezone="America/Toronto",
+        caller_timezone=caller_timezone,
     )
+
+
+@pytest.fixture
+def context(db: AsyncSession) -> ToolContext:
+    return _new_context(db)
 
 
 def _call(**args: object) -> ToolCall:
@@ -178,20 +193,23 @@ async def test_call_from_idle_without_timezone_asks_for_one_but_still_records_in
 
 
 async def test_second_call_with_timezone_now_known_proposes_slots(
-    context: ToolContext, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The visitor supplies a timezone on a later turn (a real client would
     resend ChatRequest.timezone) — intent, already recorded, isn't re-asked.
     """
     _configure_policy(monkeypatch, _policy())
-    context.caller_timezone = None
-    await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_timezone=None),
+    )
 
-    context.caller_timezone = "America/Toronto"
-    result = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    result = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
 
     assert "slots" in result
-    state = await load_booking_state(context.db, SID)
+    state = await load_booking_state(db, SID)
     assert state.step is Step.SLOTS_PROPOSED
 
 
@@ -216,22 +234,26 @@ async def test_availability_not_configured_returns_structured_error_and_saves_pr
 
 
 async def test_re_propose_from_slots_proposed_increments_round(
-    context: ToolContext, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_policy(monkeypatch, _policy())
-    first = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
     assert first["round"] == 1
 
-    second = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
     assert second["round"] == 2
 
-    state = await load_booking_state(context.db, SID)
+    state = await load_booking_state(db, SID)
     assert state.step is Step.SLOTS_PROPOSED
     assert state.proposal_rounds == 2
 
 
 async def test_re_propose_excludes_previously_offered_slots(
-    context: ToolContext, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A short window with exactly one bookable slot, so the second call
     # (which excludes it) has nothing left to offer.
@@ -242,41 +264,121 @@ async def test_re_propose_excludes_previously_offered_slots(
             work_end_time=datetime(2000, 1, 1, 9, 30).time(),
         ),
     )
-    first = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
     assert len(first["slots"]) == 1  # type: ignore[arg-type]
 
-    second = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
     assert second["slots"] == []
 
 
+async def test_widen_still_excludes_round_one_slots_not_just_round_two(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (Issue #20 review finding): RE_PROPOSE/WIDEN_WINDOW
+    both *replace* proposed_slots_json each round, so an exclude list built
+    only from the immediately-preceding round would forget round 1's
+    already-rejected slot by the time round 3 (widen) runs. A single
+    30-minute window has exactly one bookable slot; if round 3 doesn't
+    still exclude it (from round 1) alongside round 2's, it would come back.
+    """
+    _configure_policy(
+        monkeypatch,
+        _policy(
+            work_start_time=datetime(2000, 1, 1, 9, 0).time(),
+            work_end_time=datetime(2000, 1, 1, 9, 30).time(),
+        ),
+    )
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    first_slots = cast("list[object]", first["slots"])
+    assert len(first_slots) == 1
+    first_slot = first_slots[0]
+
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert second["slots"] == []  # round 1's only slot is excluded
+
+    third = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    # Widening extends the end date, but the policy still only opens a
+    # 30-min window each workday — round 1's slot must still be excluded,
+    # not just round 2's (which had nothing to offer in the first place).
+    third_slots = cast("list[object]", third["slots"])
+    assert first_slot not in third_slots
+
+    state = await load_booking_state(db, SID)
+    assert state.excluded_slots_json is not None
+    assert first_slot in state.excluded_slots_json
+
+
 async def test_third_call_widens_the_window_and_increments_round_again(
-    context: ToolContext, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_policy(monkeypatch, _policy())
-    await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)  # round 1
-    await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)  # round 2
+    await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )  # round 1
+    await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )  # round 2
 
-    third = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    third = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
 
     assert third["round"] == 3
-    state = await load_booking_state(context.db, SID)
+    state = await load_booking_state(db, SID)
     assert state.step is Step.SLOTS_PROPOSED
     assert state.proposal_rounds == 3
 
 
 async def test_fourth_call_falls_back_to_email_and_abandons(
-    context: ToolContext, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_policy(monkeypatch, _policy())
     for _ in range(3):
-        await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+        await execute_tool(
+            _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+        )
 
-    fourth = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    fourth = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
 
     assert fourth["fallback"] is True
     assert "email" in str(fourth["message"]).lower()
-    state = await load_booking_state(context.db, SID)
+    state = await load_booking_state(db, SID)
     assert state.step is Step.ABANDONED
+
+
+async def test_second_call_within_the_same_turn_is_refused_and_does_not_advance_round(
+    context: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (Issue #20 review finding): a single LLM response
+    (or several run_agent iterations within one turn) could otherwise emit
+    calendar_find_slots more than once, each independently advancing
+    proposal_rounds — burning through the entire negotiation cap without
+    the visitor ever having rejected a real proposal. Reusing `context`
+    (one ToolContext, i.e. one simulated turn) across both calls is the
+    point of this test.
+    """
+    _configure_policy(monkeypatch, _policy())
+    first = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+    assert first["round"] == 1
+
+    second = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+
+    assert "error" in second
+    assert "already called" in str(second["error"])
+    state = await load_booking_state(context.db, SID)
+    assert state.proposal_rounds == 1  # unchanged — the second call never ran
 
 
 # --- defense in depth: state gating checked inside the handler too -----------

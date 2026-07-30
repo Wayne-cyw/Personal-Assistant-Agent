@@ -61,6 +61,21 @@ def test_matches_ordinal_word() -> None:
     assert match_selection("the second one works", SLOTS) == SLOTS[1]
 
 
+def test_earliest_mentioned_ordinal_wins_not_dict_declaration_order() -> None:
+    """Regression: an earlier version resolved ordinal words by iterating a
+    fixed {"first": 1, "second": 2, ...} dict and returning on the first
+    key found *in the dict*, not the first one mentioned in the text — so
+    "third one, not the second" incorrectly returned index 2 ("second"),
+    since "second" happens to be checked before "third" in the dict
+    regardless of which one actually appears first in the message.
+    """
+    assert match_selection("third one, not the second", SLOTS) == SLOTS[2]
+
+
+def test_leftmost_digit_or_ordinal_wins_when_both_present() -> None:
+    assert match_selection("not the first, I meant 3", SLOTS) == SLOTS[0]
+
+
 def test_matches_exact_slot_id() -> None:
     assert match_selection("33333333-3333-3333-3333-333333333333", SLOTS) == SLOTS[2]
 

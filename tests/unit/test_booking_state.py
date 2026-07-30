@@ -55,11 +55,41 @@ def test_re_propose_increments_round() -> None:
     assert result.proposed_slots_json == [{"slot_id": "s3"}]
 
 
+def test_re_propose_folds_the_outgoing_round_into_excluded_slots() -> None:
+    state = _state(
+        step=Step.SLOTS_PROPOSED, proposal_rounds=1, proposed_slots_json=[{"slot_id": "s1"}]
+    )
+    result = transition(state, Event(kind=EventKind.RE_PROPOSE, slots=[{"slot_id": "s3"}]))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}]
+
+
+def test_re_propose_accumulates_onto_existing_excluded_slots() -> None:
+    state = _state(
+        step=Step.SLOTS_PROPOSED,
+        proposal_rounds=1,
+        proposed_slots_json=[{"slot_id": "s2"}],
+        excluded_slots_json=[{"slot_id": "s1"}],
+    )
+    result = transition(state, Event(kind=EventKind.RE_PROPOSE, slots=[{"slot_id": "s3"}]))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}, {"slot_id": "s2"}]
+
+
 def test_widen_window_at_cap_increments_round_again() -> None:
     state = _state(step=Step.SLOTS_PROPOSED, proposal_rounds=2)
     result = transition(state, Event(kind=EventKind.WIDEN_WINDOW, slots=[{"slot_id": "s4"}]))
     assert result.step is Step.SLOTS_PROPOSED
     assert result.proposal_rounds == 3
+
+
+def test_widen_window_also_folds_the_outgoing_round_into_excluded_slots() -> None:
+    state = _state(
+        step=Step.SLOTS_PROPOSED,
+        proposal_rounds=2,
+        proposed_slots_json=[{"slot_id": "s3"}],
+        excluded_slots_json=[{"slot_id": "s1"}],
+    )
+    result = transition(state, Event(kind=EventKind.WIDEN_WINDOW, slots=[{"slot_id": "s4"}]))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
 
 
 def test_email_fallback_after_widen_abandons() -> None:

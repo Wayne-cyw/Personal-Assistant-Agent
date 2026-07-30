@@ -142,6 +142,20 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
     is gated to this tool).
     """
     assert isinstance(args, CoarseWindow)
+
+    if context.calendar_find_slots_used_this_turn:
+        # A negotiation round is meant to correspond to one visitor turn
+        # (4.5) — refuse a second call within the same turn rather than
+        # letting it silently advance proposal_rounds again (see
+        # ToolContext.calendar_find_slots_used_this_turn's docstring).
+        return {
+            "error": (
+                "calendar_find_slots was already called once this turn. Wait for the "
+                "visitor's next reply before proposing or re-proposing again."
+            )
+        }
+    context.calendar_find_slots_used_this_turn = True
+
     state = await load_booking_state(context.db, context.session_id)
 
     if state.step is Step.IDLE:
@@ -204,16 +218,26 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
     if event_kind is EventKind.WIDEN_WINDOW:
         resolved = widen_window(resolved)
 
-    # Re-proposing or widening excludes what was already offered and
-    # rejected, so the visitor never sees the exact same list twice.
+    # Re-proposing or widening excludes everything offered and rejected
+    # across the *whole* negotiation so far, not just the immediately
+    # preceding round — state.excluded_slots_json (the accumulator) plus
+    # the current round's own proposed_slots_json, which is about to be
+    # superseded and folded into that same accumulator by transition()
+    # below. Without the accumulator half, a round-3 widened window could
+    # re-offer a round-1 slot the visitor already rejected twice, since
+    # RE_PROPOSE/WIDEN_WINDOW both *replace* proposed_slots_json each round
+    # rather than growing it.
     exclude: list[tuple[datetime, datetime]] | None = None
     if event_kind in (EventKind.RE_PROPOSE, EventKind.WIDEN_WINDOW):
+        already_offered = list(state.excluded_slots_json or []) + list(
+            state.proposed_slots_json or []
+        )
         exclude = [
             (
                 datetime.fromisoformat(str(s["start_iso"])),
                 datetime.fromisoformat(str(s["end_iso"])),
             )
-            for s in (state.proposed_slots_json or [])
+            for s in already_offered
         ]
 
     slots = await generate_slots(
