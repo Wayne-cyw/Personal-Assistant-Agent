@@ -477,6 +477,55 @@ async def test_generate_slots_correct_across_fall_back_dst_boundary() -> None:
     assert first_start.tzname() == "EST"  # already back in standard time
 
 
+async def test_generate_slots_every_slot_has_positive_duration_across_spring_forward() -> None:
+    """Regression test for the DST arithmetic bug found in review: a policy
+    whose working hours straddle the local 2 AM spring-forward gap used to
+    produce a slot whose `end` (computed via naive `cursor + meeting_length`
+    wall-clock arithmetic) landed *before* its `start` in real time, because
+    2026-03-08 02:00-03:00 America/Toronto doesn't exist on the clock. Every
+    generated slot must be exactly `meeting_length` long in real elapsed
+    time, regardless of which side of the transition it falls on.
+    """
+    # America/Toronto's 2026 spring-forward happens on Sunday 2026-03-08, so
+    # this policy has to treat Sunday as a workday to actually exercise the
+    # transition — the suite's other DST tests use the default Mon-Fri
+    # policy and check the first *following* workday instead, which never
+    # lands on the transition day itself.
+    policy = _policy(
+        work_start_day=6,  # Sunday
+        work_end_day=6,
+        work_start_time=datetime(2000, 1, 1, 0, 30).time(),
+        work_end_time=datetime(2000, 1, 1, 3, 30).time(),
+        buffer=timedelta(0),
+    )
+    resolved = resolve_window(
+        CoarseWindow(date_from=date(2026, 3, 8), date_to=date(2026, 3, 8)), policy
+    )
+    now = _now_for_window(resolved.start)
+    fake = FakeCalendar()
+
+    slots = await generate_slots(fake, resolved, policy, "America/Toronto", now=now)
+
+    assert len(slots) > 0
+    for slot in slots:
+        start = datetime.fromisoformat(slot.start_iso)
+        end = datetime.fromisoformat(slot.end_iso)
+        assert end - start == policy.meeting_length
+
+
+async def test_generate_slots_rejects_naive_now() -> None:
+    policy = _policy()
+    resolved = resolve_window(
+        CoarseWindow(date_from=date(2026, 8, 3), date_to=date(2026, 8, 3)), policy
+    )
+    fake = FakeCalendar()
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await generate_slots(
+            fake, resolved, policy, "America/Toronto", now=datetime(2026, 8, 1, 0, 0)
+        )
+
+
 def test_slot_model_fields() -> None:
     slot = Slot(
         slot_id="abc",

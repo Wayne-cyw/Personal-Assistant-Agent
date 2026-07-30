@@ -1,10 +1,12 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
 import app.api.health as health_module
-from app.api.health import _check_calendar
+from app.api.health import _check_availability_policy, _check_calendar
+from app.booking.slots import AvailabilityPolicy, AvailabilityPolicyError
 from app.tools.calendar import BusyInterval, CalendarError
 from app.tools.fake_calendar import FakeCalendar
 
@@ -72,6 +74,36 @@ class _CountingSlowCalendar:
 
     async def delete_event(self, event_id: str) -> None:
         raise NotImplementedError
+
+
+def test_check_availability_policy_ok_when_policy_parses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = AvailabilityPolicy(
+        timezone=ZoneInfo("America/New_York"),
+        timezone_name="America/New_York",
+        work_start_day=0,
+        work_end_day=4,
+        work_start_time=datetime(2026, 1, 1, 9, 0).time(),
+        work_end_time=datetime(2026, 1, 1, 17, 0).time(),
+        meeting_length=timedelta(minutes=30),
+        buffer=timedelta(minutes=15),
+        min_notice=timedelta(hours=24),
+    )
+    monkeypatch.setattr(health_module, "get_availability_policy", lambda: policy)
+
+    assert _check_availability_policy() == "ok"
+
+
+def test_check_availability_policy_not_configured_when_still_a_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise() -> AvailabilityPolicy:
+        raise AvailabilityPolicyError("still a template")
+
+    monkeypatch.setattr(health_module, "get_availability_policy", _raise)
+
+    assert _check_availability_policy() == "not_configured"
 
 
 async def test_concurrent_checks_on_a_stale_cache_only_call_the_api_once() -> None:

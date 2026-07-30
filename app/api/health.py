@@ -4,7 +4,16 @@
 a cheap free/busy ping against a 1-minute window, cached for
 `_CACHE_SECONDS` so a revoked/expired refresh token is caught within a
 bounded window (the issue's acceptance criteria: within 5 minutes) without
-pinging Google on every single health check.
+pinging Google on every single health check. `availability_policy` is also
+really checked (Issue #19): get_availability_policy() is a lazy, cached
+singleton rather than evaluated at app-startup time (see its docstring —
+knowledge/availability_policy.md is still a template pending Issue #13,
+and eager evaluation would break importing/testing the rest of the app
+over a booking-only config file) — this endpoint is the substitute signal
+that a still-unfilled-in policy gets caught by *something* running in
+production, the same role Issue #17's calendar check plays for revoked
+OAuth, rather than only surfacing the first time a real visitor tries to
+book.
 """
 
 from __future__ import annotations
@@ -15,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends
 
+from app.booking.slots import AvailabilityPolicyError, get_availability_policy
 from app.tools.calendar import CalendarClient, CalendarError, get_calendar_client
 
 router = APIRouter()
@@ -96,9 +106,30 @@ async def _check_calendar(client: CalendarClient) -> str:
         return status
 
 
+def _check_availability_policy() -> str:
+    """Uncached, unlike `_check_calendar`: this is a local file parse, not an
+    outbound network call, so there's no latency/rate-limit reason to cache
+    it — and `get_availability_policy()` already caches the parsed result
+    itself after the first successful call, so a second parse attempt here
+    only happens while it's still failing anyway.
+    """
+    try:
+        get_availability_policy()
+        return "ok"
+    except AvailabilityPolicyError:
+        return "not_configured"
+
+
 @router.get("/health")
 async def health(
     calendar_client: CalendarClient = Depends(get_health_calendar_client),
 ) -> dict[str, str]:
     calendar_status = await _check_calendar(calendar_client)
-    return {"status": "ok", "db": "ok", "llm": "unchecked", "calendar": calendar_status}
+    availability_policy_status = _check_availability_policy()
+    return {
+        "status": "ok",
+        "db": "ok",
+        "llm": "unchecked",
+        "calendar": calendar_status,
+        "availability_policy": availability_policy_status,
+    }

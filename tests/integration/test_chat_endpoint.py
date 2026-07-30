@@ -635,7 +635,13 @@ async def test_health_endpoint(client: httpx.AsyncClient) -> None:
         app.dependency_overrides.pop(get_health_calendar_client, None)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok", "llm": "unchecked", "calendar": "ok"}
+    body = response.json()
+    # availability_policy isn't asserted as a fixed literal: it reflects
+    # whether knowledge/availability_policy.md (Issue #13) has been filled
+    # in with real content yet, which is independent of this test's concern
+    # (that the calendar-check wiring produces "ok" for a healthy client).
+    assert body.pop("availability_policy") in ("ok", "not_configured")
+    assert body == {"status": "ok", "db": "ok", "llm": "unchecked", "calendar": "ok"}
 
 
 async def test_health_endpoint_reports_calendar_error(client: httpx.AsyncClient) -> None:

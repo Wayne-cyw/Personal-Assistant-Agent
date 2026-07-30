@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -235,6 +235,33 @@ def _overlaps_any(start: datetime, end: datetime, blocked: list[tuple[datetime, 
     return any(start < b_end and end > b_start for b_start, b_end in blocked)
 
 
+def _step(cursor: datetime, delta: timedelta) -> datetime:
+    """Advance `cursor` by exactly `delta` of absolute (UTC) time, then
+    re-express the result in `cursor`'s original zone.
+
+    Plain `cursor + delta` on a zoneinfo-aware datetime performs *wall-
+    clock* arithmetic, not absolute-time arithmetic — a well-known
+    zoneinfo gotcha. Near a DST spring-forward, that can silently produce
+    a slot whose `end` precedes its `start` in real time: e.g. adding 30
+    minutes to a 02:30 local start (a wall-clock time that doesn't exist
+    on the transition date, since clocks skip 02:00 -> 03:00) resolves
+    using the *pre*-transition UTC offset, while the resulting 03:00
+    already resolves using the *post*-transition offset — so `end` ends up
+    30 minutes *before* `start`. Converting through UTC sidesteps this
+    entirely: UTC has no DST, so the arithmetic is always unambiguous, and
+    every generated slot is guaranteed exactly `delta` long in real time.
+
+    This dodges the acute "inverted slot" bug but not every DST edge case
+    in general — day_start/day_end below are still constructed via
+    datetime.combine(), which could in principle land on a non-existent
+    local time if a policy's working hours started or ended exactly within
+    a transition gap. Not addressed here: no realistic booking policy has
+    working hours starting at 2 AM, and handling that fully general case
+    is out of proportion to this issue's scope.
+    """
+    return (cursor.astimezone(UTC) + delta).astimezone(cursor.tzinfo)
+
+
 def _discretize(
     window_start: datetime,
     window_end: datetime,
@@ -259,11 +286,13 @@ def _discretize(
                 day_end = datetime.combine(day, day_end_time, tzinfo=policy.timezone)
                 cursor = max(day_start, window_start)
                 capped_end = min(day_end, window_end)
-                while cursor + policy.meeting_length <= capped_end:
-                    slot_end = cursor + policy.meeting_length
+                while True:
+                    slot_end = _step(cursor, policy.meeting_length)
+                    if slot_end > capped_end:
+                        break
                     if not _overlaps_any(cursor, slot_end, blocked):
                         candidates.append(cursor)
-                    cursor += policy.meeting_length
+                    cursor = slot_end
 
         day += timedelta(days=1)
 
@@ -319,7 +348,14 @@ async def generate_slots(
     `{slot_id, start_iso, end_iso, label}` with labels rendered in the
     caller's timezone.
     """
-    earliest_allowed = now + policy.min_notice
+    if now.tzinfo is None:
+        raise ValueError("now must be a timezone-aware datetime, got a naive one")
+
+    # min_notice is a real-elapsed-time guarantee ("at least 24 hours from
+    # now"), not a wall-clock offset, so this needs the same UTC-safe
+    # stepping as meeting durations — plain `+` here could under-deliver
+    # the promised notice by an hour across a spring-forward transition.
+    earliest_allowed = _step(now, policy.min_notice)
     query_start = max(resolved.start, earliest_allowed)
     if query_start >= resolved.end:
         return []
@@ -337,12 +373,15 @@ async def generate_slots(
     chosen = _spread_pick(candidates, _TARGET_SLOT_COUNT)
 
     caller_tz = ZoneInfo(caller_timezone)
-    return [
-        Slot(
-            slot_id=str(uuid.uuid4()),
-            start_iso=start.isoformat(),
-            end_iso=(start + policy.meeting_length).isoformat(),
-            label=_format_label(start, start + policy.meeting_length, caller_tz),
+    slots = []
+    for start in chosen:
+        end = _step(start, policy.meeting_length)
+        slots.append(
+            Slot(
+                slot_id=str(uuid.uuid4()),
+                start_iso=start.isoformat(),
+                end_iso=end.isoformat(),
+                label=_format_label(start, end, caller_tz),
+            )
         )
-        for start in chosen
-    ]
+    return slots
