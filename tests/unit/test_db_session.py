@@ -593,6 +593,47 @@ async def test_create_booking_inserts_a_tentative_row(
     assert isinstance(booking.created_at, datetime)
 
 
+async def test_create_booking_survives_a_refresh_failure_after_a_successful_commit(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found that create_booking()'s
+    unconditional db.refresh() call after the commit meant a refresh
+    failure (e.g. a connectivity blip right after the commit) propagated
+    out of create_booking() before it returned a Booking -- even though the
+    row was already durably committed. That mattered to
+    app/tools/registry.py's calendar_create_booking, whose
+    compensating-cleanup logic decides whether to delete an orphaned row
+    based on whether create_booking() returned successfully; a refresh-only
+    failure there would make it wrongly conclude no row exists and skip
+    cleanup of one that does. create_booking() now swallows a refresh
+    failure and returns the pre-commit object, since `id` (an autoincrement
+    PK) is already populated at flush time and `created_at` is set
+    client-side by the column's Python default, both independent of
+    whether the refresh itself succeeds.
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")  # itself calls db.refresh -- do this first
+
+        async def _raise(_self: AsyncSession, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("refresh failed")
+
+        monkeypatch.setattr(AsyncSession, "refresh", _raise)
+
+        booking = await create_booking(
+            db,
+            session_id="sess-1",
+            slot_start_iso="2026-08-03T09:00:00-04:00",
+            slot_end_iso="2026-08-03T09:30:00-04:00",
+            timezone_name="America/Toronto",
+            contact_name="Priya Patel",
+            contact_email="priya@example.com",
+            gcal_event_id="gcal-event-123",
+        )
+
+    assert booking.id is not None
+    assert booking.session_id == "sess-1"
+
+
 def test_no_sync_db_access_outside_session_module() -> None:
     """Grep-audit (Issue #3 acceptance criteria): no synchronous SQLAlchemy
     engine, no `sqlite3` import, and no dialect-specific SQL (PRAGMA / ON

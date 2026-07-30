@@ -485,5 +485,23 @@ async def create_booking(
     )
     db.add(booking)
     await db.commit()
-    await db.refresh(booking)
+    try:
+        await db.refresh(booking)
+    except Exception:
+        # The commit above already succeeded and durably created the row —
+        # `id` was already populated on `booking` at flush time (standard
+        # SQLAlchemy behavior for an autoincrement PK, independent of this
+        # refresh) and `created_at` was set client-side by the column's
+        # Python default before the insert, so a refresh failure here
+        # doesn't leave `booking` missing anything a caller actually reads.
+        # Letting it propagate instead would make create_booking() look
+        # like it failed even though the row is committed — which matters
+        # to app/tools/registry.py's calendar_create_booking: it decides
+        # whether to attempt a compensating delete of an orphaned bookings
+        # row based on whether this function returned a Booking at all.
+        logger.warning(
+            "create_booking: row committed for session %s but refresh failed — continuing "
+            "with the pre-commit object",
+            session_id,
+        )
     return booking
