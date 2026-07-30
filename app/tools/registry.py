@@ -463,19 +463,52 @@ async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dic
             ),
         }
 
-    booking = await create_booking(
-        context.db,
-        session_id=context.session_id,
-        slot_start_iso=str(selected["start_iso"]),
-        slot_end_iso=str(selected["end_iso"]),
-        timezone_name=state.timezone_name,
-        contact_name=state.contact_name,
-        contact_email=state.contact_email,
-        gcal_event_id=event_id,
-    )
-
-    new_state = transition(state, Event(kind=EventKind.CREATED))
-    await save_booking_state(context.db, new_state)
+    try:
+        booking = await create_booking(
+            context.db,
+            session_id=context.session_id,
+            slot_start_iso=str(selected["start_iso"]),
+            slot_end_iso=str(selected["end_iso"]),
+            timezone_name=state.timezone_name,
+            contact_name=state.contact_name,
+            contact_email=state.contact_email,
+            gcal_event_id=event_id,
+        )
+        new_state = transition(state, Event(kind=EventKind.CREATED))
+        await save_booking_state(context.db, new_state)
+    except Exception:
+        # The calendar write above already succeeded — without this, a
+        # failure here (a DB outage, a transient error) would leave a real
+        # event on the calendar with no bookings row and no owner
+        # notification, permanently invisible to the app: state stays at
+        # confirmed, so a retry re-runs the free/busy re-check, sees the
+        # orphaned event as busy, and wrongly bounces the visitor into
+        # "that time was just taken by someone else" for a slot they
+        # already got. Best-effort compensating delete closes that window;
+        # if the delete itself also fails, this is logged for manual
+        # reconciliation rather than silently lost.
+        logger.error(
+            "calendar_create_booking: DB write failed after event creation for session %s "
+            "(event_id=%s) — attempting to delete the orphaned event",
+            context.session_id,
+            event_id,
+        )
+        try:
+            await context.calendar_client.delete_event(event_id)
+        except CalendarError:
+            logger.error(
+                "calendar_create_booking: failed to delete orphaned event %s for session %s "
+                "— needs manual cleanup",
+                event_id,
+                context.session_id,
+            )
+        return {
+            "error": "creation_failed",
+            "message": (
+                "Something went wrong — ask the visitor to try again shortly, or offer to "
+                "have the owner follow up by email."
+            ),
+        }
 
     # Scheduled as a background task by app/api/chat.py after run_agent
     # returns (see ToolContext.pending_owner_notifications) — a

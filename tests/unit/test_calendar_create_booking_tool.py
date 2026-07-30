@@ -227,3 +227,35 @@ async def test_event_creation_failure_returns_structured_error(db: AsyncSession)
     assert result["error"] == "creation_failed"
     state = await load_booking_state(db, SID)
     assert state.step is Step.CONFIRMED  # unchanged; visitor can retry
+
+
+async def test_db_write_failure_after_event_creation_deletes_the_orphaned_event(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found that if create_booking (the DB
+    write) fails *after* calendar_client.create_event already succeeded, the
+    handler left a real orphaned event on the calendar with no bookings row
+    and booking_state stuck at confirmed -- a retry would then see the
+    orphaned event as busy at the free/busy re-check and wrongly tell the
+    visitor their own just-created slot was taken by someone else. The fix
+    wraps the DB write in try/except and attempts a compensating
+    delete_event() call. FakeCalendar.delete_event() pops the event out of
+    created_events, so asserting created_events == {} after the failure
+    proves the compensating delete actually ran (not just that an exception
+    was swallowed).
+    """
+    await save_booking_state(db, _confirmed_state())
+    calendar = FakeCalendar()
+    context = _context(db, calendar_client=calendar)
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("db write failed")
+
+    monkeypatch.setattr("app.tools.registry.create_booking", _raise)
+
+    result = await execute_tool(_call(), context)
+
+    assert result["error"] == "creation_failed"
+    assert calendar.created_events == {}
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.CONFIRMED  # unchanged; visitor can retry
