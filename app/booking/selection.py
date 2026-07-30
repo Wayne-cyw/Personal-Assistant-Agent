@@ -15,27 +15,12 @@ from __future__ import annotations
 import re
 
 _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
-# A single combined pattern (not "try digits, then fall back to ordinal
-# words") — every digit/ordinal mention in the message is found and
-# evaluated (see _extract_index), not just the first one, so which form
-# comes first no longer silently decides the outcome the way a fixed
-# dict-iteration order or an unconditional "digits always win" rule used
-# to. A bare 1-5 digit excludes a longer number (so "slot 12" or a year
-# like "2026" doesn't false-match) and the hour of a clock time (so "2:00"
+# A bare 1-5 digit excludes a longer number (so "slot 12" or a year like
+# "2026" doesn't false-match) and the hour of a clock time (so "2:00"
 # doesn't get read as index 2) via negative lookaround on both sides.
 _INDEX_RE = re.compile(
     r"(?<!\d)(?P<digit>[1-5])(?![\d:])|\b(?P<ordinal>first|second|third|fourth|fifth)\b"
 )
-# A mention immediately preceded by "not" (optionally "not the") is being
-# rejected, not selected — "not the first, I meant 3" and "third one, not
-# the second" both have exactly one *non*-negated mention once this is
-# applied, regardless of which one is textually first. Pure left-to-right
-# position (an earlier version of this fix) got the second example right
-# but silently broke the first, since natural corrections go both
-# directions ("X, not Y" and "not X, I meant Y"); this is not full
-# negation-scope parsing (double negatives, "not not the first" etc. aren't
-# handled) — just the common single-correction case.
-_NEGATION_BEFORE_RE = re.compile(r"\bnot\s+(?:the\s+)?$")
 # Labels render weekdays via strftime("%a") — "Mon", "Tue", "Wed", etc.
 # (app/booking/slots.py's _format_label) — so matching has to normalize a
 # visitor's full-name-or-abbreviation mention ("Wednesday", "Wed", "wed") to
@@ -47,44 +32,61 @@ _WEEKDAY_RE = re.compile(
 # HH:MM, optionally with am/pm attached or space-separated (label times are
 # always zero-padded, e.g. "9:00", "2:30").
 _CLOCK_TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\s*(am|pm)?\b")
-# A visitor rejecting a proposed slot ("none of those work", "2:00 doesn't
-# work for me", "skip the second", "the second is impossible for me") can
-# still incidentally reference a number/weekday/time — without this guard,
-# any of those would misread as *choosing* the referenced slot instead of
-# rejecting it. Checked before any positive match is attempted: whenever
-# one of these fires, the whole message is treated as unresolved (None),
-# even if it also names a *different*, intended slot elsewhere in the same
-# message ("anything but the second, let's do the third" doesn't recover
-# "the third" here) — a missed match the caller can ask about is always
-# safer than this deterministic matcher ever locking in a hold on the exact
-# slot the visitor just said they can't take, which _NEGATION_BEFORE_RE's
-# narrower, position-adjacent "not"/"not the" check alone doesn't catch
-# (rejection cues that trail their reference, like "is impossible", or that
-# use a different lead-in, like "skip"/"cannot make", both slip past it).
-# This is deliberately over the acceptance-criteria phrase ("none of those
-# work") plus the most common rejection phrasings — not full negation-scope
-# parsing (e.g. "not sure, but I'll take the 2nd one" isn't handled).
-_REJECTION_PHRASES = (
-    "none of",
-    "not any of",
-    "anything but",
-    "anything except",
-    "doesn't work",
-    "does not work",
-    "don't work",
-    "do not work",
-    "won't work",
-    "will not work",
-    "no good",
-    "skip the",
-    "cannot make",
-    "can't make",
-    "cant make",
-    "unable to make",
-    "not able to make",
-    "won't be able",
-    "wont be able",
-    "impossible for me",
+
+# A visitor rejecting a proposed slot can phrase it in effectively unbounded
+# ways, and the rejection cue can precede, follow, or sit several words away
+# from whichever number/ordinal/weekday/time it's actually about: "skip the
+# second", "the second is impossible", "not going to work for the second
+# one", "ruling out the second", "2:00 doesn't work for me". Earlier
+# versions of this guard tried to be clever about *which* reference a
+# negation applied to — excluding only the nearby candidate, so a message
+# like "third one, not the second" could still resolve to "third" — but
+# every refinement of that approach (position-based, then adjacency-based,
+# then an enumerated list of whole rejection *phrases*) kept finding a new
+# real-world phrasing that slipped through and caused a *wrong* selection,
+# not just a missed one.
+#
+# This module's whole design premise is that a missed match (the agent asks
+# for clarification) is always safer than a wrong one (the agent locks in a
+# hold on a slot the visitor just rejected) — so this guard is deliberately
+# blunt: if the message contains *any* recognizable rejection cue *word*
+# anywhere, the whole message is treated as unresolved, even if it also
+# names what looks like an intended slot elsewhere ("anything but the
+# second, let's do the third" still returns None, not "third"). This is not
+# full negation-scope parsing; it trades "sometimes asks to clarify when a
+# human reader could have figured out the real choice" for "never silently
+# selects a slot the visitor just rejected."
+#
+# "no", "but", "out", and "pass" alone are deliberately NOT included —
+# they're too common in ordinary affirmative replies ("no problem, the
+# second works", "I like it, but is Tuesday possible too?", "I'm out and
+# about but the second works") to trigger on safely as bare words. A few
+# genuinely unambiguous idioms that use them ("anything but", "no good",
+# "no-go") are still matched as fixed multi-word phrases instead. This
+# means some colloquial rejections still slip through uncaught — "the
+# second is a hard no", "I'll pass on the second", "the second is out for
+# me" all still (wrongly) select the referenced slot rather than punting to
+# clarification. Known, accepted, not chased further: the space of ways to
+# reject a slot in English is unbounded, each phrase added here closes one
+# case while risking a new false-positive elsewhere, and this is
+# deliberately not full negation-scope parsing (see the module docstring).
+# If a wrong-selection case shows up in real traffic, add it as a new
+# fixed phrase rather than reaching for a broader bare word.
+_REJECTION_CUE_RE = re.compile(
+    r"\bnot\b"
+    r"|\bnone\b"
+    r"|\b\w+n't\b"  # any contraction ending in n't: don't, won't, can't, doesn't, ...
+    r"|\bcannot\b"
+    r"|\bimpossible\b"
+    r"|\bunable\b"
+    r"|\bavoid(?:ing)?\b"
+    r"|\bskip(?:ping)?\b"
+    r"|\bexcept\b"
+    r"|\banything\s+but\b"
+    r"|\bno[- ]good\b"
+    r"|\bno[- ]go\b"
+    r"|\brul(?:e|ing)\s+out\b"
+    r"|\bis\s+a\s+no\b"
 )
 
 
@@ -103,7 +105,7 @@ def match_selection(
 
     text = message.strip().lower()
 
-    if any(phrase in text for phrase in _REJECTION_PHRASES):
+    if _REJECTION_CUE_RE.search(text):
         return None
 
     for slot in proposed_slots:
@@ -125,21 +127,17 @@ def match_selection(
 
 
 def _extract_index(text: str) -> int | None:
-    """Every digit/ordinal mention in `text` is a candidate unless it's
-    immediately negated (see _NEGATION_BEFORE_RE) — resolved only if
-    exactly one non-negated candidate remains; zero or more than one is
-    ambiguous, same as any other unresolved reference (the caller clarifies).
+    """A single, unambiguous digit/ordinal mention resolves; more than one
+    (or none) is ambiguous. No per-candidate negation check is needed here
+    — _REJECTION_CUE_RE above has already ruled out any negated message by
+    the time this runs.
     """
-    candidates = []
-    for match in _INDEX_RE.finditer(text):
-        if _NEGATION_BEFORE_RE.search(text[: match.start()]):
-            continue
-        digit = match.group("digit")
-        value = int(digit) if digit else _ORDINAL_WORDS[match.group("ordinal")]
-        candidates.append(value)
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+    matches = list(_INDEX_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    digit = match.group("digit")
+    return int(digit) if digit else _ORDINAL_WORDS[match.group("ordinal")]
 
 
 def _label_matches(text: str, label: str) -> bool:

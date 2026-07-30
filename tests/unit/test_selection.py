@@ -1,3 +1,5 @@
+import pytest
+
 from app.booking.selection import match_selection
 
 SLOTS: list[dict[str, object]] = [
@@ -61,29 +63,18 @@ def test_matches_ordinal_word() -> None:
     assert match_selection("the second one works", SLOTS) == SLOTS[1]
 
 
-def test_negated_ordinal_excluded_leaving_the_real_choice() -> None:
-    """Regression: an earlier version resolved ordinal words by iterating a
-    fixed {"first": 1, "second": 2, ...} dict and returning on the first key
-    found *in the dict*, not the intended one — so "third one, not the
-    second" incorrectly returned index 2 ("second"), since "second" happens
-    to be checked before "third" in the dict regardless of the message's
-    actual meaning. A later "leftmost mention wins" fix got *this* case
-    right by coincidence of word order, but broke the mirror-image phrasing
-    (see test_negated_leading_reference_excluded_even_when_mentioned_first
-    below) — negation-adjacent exclusion handles both directions.
+def test_a_negated_reference_alongside_another_does_not_match_either() -> None:
+    """A message mentioning both a rejected and (seemingly) an intended
+    slot is treated as fully unresolved, not "smartly" resolved to the
+    non-negated one. Several rounds of trying to be clever about *which*
+    reference a negation applies to (positional, then adjacency-based)
+    each fixed one phrasing while breaking or missing another — seven
+    concrete real-world phrasings were still found selecting the wrong
+    slot after that. Punting the whole message to clarification is
+    deliberately blunt but never silently wrong.
     """
-    assert match_selection("third one, not the second", SLOTS) == SLOTS[2]
-
-
-def test_negated_leading_reference_excluded_even_when_mentioned_first() -> None:
-    """Regression: a message can lead with the rejected option and correct
-    afterward ("not X, I meant Y") just as easily as leading with the
-    intended one ("Y, not X") — a purely positional (leftmost-wins) rule
-    only gets one of the two directions right. "first" is immediately
-    preceded by "not the", so it's excluded as a candidate regardless of
-    appearing before "3" in the text.
-    """
-    assert match_selection("not the first, I meant 3", SLOTS) == SLOTS[2]
+    assert match_selection("third one, not the second", SLOTS) is None
+    assert match_selection("not the first, I meant 3", SLOTS) is None
 
 
 def test_only_negated_references_present_does_not_match() -> None:
@@ -139,27 +130,32 @@ def test_none_of_those_work_phrase_does_not_match() -> None:
     assert match_selection("none of those work for me", SLOTS) is None
 
 
-def test_anything_but_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
-    """Regression: a review pass found "anything but the second, let's do
-    that one" resolved to SLOTS[1] (the explicitly rejected slot) — none of
-    the negation-adjacency check or the (narrower, at the time) rejection-
-    phrase list caught this framing.
+@pytest.mark.parametrize(
+    "message",
+    [
+        "anything but the second, let us do that one",
+        "skip the second, whatever else",
+        "I cannot make the second one",
+        "the second is impossible for me, find something else",
+        "let's not do the second",
+        "not going to work for the second one",
+        "the second doesn't fit my schedule",
+        "second one is a no for me",
+        "the second is a no-go, what else you got",
+        "can we avoid the second",
+        "the second won't fly for me",
+        "ruling out the second",
+    ],
+)
+def test_alternate_rejection_phrasings_do_not_wrongly_select_the_rejected_slot(
+    message: str,
+) -> None:
+    """Regression: successive review passes each found real-world
+    rejection phrasings that resolved to the explicitly rejected slot
+    anyway — first a handful of specific idioms, then several more with
+    the negation cue trailing or several words away from the reference.
+    The generic-cue-word design (any of "not"/an n't-contraction/"cannot"/
+    "impossible"/etc. anywhere in the message) closes the whole class
+    rather than each phrasing individually.
     """
-    assert match_selection("anything but the second, let us do that one", SLOTS) is None
-
-
-def test_skip_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
-    assert match_selection("skip the second, whatever else", SLOTS) is None
-
-
-def test_cannot_make_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
-    assert match_selection("I cannot make the second one", SLOTS) is None
-
-
-def test_impossible_for_me_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
-    """The rejection cue trails the reference here ("second" ... "is
-    impossible") rather than leading it — _NEGATION_BEFORE_RE's
-    preceding-text check alone can't catch this direction; only the
-    whole-message _REJECTION_PHRASES guard does.
-    """
-    assert match_selection("the second is impossible for me, find something else", SLOTS) is None
+    assert match_selection(message, SLOTS) is None
