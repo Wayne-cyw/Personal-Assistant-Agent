@@ -27,6 +27,7 @@ gating, booking guidance) already reflects the new step.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
@@ -215,8 +216,18 @@ async def chat(
                 request.message, booking_state.proposed_slots_json or []
             )
             if matched_slot is not None:
+                # DB-only soft hold (Issue #21, 4.5) — never written to the
+                # calendar. calendar_find_slots (app/tools/registry.py)
+                # treats other sessions' unexpired holds as busy via
+                # app/db/session.py's active_holds().
+                hold_expires_at = datetime.now(UTC) + timedelta(minutes=settings.hold_minutes)
                 booking_state = transition(
-                    booking_state, Event(kind=EventKind.SLOT_SELECTED, slot=matched_slot)
+                    booking_state,
+                    Event(
+                        kind=EventKind.SLOT_SELECTED,
+                        slot=matched_slot,
+                        hold_expires_at=hold_expires_at,
+                    ),
                 )
                 await save_booking_state(db, booking_state)
 

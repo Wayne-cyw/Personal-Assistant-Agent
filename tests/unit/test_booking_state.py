@@ -3,6 +3,8 @@ criteria: 100% branch coverage on transition() and allowed_tools_for();
 the 4.5 diagram and the code agree exactly).
 """
 
+from datetime import UTC, datetime
+
 import pytest
 
 from app.booking.state import (
@@ -101,9 +103,13 @@ def test_email_fallback_after_widen_abandons() -> None:
 def test_slot_selected_from_slots_proposed() -> None:
     state = _state(step=Step.SLOTS_PROPOSED, proposal_rounds=1)
     slot = {"slot_id": "s1", "start_iso": "2026-08-03T09:00:00+00:00"}
-    result = transition(state, Event(kind=EventKind.SLOT_SELECTED, slot=slot))
+    hold_expires_at = datetime(2026, 8, 3, 9, 10, tzinfo=UTC)
+    result = transition(
+        state, Event(kind=EventKind.SLOT_SELECTED, slot=slot, hold_expires_at=hold_expires_at)
+    )
     assert result.step is Step.SLOT_SELECTED
     assert result.selected_slot_json == slot
+    assert result.hold_expires_at == hold_expires_at
 
 
 def test_contact_collected_from_slot_selected() -> None:
@@ -278,8 +284,20 @@ def test_timezone_captured_without_timezone_raises_value_error() -> None:
 
 
 def test_slot_selected_without_slot_raises_value_error() -> None:
+    hold_expires_at = datetime(2026, 8, 3, 9, 10, tzinfo=UTC)
     with pytest.raises(ValueError, match="slot"):
-        transition(_state(step=Step.SLOTS_PROPOSED), Event(kind=EventKind.SLOT_SELECTED))
+        transition(
+            _state(step=Step.SLOTS_PROPOSED),
+            Event(kind=EventKind.SLOT_SELECTED, hold_expires_at=hold_expires_at),
+        )
+
+
+def test_slot_selected_without_hold_expires_at_raises_value_error() -> None:
+    slot = {"slot_id": "s1"}
+    with pytest.raises(ValueError, match="hold_expires_at"):
+        transition(
+            _state(step=Step.SLOTS_PROPOSED), Event(kind=EventKind.SLOT_SELECTED, slot=slot)
+        )
 
 
 def test_contact_collected_without_name_raises_value_error() -> None:
@@ -345,6 +363,10 @@ def test_allowed_tools_for_slots_proposed() -> None:
     assert allowed_tools_for(Step.SLOTS_PROPOSED) == ["calendar_find_slots"]
 
 
+def test_allowed_tools_for_slot_selected() -> None:
+    assert allowed_tools_for(Step.SLOT_SELECTED) == ["provide_contact_info"]
+
+
 def test_allowed_tools_for_confirmed() -> None:
     assert allowed_tools_for(Step.CONFIRMED) == ["calendar_create_booking"]
 
@@ -352,7 +374,6 @@ def test_allowed_tools_for_confirmed() -> None:
 @pytest.mark.parametrize(
     "step",
     [
-        Step.SLOT_SELECTED,
         Step.CONTACT_INFO_COLLECTED,
         Step.BOOKING_CREATED,
         Step.ABANDONED,
