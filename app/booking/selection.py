@@ -47,17 +47,28 @@ _WEEKDAY_RE = re.compile(
 # HH:MM, optionally with am/pm attached or space-separated (label times are
 # always zero-padded, e.g. "9:00", "2:30").
 _CLOCK_TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\s*(am|pm)?\b")
-# A visitor rejecting every proposed slot ("none of those work", "2:00
-# doesn't work for me") can still incidentally reference a number/weekday/
-# time — without this guard, "2:00 doesn't work" would misread as *choosing*
-# the 2:00 slot instead of rejecting it. Checked before any positive match
-# is attempted, deliberately over the acceptance-criteria phrase ("none of
-# those work") plus the most common rejection phrasings; this is not full
-# negation-scope parsing (e.g. "not sure, but I'll take the 2nd one" isn't
-# handled) — just closing the obvious false-positive-selection risk.
+# A visitor rejecting a proposed slot ("none of those work", "2:00 doesn't
+# work for me", "skip the second", "the second is impossible for me") can
+# still incidentally reference a number/weekday/time — without this guard,
+# any of those would misread as *choosing* the referenced slot instead of
+# rejecting it. Checked before any positive match is attempted: whenever
+# one of these fires, the whole message is treated as unresolved (None),
+# even if it also names a *different*, intended slot elsewhere in the same
+# message ("anything but the second, let's do the third" doesn't recover
+# "the third" here) — a missed match the caller can ask about is always
+# safer than this deterministic matcher ever locking in a hold on the exact
+# slot the visitor just said they can't take, which _NEGATION_BEFORE_RE's
+# narrower, position-adjacent "not"/"not the" check alone doesn't catch
+# (rejection cues that trail their reference, like "is impossible", or that
+# use a different lead-in, like "skip"/"cannot make", both slip past it).
+# This is deliberately over the acceptance-criteria phrase ("none of those
+# work") plus the most common rejection phrasings — not full negation-scope
+# parsing (e.g. "not sure, but I'll take the 2nd one" isn't handled).
 _REJECTION_PHRASES = (
     "none of",
     "not any of",
+    "anything but",
+    "anything except",
     "doesn't work",
     "does not work",
     "don't work",
@@ -65,6 +76,15 @@ _REJECTION_PHRASES = (
     "won't work",
     "will not work",
     "no good",
+    "skip the",
+    "cannot make",
+    "can't make",
+    "cant make",
+    "unable to make",
+    "not able to make",
+    "won't be able",
+    "wont be able",
+    "impossible for me",
 )
 
 

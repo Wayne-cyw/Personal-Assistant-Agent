@@ -137,3 +137,29 @@ def test_rejection_phrase_overrides_an_incidental_number() -> None:
 
 def test_none_of_those_work_phrase_does_not_match() -> None:
     assert match_selection("none of those work for me", SLOTS) is None
+
+
+def test_anything_but_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
+    """Regression: a review pass found "anything but the second, let's do
+    that one" resolved to SLOTS[1] (the explicitly rejected slot) — none of
+    the negation-adjacency check or the (narrower, at the time) rejection-
+    phrase list caught this framing.
+    """
+    assert match_selection("anything but the second, let us do that one", SLOTS) is None
+
+
+def test_skip_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
+    assert match_selection("skip the second, whatever else", SLOTS) is None
+
+
+def test_cannot_make_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
+    assert match_selection("I cannot make the second one", SLOTS) is None
+
+
+def test_impossible_for_me_phrasing_does_not_wrongly_select_the_rejected_slot() -> None:
+    """The rejection cue trails the reference here ("second" ... "is
+    impossible") rather than leading it — _NEGATION_BEFORE_RE's
+    preceding-text check alone can't catch this direction; only the
+    whole-message _REJECTION_PHRASES guard does.
+    """
+    assert match_selection("the second is impossible for me, find something else", SLOTS) is None
