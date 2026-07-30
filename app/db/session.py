@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import (
 from app.booking.state import BookingState
 from app.booking.state import Step as BookingStep
 from app.config import settings
-from app.db.models import Base, Message, SessionRow
+from app.db.models import Base, Booking, Message, SessionRow
 from app.db.models import BookingState as BookingStateRow
 
 logger = logging.getLogger(__name__)
@@ -449,3 +449,39 @@ async def active_holds(
                 slot,
             )
     return holds
+
+
+async def create_booking(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    slot_start_iso: str,
+    slot_end_iso: str,
+    timezone_name: str,
+    contact_name: str,
+    contact_email: str,
+    gcal_event_id: str,
+) -> Booking:
+    """Insert the `bookings` row for a newly-created tentative event (Issue
+    #22) — the durable, permanent record, independent of `booking_states`
+    (which tracks the in-progress flow and can be overwritten/reset;
+    `bookings` never is). `status` starts "tentative", matching the real
+    Google Calendar event's own status (app/tools/calendar.py's
+    `create_event`); nothing in v1 ever transitions it to "cancelled" —
+    that's out of scope here (rescheduling/cancellation is by email, per
+    the issue text).
+    """
+    booking = Booking(
+        session_id=session_id,
+        slot_start_iso=slot_start_iso,
+        slot_end_iso=slot_end_iso,
+        timezone_name=timezone_name,
+        contact_name=contact_name,
+        contact_email=contact_email,
+        gcal_event_id=gcal_event_id,
+        status="tentative",
+    )
+    db.add(booking)
+    await db.commit()
+    await db.refresh(booking)
+    return booking

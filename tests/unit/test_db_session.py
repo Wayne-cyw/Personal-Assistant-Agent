@@ -25,6 +25,7 @@ from app.db.session import (
     add_token_budget_used,
     advance_summary,
     append_message,
+    create_booking,
     get_engine,
     get_or_create_session,
     load_booking_state,
@@ -553,6 +554,42 @@ async def test_active_holds_skips_a_row_with_a_non_dict_selected_slot_json(
     assert holds == [
         (datetime(2026, 8, 3, 9, 0, tzinfo=UTC), datetime(2026, 8, 3, 9, 30, tzinfo=UTC))
     ]
+
+
+# --- create_booking (Issue #22) -----------------------------------------------
+
+
+async def test_create_booking_inserts_a_tentative_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        booking = await create_booking(
+            db,
+            session_id="sess-1",
+            slot_start_iso="2026-08-03T09:00:00-04:00",
+            slot_end_iso="2026-08-03T09:30:00-04:00",
+            timezone_name="America/Toronto",
+            contact_name="Priya Patel",
+            contact_email="priya@example.com",
+            gcal_event_id="gcal-event-123",
+        )
+
+    assert booking.id is not None
+    assert booking.session_id == "sess-1"
+    assert booking.slot_start_iso == "2026-08-03T09:00:00-04:00"
+    assert booking.slot_end_iso == "2026-08-03T09:30:00-04:00"
+    assert booking.timezone_name == "America/Toronto"
+    assert booking.contact_name == "Priya Patel"
+    assert booking.contact_email == "priya@example.com"
+    assert booking.gcal_event_id == "gcal-event-123"
+    assert booking.status == "tentative"
+    # Not asserting tzinfo here: like hold_expires_at elsewhere in this
+    # file, a value re-read via db.refresh() comes back naive on SQLite's
+    # round-trip (no native tz-aware storage) — a pre-existing, documented
+    # quirk, not something create_booking needs to compensate for, since
+    # created_at is never compared against another datetime anywhere.
+    assert isinstance(booking.created_at, datetime)
 
 
 def test_no_sync_db_access_outside_session_module() -> None:
