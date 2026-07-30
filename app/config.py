@@ -104,6 +104,20 @@ class Settings(BaseSettings):
     # slot for long.
     hold_minutes: int = Field(default=10, ge=1, alias="HOLD_MINUTES")
 
+    # Booking-specific rate limits (Issue #23, PRD: "booking abuse is
+    # costlier than Q&A abuse" — stricter and separate from #24's general
+    # chat-message limits). Per-session is a lifetime cap (no reset window
+    # — bounded by the session's own natural lifetime, not a rolling
+    # period); per-IP is explicitly "per day" in the issue text. No default
+    # is specified for the per-IP cap in the Engineering Guide; 10 is a
+    # deliberately looser number than the per-session cap (3) so a shared
+    # office/NAT IP with a few genuine visitors in one day isn't
+    # false-positived by one visitor's own legitimate attempts.
+    booking_attempts_per_session: int = Field(default=3, ge=1, alias="BOOKING_ATTEMPTS_PER_SESSION")
+    booking_attempts_per_ip_per_day: int = Field(
+        default=10, ge=1, alias="BOOKING_ATTEMPTS_PER_IP_PER_DAY"
+    )
+
     # Owner notification (Issue #22, app/notify.py). Optional: unset just
     # means notifications no-op with a logged warning rather than crashing
     # startup — a dev environment without a configured webhook shouldn't be
