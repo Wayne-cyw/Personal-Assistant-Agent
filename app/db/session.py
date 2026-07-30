@@ -428,15 +428,21 @@ async def active_holds(
     result = await db.execute(stmt)
     holds: list[tuple[datetime, datetime]] = []
     for row in result.scalars():
-        slot = cast("dict[str, object]", row.selected_slot_json)
+        slot = row.selected_slot_json
         try:
+            if not isinstance(slot, dict):
+                raise TypeError(f"selected_slot_json was not a dict: {type(slot).__name__}")
             holds.append(
                 (
                     datetime.fromisoformat(str(slot["start_iso"])),
                     datetime.fromisoformat(str(slot["end_iso"])),
                 )
             )
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
+            # A single corrupted row must not fail this query for every
+            # session — active_holds() runs on every calendar_find_slots
+            # call, so an unhandled exception here would break slot
+            # proposals process-wide, not just for the offending session.
             logger.error(
                 "active_holds: session %s has a malformed selected_slot_json, skipping: %r",
                 row.session_id,

@@ -55,6 +55,7 @@ from app.booking.state import Event, EventKind, Step, transition
 from app.config import settings
 from app.db.models import SessionRow
 from app.db.session import (
+    active_holds,
     add_token_budget_used,
     append_message,
     get_db,
@@ -136,6 +137,21 @@ def _session_budget_exceeded_message() -> str:
         "This conversation has reached its limit — email the owner directly at "
         f"{settings.owner_contact_email}."
     )
+
+
+async def _slot_is_held_by_another_session(
+    db: AsyncSession, slot: dict[str, object], *, exclude_session_id: str
+) -> bool:
+    """Guards the moment a hold is actually granted (Issue #21 review
+    finding), not just proposal time — active_holds() is also consulted in
+    app/tools/registry.py's calendar_find_slots, but a slot could still be
+    proposed to two sessions before either selects, so the grant itself
+    needs its own re-check.
+    """
+    held = await active_holds(db, exclude_session_id=exclude_session_id)
+    start = datetime.fromisoformat(str(slot["start_iso"]))
+    end = datetime.fromisoformat(str(slot["end_iso"]))
+    return any(held_start < end and held_end > start for held_start, held_end in held)
 
 
 _BOOKING_TOOL_NAMES = ("calendar_find_slots", "provide_contact_info")
@@ -224,11 +240,22 @@ async def chat(
             matched_slot = match_selection(
                 request.message, booking_state.proposed_slots_json or []
             )
-            if matched_slot is not None:
+            if matched_slot is not None and not await _slot_is_held_by_another_session(
+                db, matched_slot, exclude_session_id=request.session_id
+            ):
                 # DB-only soft hold (Issue #21, 4.5) — never written to the
                 # calendar. calendar_find_slots (app/tools/registry.py)
                 # treats other sessions' unexpired holds as busy via
-                # app/db/session.py's active_holds().
+                # app/db/session.py's active_holds(), but that's only
+                # checked at *proposal* time — two sessions could still be
+                # offered the same slot before either selects it, so this
+                # re-checks right before actually granting the hold too
+                # (review finding: without this, both could reach
+                # slot_selected/confirmed for the identical slot). Still a
+                # narrow, best-effort soft-hold guarantee, not a hard one —
+                # the real guarantee against a genuine double-booking is
+                # Issue #22's free/busy re-check right before the actual
+                # Google Calendar event gets created.
                 hold_expires_at = datetime.now(UTC) + timedelta(minutes=settings.hold_minutes)
                 booking_state = transition(
                     booking_state,

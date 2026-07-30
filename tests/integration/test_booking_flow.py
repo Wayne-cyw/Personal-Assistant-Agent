@@ -271,6 +271,64 @@ async def test_invalid_email_is_rejected_then_corrected_reaches_confirmed(
     assert state_after_correction.step is Step.CONFIRMED
 
 
+async def test_a_held_slot_blocks_a_concurrent_sessions_selection(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (review finding): active_holds() was only consulted
+    at *proposal* time, so two sessions proposed the identical slot before
+    either had selected anything could both go on to select it and both
+    hold it -- the actual moment a hold is granted needs its own re-check,
+    not just the proposal step.
+    """
+    monkeypatch.setattr(
+        registry_module,
+        "get_availability_policy",
+        lambda: AvailabilityPolicy(
+            timezone=TZ,
+            timezone_name="America/Toronto",
+            work_start_day=0,
+            work_end_day=4,
+            work_start_time=datetime(2000, 1, 1, 9, 0).time(),
+            work_end_time=datetime(2000, 1, 1, 9, 30).time(),
+            meeting_length=timedelta(minutes=30),
+            buffer=timedelta(0),
+            min_notice=timedelta(hours=1),
+        ),
+    )
+
+    # Both sessions propose before either selects -- at proposal time,
+    # neither has a hold yet, so both legitimately see the same one slot.
+    await _prime_past_turn_zero(client, "sess-a")
+    _use_fake_provider([_find_slots_call("call_a1"), _response("Here's the only slot.")])
+    proposal_a = await client.post(
+        "/v1/chat",
+        json={"session_id": "sess-a", "message": "book a call", "timezone": "America/Toronto"},
+    )
+    assert len(proposal_a.json()["data"]["slots"]) == 1
+
+    await _prime_past_turn_zero(client, "sess-b")
+    _use_fake_provider([_find_slots_call("call_b1"), _response("Here's the only slot.")])
+    proposal_b = await client.post(
+        "/v1/chat",
+        json={"session_id": "sess-b", "message": "book a call", "timezone": "America/Toronto"},
+    )
+    assert len(proposal_b.json()["data"]["slots"]) == 1
+
+    # Session A selects first -- grants the hold.
+    _use_fake_provider([_response("Locked in for you.")])
+    await client.post("/v1/chat", json={"session_id": "sess-a", "message": "1"})
+    state_a = await _get_booking_state(engine, "sess-a")
+    assert state_a.step is Step.SLOT_SELECTED
+
+    # Session B selects the same (only) slot next -- must be refused the
+    # hold even though its own stored proposal still lists it.
+    _use_fake_provider([_response("Let me check what else is available.")])
+    await client.post("/v1/chat", json={"session_id": "sess-b", "message": "1"})
+    state_b = await _get_booking_state(engine, "sess-b")
+    assert state_b.step is Step.SLOTS_PROPOSED  # never advanced
+    assert state_b.selected_slot_json is None
+
+
 async def test_a_held_slot_blocks_a_concurrent_sessions_proposal(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
