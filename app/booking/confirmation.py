@@ -47,9 +47,14 @@ _NEGATIVE_RE = re.compile(
 # or hasn't decided yet. Belt-and-suspenders alongside the strict
 # fullmatch below (which already rejects most hedges structurally, since
 # they add trailing text past the allowed phrase), not the primary guard.
+# A trailing ellipsis (`...`/`…`) gets the same treatment as a trailing `?`
+# (review finding): the affirmative regex's punctuation-tail allowance
+# would otherwise let "ok...", "sure...", "perfect..." fullmatch as clean
+# affirmatives even though a trailing ellipsis is a common, plausible way
+# to type a non-committal reply.
 _HESITATION_RE = re.compile(
-    r"\?|\bwait\b|\bhold\s+on\b|\bhmm+\b|\bmaybe\b|\bactually\b|\bnot\s+sure\b|\bnot\s+yet\b"
-    r"|\bi\s+guess\b|\blet\s+me\s+(?:think|check)\b|\bget\s+back\s+to\s+you\b"
+    r"\?|\.{2,}|…|\bwait\b|\bhold\s+on\b|\bhmm+\b|\bmaybe\b|\bactually\b|\bnot\s+sure\b"
+    r"|\bnot\s+yet\b|\bi\s+guess\b|\blet\s+me\s+(?:think|check)\b|\bget\s+back\s+to\s+you\b"
 )
 # The *entire* cleaned reply must match one of these, optionally followed
 # by minimal trailing punctuation/politeness — not just its first word

@@ -119,6 +119,27 @@ def test_no_problem_and_no_worries_are_not_misread_as_declining(message: str) ->
     assert classify_confirmation_reply(message) == "unclear"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ok...",
+        "sure...",
+        "perfect...",
+        "yes..",
+        "confirm…",
+    ],
+)
+def test_trailing_ellipsis_does_not_wrongly_confirm(message: str) -> None:
+    """Regression test: the affirmative regex's trailing-punctuation
+    allowance (`[\\s!.,]*`) let a run of periods through unchecked, so
+    "ok...", "sure...", "perfect..." previously fullmatched as clean
+    affirmatives even though a trailing ellipsis is a common, plausible way
+    to type a non-committal reply -- the same class of risk `?` is already
+    guarded against.
+    """
+    assert classify_confirmation_reply(message) != "affirmative"
+
+
 def test_negative_takes_priority_over_an_incidental_affirmative_word() -> None:
     assert classify_confirmation_reply("sure, actually no, let's not") == "negative"
 
