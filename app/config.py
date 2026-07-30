@@ -97,6 +97,13 @@ class Settings(BaseSettings):
     # owner books off a dedicated secondary calendar.
     google_calendar_id: str = Field(default="primary", alias="GOOGLE_CALENDAR_ID")
 
+    # Soft-hold duration on a selected-but-not-yet-confirmed slot (Issue #21,
+    # 4.5's slot_selected step). DB-only — never written to the calendar.
+    # 10 minutes is the issue's own stated default: long enough to type a
+    # name/email, short enough that an abandoned flow doesn't block a real
+    # slot for long.
+    hold_minutes: int = Field(default=10, ge=1, alias="HOLD_MINUTES")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by

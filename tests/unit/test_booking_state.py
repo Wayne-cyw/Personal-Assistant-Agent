@@ -12,6 +12,7 @@ from app.booking.state import (
     InvalidTransition,
     Step,
     allowed_tools_for,
+    next_proposal_event,
     transition,
 )
 
@@ -54,11 +55,41 @@ def test_re_propose_increments_round() -> None:
     assert result.proposed_slots_json == [{"slot_id": "s3"}]
 
 
+def test_re_propose_folds_the_outgoing_round_into_excluded_slots() -> None:
+    state = _state(
+        step=Step.SLOTS_PROPOSED, proposal_rounds=1, proposed_slots_json=[{"slot_id": "s1"}]
+    )
+    result = transition(state, Event(kind=EventKind.RE_PROPOSE, slots=[{"slot_id": "s3"}]))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}]
+
+
+def test_re_propose_accumulates_onto_existing_excluded_slots() -> None:
+    state = _state(
+        step=Step.SLOTS_PROPOSED,
+        proposal_rounds=1,
+        proposed_slots_json=[{"slot_id": "s2"}],
+        excluded_slots_json=[{"slot_id": "s1"}],
+    )
+    result = transition(state, Event(kind=EventKind.RE_PROPOSE, slots=[{"slot_id": "s3"}]))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}, {"slot_id": "s2"}]
+
+
 def test_widen_window_at_cap_increments_round_again() -> None:
     state = _state(step=Step.SLOTS_PROPOSED, proposal_rounds=2)
     result = transition(state, Event(kind=EventKind.WIDEN_WINDOW, slots=[{"slot_id": "s4"}]))
     assert result.step is Step.SLOTS_PROPOSED
     assert result.proposal_rounds == 3
+
+
+def test_widen_window_also_folds_the_outgoing_round_into_excluded_slots() -> None:
+    state = _state(
+        step=Step.SLOTS_PROPOSED,
+        proposal_rounds=2,
+        proposed_slots_json=[{"slot_id": "s3"}],
+        excluded_slots_json=[{"slot_id": "s1"}],
+    )
+    result = transition(state, Event(kind=EventKind.WIDEN_WINDOW, slots=[{"slot_id": "s4"}]))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
 
 
 def test_email_fallback_after_widen_abandons() -> None:
@@ -298,6 +329,14 @@ def test_negotiation_cap_arithmetic_two_rounds_then_widen_then_fallback() -> Non
 # --- tool-gating table -------------------------------------------------------
 
 
+def test_allowed_tools_for_idle() -> None:
+    # Issue #20: no classifier exists yet, and state transitions only ever
+    # happen inside execute_tool/handler code — so calendar_find_slots
+    # itself has to be reachable from idle to be the mechanism that both
+    # signals and records "the visitor wants to book."
+    assert allowed_tools_for(Step.IDLE) == ["calendar_find_slots"]
+
+
 def test_allowed_tools_for_intent_detected() -> None:
     assert allowed_tools_for(Step.INTENT_DETECTED) == ["calendar_find_slots"]
 
@@ -313,7 +352,6 @@ def test_allowed_tools_for_confirmed() -> None:
 @pytest.mark.parametrize(
     "step",
     [
-        Step.IDLE,
         Step.SLOT_SELECTED,
         Step.CONTACT_INFO_COLLECTED,
         Step.BOOKING_CREATED,
@@ -322,6 +360,48 @@ def test_allowed_tools_for_confirmed() -> None:
 )
 def test_allowed_tools_empty_everywhere_else(step: Step) -> None:
     assert allowed_tools_for(step) == []
+
+
+# --- next_proposal_event (Issue #20) -----------------------------------------
+
+
+def test_next_proposal_event_from_idle_is_slots_proposed() -> None:
+    assert next_proposal_event(_state()) is EventKind.SLOTS_PROPOSED
+
+
+def test_next_proposal_event_from_intent_detected_is_slots_proposed() -> None:
+    state = _state(step=Step.INTENT_DETECTED)
+    assert next_proposal_event(state) is EventKind.SLOTS_PROPOSED
+
+
+def test_next_proposal_event_first_round_is_re_propose() -> None:
+    state = _state(step=Step.SLOTS_PROPOSED, proposal_rounds=1)
+    assert next_proposal_event(state) is EventKind.RE_PROPOSE
+
+
+def test_next_proposal_event_at_cap_is_widen_window() -> None:
+    state = _state(step=Step.SLOTS_PROPOSED, proposal_rounds=2)
+    assert next_proposal_event(state) is EventKind.WIDEN_WINDOW
+
+
+def test_next_proposal_event_past_cap_is_email_fallback() -> None:
+    state = _state(step=Step.SLOTS_PROPOSED, proposal_rounds=3)
+    assert next_proposal_event(state) is EventKind.EMAIL_FALLBACK
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        Step.SLOT_SELECTED,
+        Step.CONTACT_INFO_COLLECTED,
+        Step.CONFIRMED,
+        Step.BOOKING_CREATED,
+        Step.ABANDONED,
+    ],
+)
+def test_next_proposal_event_raises_outside_the_reachable_steps(step: Step) -> None:
+    with pytest.raises(AssertionError):
+        next_proposal_event(_state(step=step))
 
 
 # --- other -------------------------------------------------------------------

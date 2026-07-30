@@ -3,9 +3,14 @@ Issue #10) — the component that turns "an LLM call" into "an agent".
 
 Scope note: context assembly (system prompt + history + user message) stays
 the caller's job — app/agent/memory.py (Issue #11) builds that list; this
-function owns only the tool-call round-trip loop. Tool availability isn't
-yet gated by booking state (no state machine exists until #18), so every
-registered tool is always offered.
+function owns only the tool-call round-trip loop.
+
+Tool availability is gated by booking state (Issue #20, 4.2's "tool gating
+by state" safety property): the offered tool list is recomputed from live
+booking state before every provider call, not just once per turn, so a state
+transition made by an earlier tool call in the same turn (e.g.
+calendar_find_slots moving idle -> slots_proposed) is reflected immediately
+for the model's next call, rather than only on the following turn.
 """
 
 from __future__ import annotations
@@ -16,8 +21,9 @@ from dataclasses import dataclass, field
 
 from app.agent.memory import ToolEvent
 from app.agent.providers.base import LLMProvider, Message
+from app.db.session import load_booking_state
 from app.tools.context import ToolContext
-from app.tools.registry import TOOL_DEFS, execute_tool, persist_receipt_for
+from app.tools.registry import execute_tool, persist_receipt_for, tool_defs_for_step
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +71,10 @@ async def run_agent(
     tool_events: list[ToolEvent] = []
 
     for _ in range(max_iterations):
+        booking_state = await load_booking_state(tool_context.db, tool_context.session_id)
+        tools = tool_defs_for_step(booking_state.step)
         response = await provider.complete(
-            messages=working_messages, tools=TOOL_DEFS, max_tokens=max_tokens
+            messages=working_messages, tools=tools, max_tokens=max_tokens
         )
         total_input_tokens += response.usage.input_tokens
         total_output_tokens += response.usage.output_tokens

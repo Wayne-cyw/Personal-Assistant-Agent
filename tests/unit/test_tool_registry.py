@@ -16,6 +16,7 @@ from app.agent.providers.fake import FakeProvider
 from app.db.models import Base
 from app.db.session import get_or_create_session
 from app.tools.context import ToolContext
+from app.tools.fake_calendar import FakeCalendar
 from app.tools.registry import (
     FLAG_SUMMARY_CONFLICT,
     GET_CURRENT_DATE,
@@ -52,7 +53,9 @@ def summarizer() -> FakeProvider:
 
 @pytest.fixture
 def context(db: AsyncSession, summarizer: FakeProvider) -> ToolContext:
-    return ToolContext(db=db, session_id="sess-1", summarizer_provider=summarizer)
+    return ToolContext(
+        db=db, session_id="sess-1", summarizer_provider=summarizer, calendar_client=FakeCalendar()
+    )
 
 
 def test_get_current_date_is_registered() -> None:

@@ -360,6 +360,7 @@ async def load_booking_state(db: AsyncSession, session_id: str) -> BookingState:
         proposal_rounds=row.proposal_rounds,
         contact_name=row.contact_name,
         contact_email=row.contact_email,
+        excluded_slots_json=cast(list[dict[str, object]] | None, row.excluded_slots_json),
     )
 
 
@@ -399,4 +400,5 @@ async def save_booking_state(db: AsyncSession, state: BookingState) -> None:
     row.proposal_rounds = state.proposal_rounds
     row.contact_name = state.contact_name
     row.contact_email = state.contact_email
+    row.excluded_slots_json = cast("list[object] | None", state.excluded_slots_json)
     await db.commit()

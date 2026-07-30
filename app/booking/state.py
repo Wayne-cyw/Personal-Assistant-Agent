@@ -102,6 +102,24 @@ class BookingState:
     proposal_rounds: int = 0
     contact_name: str | None = None
     contact_email: str | None = None
+    # Every slot ever offered and then superseded by a later round (Issue
+    # #20 review fix) — accumulated across the whole negotiation, not just
+    # the immediately-preceding round. Without this, a round-3 widened
+    # window could re-offer a slot from round 1 that the visitor already
+    # explicitly rejected twice: RE_PROPOSE/WIDEN_WINDOW both *replace*
+    # proposed_slots_json with the fresh round's results, so an exclude
+    # list built only from `proposed_slots_json` only ever sees the single
+    # most recent round.
+    excluded_slots_json: list[dict[str, object]] | None = None
+
+
+def _accumulate_excluded(state: BookingState) -> list[dict[str, object]]:
+    """The outgoing round's proposed_slots_json is about to be superseded
+    (the visitor is rejecting it by triggering a re-propose/widen) — fold it
+    into the running excluded-slots accumulator so a later round never
+    re-offers it (see BookingState.excluded_slots_json's docstring).
+    """
+    return list(state.excluded_slots_json or []) + list(state.proposed_slots_json or [])
 
 
 class InvalidTransition(Exception):
@@ -170,6 +188,7 @@ def transition(state: BookingState, event: Event) -> BookingState:
             state,
             proposed_slots_json=list(event.slots or []),
             proposal_rounds=state.proposal_rounds + 1,
+            excluded_slots_json=_accumulate_excluded(state),
         )
 
     if kind is EventKind.WIDEN_WINDOW:
@@ -181,6 +200,7 @@ def transition(state: BookingState, event: Event) -> BookingState:
             state,
             proposed_slots_json=list(event.slots or []),
             proposal_rounds=state.proposal_rounds + 1,
+            excluded_slots_json=_accumulate_excluded(state),
         )
 
     if kind is EventKind.EMAIL_FALLBACK:
@@ -238,11 +258,23 @@ def transition(state: BookingState, event: Event) -> BookingState:
     raise AssertionError(f"unhandled event kind: {kind!r}")  # pragma: no cover
 
 
-# calendar_find_slots only from intent/proposal steps; calendar_create_
-# booking only from confirmed (4.5's tool-gating rule, enforced here so a
-# jailbreak convincing the model to "just book it" fails structurally —
-# the tool isn't even in the list it was given, 4.2).
+# calendar_find_slots from idle onward; calendar_create_booking only from
+# confirmed (4.5's tool-gating rule, enforced here so a jailbreak convincing
+# the model to "just book it" fails structurally — the tool isn't even in
+# the list it was given, 4.2).
+#
+# idle is included (Issue #20) even though 4.5's table names "Classifier/LLM
+# detects booking intent" as intent_detected's own trigger: there is no
+# classifier yet (deferred to #25), and state transitions happen only inside
+# execute_tool/handler code, never inferred from the LLM's prose — so the
+# calendar_find_slots call itself has to be the mechanism that both signals
+# and records intent detection (its handler fires idle -> intent_detected as
+# its first step when called from idle, before doing anything else). Without
+# idle here, the tool would never appear in the list offered to a
+# fresh/idle session, and the model would have no structural way to signal
+# "the visitor wants to book."
 _ALLOWED_TOOLS: dict[Step, tuple[str, ...]] = {
+    Step.IDLE: ("calendar_find_slots",),
     Step.INTENT_DETECTED: ("calendar_find_slots",),
     Step.SLOTS_PROPOSED: ("calendar_find_slots",),
     Step.CONFIRMED: ("calendar_create_booking",),
@@ -251,3 +283,24 @@ _ALLOWED_TOOLS: dict[Step, tuple[str, ...]] = {
 
 def allowed_tools_for(step: Step) -> list[str]:
     return list(_ALLOWED_TOOLS.get(step, ()))
+
+
+def next_proposal_event(state: BookingState) -> EventKind:
+    """Which EventKind a fresh calendar_find_slots call should fire, given
+    the current step and proposal_rounds — the negotiation-cap policy (4.5:
+    <=2 proposal rounds, then widen the window once, then offer email
+    fallback) lives here as one decision, so callers never need to reach
+    into _PROPOSAL_ROUND_CAP directly. Only meaningful when
+    calendar_find_slots is actually reachable for `state.step` (idle,
+    intent_detected, or slots_proposed) — any other step is a caller-contract
+    violation (calendar_find_slots is not offered as a tool there).
+    """
+    if state.step in (Step.IDLE, Step.INTENT_DETECTED):
+        return EventKind.SLOTS_PROPOSED
+    if state.step is Step.SLOTS_PROPOSED:
+        if state.proposal_rounds < _PROPOSAL_ROUND_CAP:
+            return EventKind.RE_PROPOSE
+        if state.proposal_rounds == _PROPOSAL_ROUND_CAP:
+            return EventKind.WIDEN_WINDOW
+        return EventKind.EMAIL_FALLBACK
+    raise AssertionError(f"next_proposal_event called for step {state.step!r}")
