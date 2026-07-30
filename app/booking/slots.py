@@ -123,6 +123,14 @@ def parse_availability_policy(path: Path) -> AvailabilityPolicy:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise AvailabilityPolicyError(f"{path} does not exist") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        # OSError also covers PermissionError/IsADirectoryError. This is a
+        # config file read on every /health request once Issue #19's
+        # health-check wiring is live — health.py only catches
+        # AvailabilityPolicyError, so leaving this un-narrowed would let a
+        # bad file permission or a non-UTF-8 edit turn the health endpoint
+        # itself into the outage it exists to catch.
+        raise AvailabilityPolicyError(f"{path} could not be read: {exc}") from exc
 
     fields: dict[str, str] = {}
     for line in text.splitlines():
