@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -67,6 +67,25 @@ class Settings(BaseSettings):
     enforce_single_worker: bool = Field(default=False, alias="ENFORCE_SINGLE_WORKER")
     web_concurrency: int | None = Field(default=None, alias="WEB_CONCURRENCY")
 
+    # Cost-control guardrails (Engineering Guide 4.6 layer 4, Issue #12).
+    # A tighter, chat-reply-specific cap than max_tokens_per_turn — pairs
+    # with #8's brevity rule (2-4 sentences by default). max_tokens_per_turn
+    # remains the outer ceiling enforced on every provider call, including
+    # this one (app/api/chat.py takes min(chat_max_output_tokens,
+    # max_tokens_per_turn)); this is the tighter, ordinary-chat-turn value
+    # in the common case where it's the smaller of the two.
+    chat_max_output_tokens: int = Field(default=500, ge=1, alias="CHAT_MAX_OUTPUT_TOKENS")
+    # Per-session lifetime token budget. No number is given in the
+    # Engineering Guide; 50,000 is a deliberately generous default (dozens
+    # of ordinary turns plus a few evictions) that a real deployment should
+    # tune against observed cost, not a value with any special significance.
+    session_token_budget: int = Field(default=50_000, ge=1, alias="SESSION_TOKEN_BUDGET")
+    # Required, no default (same pattern as openai_api_key): the wrap-up
+    # message shown once a session hits its budget names this address
+    # explicitly, so shipping a placeholder here would leak into a real
+    # visitor-facing response.
+    owner_contact_email: str = Field(alias="OWNER_CONTACT_EMAIL")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by
@@ -105,6 +124,28 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip().lstrip("-").isdigit():
             return None
         return value
+
+    @model_validator(mode="after")
+    def _check_max_tokens_per_turn_supports_summarization(self) -> Settings:
+        # Mirrors app/agent/memory.py's _SUMMARIZER_MAX_TOKENS_FLOOR
+        # (duplicated here, not imported, to avoid a config<->memory
+        # circular import — keep the two in sync if either changes).
+        # _summarize() clamps its own call to
+        # min(its own computed budget, max_tokens_per_turn) — Issue #12's
+        # "enforce MAX_TOKENS_PER_TURN on every provider call" rule. Below
+        # this floor, that clamp guarantees every summarizer call is too
+        # small to emit valid JSON, so every eviction fails, retries once,
+        # and burns real tokens with no way to ever succeed (a fail-fast
+        # startup error here is cheap insurance against that silent,
+        # unbounded-retry cost).
+        min_reasonable = 300
+        if self.max_tokens_per_turn < min_reasonable:
+            raise ValueError(
+                f"MAX_TOKENS_PER_TURN={self.max_tokens_per_turn} is too low for the memory "
+                f"summarizer to ever produce valid JSON (needs at least {min_reasonable}) — "
+                "every eviction would fail and retry indefinitely. Raise MAX_TOKENS_PER_TURN."
+            )
+        return self
 
 
 settings = Settings()  # type: ignore[call-arg]  # values come from env, not call args

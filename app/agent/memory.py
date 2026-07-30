@@ -33,14 +33,15 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.prompts import SUMMARIZER_SYSTEM_PROMPT
-from app.agent.providers.base import LLMProvider, UpstreamError
+from app.agent.providers.base import LLMProvider, UpstreamError, Usage
 from app.agent.providers.base import Message as LLMMessage
 from app.agent.session_lock import SessionBusyError, session_turn_lock
-from app.agent.tokens import count_tokens
+from app.agent.tokens import count_tokens, effective_tokens_from_usage
 from app.config import settings
 from app.db.models import Message as MessageRow
 from app.db.models import SessionRow
 from app.db.session import (
+    add_token_budget_used,
     advance_summary,
     append_message,
     get_session_factory,
@@ -248,15 +249,30 @@ def _parse_summary_json(text: str) -> SummaryJSON | None:
         return None
 
 
+_ZERO_USAGE = Usage(input_tokens=0, output_tokens=0, cached_input_tokens=0)
+
+
+def _add_usage(a: Usage, b: Usage) -> Usage:
+    return Usage(
+        input_tokens=a.input_tokens + b.input_tokens,
+        output_tokens=a.output_tokens + b.output_tokens,
+        cached_input_tokens=a.cached_input_tokens + b.cached_input_tokens,
+    )
+
+
 async def _summarize(
     provider: LLMProvider, existing_summary: SummaryJSON | None, turns: list[MessageRow]
-) -> SummaryJSON | None:
+) -> tuple[SummaryJSON | None, Usage]:
     """Merge `turns` into `existing_summary` (or start fresh if None — used
     both for a normal eviction fold and for reload_and_reconcile's
     from-scratch regeneration). Retries once on failure, then skips
     gracefully (4.3): the evicted turns remain in the DB log regardless, so
     nothing is lost, only the compressed context update is deferred to the
     next eviction.
+
+    Returns real usage across every attempt made (even a failed/retried one
+    still spent real tokens) so the caller can charge it to the session's
+    token budget (Issue #12) regardless of whether the fold succeeded.
     """
     existing_text = existing_summary.model_dump_json() if existing_summary else "none"
     turns_text = "\n".join(f"{m.role}: {m.content}" for m in turns)
@@ -265,7 +281,13 @@ async def _summarize(
         LLMMessage(role="system", content=SUMMARIZER_SYSTEM_PROMPT),
         LLMMessage(role="user", content=user_content),
     ]
-    max_tokens = max(_SUMMARIZER_MAX_TOKENS_FLOOR, settings.summary_max_tokens * 2)
+    # MAX_TOKENS_PER_TURN is enforced as the outer ceiling on every provider
+    # call (4.3/Issue #12), including the summarizer's own, tighter budget.
+    max_tokens = min(
+        max(_SUMMARIZER_MAX_TOKENS_FLOOR, settings.summary_max_tokens * 2),
+        settings.max_tokens_per_turn,
+    )
+    total_usage = _ZERO_USAGE
 
     for attempt in range(2):
         try:
@@ -273,14 +295,15 @@ async def _summarize(
         except UpstreamError:
             logger.warning("summarizer call failed (attempt %d/2)", attempt + 1)
             continue
+        total_usage = _add_usage(total_usage, response.usage)
         parsed = _parse_summary_json(response.text)
         if parsed is not None:
-            return parsed
+            return parsed, total_usage
         logger.warning(
             "summarizer produced invalid JSON (attempt %d/2): %r", attempt + 1, response.text
         )
     logger.error("summarizer failed twice; skipping this fold (evicted turns remain in the DB log)")
-    return None
+    return None, total_usage
 
 
 def _memory_lock_key(session_id: str) -> str:
@@ -356,7 +379,8 @@ async def _run_eviction_locked(session_id: str, summarizer_provider: LLMProvider
         existing_summary = (
             SummaryJSON.model_validate(session.summary_json) if session.summary_json else None
         )
-        new_summary = await _summarize(summarizer_provider, existing_summary, evicted)
+        new_summary, usage = await _summarize(summarizer_provider, existing_summary, evicted)
+        await add_token_budget_used(db, session_id, effective_tokens_from_usage(usage))
         if new_summary is None:
             return
 
@@ -384,7 +408,10 @@ async def _run_drift_audit(
     if session is None or session.summary_through_message_id is None:
         return
     raw_messages = await messages_up_to(db, session_id, session.summary_through_message_id)
-    from_scratch = await _summarize(summarizer_provider, existing_summary=None, turns=raw_messages)
+    from_scratch, usage = await _summarize(
+        summarizer_provider, existing_summary=None, turns=raw_messages
+    )
+    await add_token_budget_used(db, session_id, effective_tokens_from_usage(usage))
     if from_scratch is None:
         return
     incremental = session.summary_json
@@ -420,7 +447,10 @@ async def reload_and_reconcile(
     if session is None or session.summary_through_message_id is None:
         return None  # nothing summarized yet, nothing to reconcile
     raw_messages = await messages_up_to(db, session_id, session.summary_through_message_id)
-    new_summary = await _summarize(summarizer_provider, existing_summary=None, turns=raw_messages)
+    new_summary, usage = await _summarize(
+        summarizer_provider, existing_summary=None, turns=raw_messages
+    )
+    await add_token_budget_used(db, session_id, effective_tokens_from_usage(usage))
     if new_summary is None:
         return None
     before = session.summary_json

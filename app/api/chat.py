@@ -40,10 +40,12 @@ from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
 from app.agent.session_lock import session_turn_lock
+from app.agent.tokens import effective_tokens
 from app.agent.visitor_info import extract_linkedin_url, extract_name
 from app.config import settings
 from app.db.models import SessionRow
 from app.db.session import (
+    add_token_budget_used,
     append_message,
     get_db,
     get_or_create_session,
@@ -108,6 +110,13 @@ async def _maybe_capture_visitor_info_turn_zero(
         await set_visitor_info(db, session.id, name=newly_name, linkedin=newly_linkedin)
 
 
+def _session_budget_exceeded_message() -> str:
+    return (
+        "This conversation has reached its limit — email the owner directly at "
+        f"{settings.owner_contact_email}."
+    )
+
+
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -132,6 +141,21 @@ async def chat(
             await append_message(db, request.session_id, "assistant", INTRO_MESSAGE)
             return ChatResponse(reply=INTRO_MESSAGE, type=ResponseType.MESSAGE, data=None)
 
+        # Cost-control guardrail (Engineering Guide 4.6 layer 4, Issue #12):
+        # a session that has already spent its lifetime budget gets a
+        # static wrap-up message and zero LLM calls — but the message
+        # itself is still logged, per 4.3's "DB log is complete" invariant.
+        # Deliberately permanent for the rest of the session's life once
+        # crossed (token_budget_used only ever increases, and there's no
+        # reset path) — the plain reading of "lifetime budget" in the issue
+        # body, and simpler than trying to distinguish "trivial" turns that
+        # might still deserve a real reply from ones that don't.
+        if session.token_budget_used >= settings.session_token_budget:
+            await append_message(db, request.session_id, "user", request.message)
+            reply_text = _session_budget_exceeded_message()
+            await append_message(db, request.session_id, "assistant", reply_text)
+            return ChatResponse(reply=reply_text, type=ResponseType.MESSAGE, data=None)
+
         memory = await load_memory(db, session)
         messages = assemble_messages(memory, SYSTEM_PROMPT, request.message)
 
@@ -144,15 +168,30 @@ async def chat(
         tool_context = ToolContext(
             db=db, session_id=request.session_id, summarizer_provider=summarizer_provider
         )
+        # CHAT_MAX_OUTPUT_TOKENS is the tighter, chat-reply-specific cap
+        # (pairs with #8's brevity rule); MAX_TOKENS_PER_TURN remains the
+        # outer ceiling enforced on every provider call (Issue #12) — the
+        # summarizer's own call is clamped the same way in
+        # app/agent/memory.py's _summarize.
+        max_tokens = min(settings.chat_max_output_tokens, settings.max_tokens_per_turn)
         result = await run_agent(
             messages,
             provider,
-            settings.max_tokens_per_turn,
+            max_tokens,
             max_iterations=settings.max_iterations,
             tool_context=tool_context,
         )
         http_request.state.llm_tokens_in = result.input_tokens
         http_request.state.llm_tokens_out = result.output_tokens
+        await add_token_budget_used(
+            db,
+            request.session_id,
+            effective_tokens(
+                input_tokens=result.input_tokens,
+                cached_input_tokens=result.cached_input_tokens,
+                output_tokens=result.output_tokens,
+            ),
+        )
 
         needs_eviction = await persist_turn(
             db,

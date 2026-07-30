@@ -459,6 +459,79 @@ async def test_concurrent_same_session_requests_serialize_through_the_endpoint(
     assert order == ["start", "end", "start", "end"]
 
 
+async def test_session_token_budget_exceeded_returns_wrap_up_message_with_zero_llm_calls(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import settings
+    from app.db.session import add_token_budget_used
+
+    monkeypatch.setattr(settings, "session_token_budget", 10)
+    await _prime_past_turn_zero(client, "sess-1")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as db:
+        await add_token_budget_used(db, "sess-1", 10)  # already at the budget
+
+    fake = _use_fake_provider([_response("unused — budget already exhausted")])
+
+    response = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "one more question"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["reply"] == (
+        f"This conversation has reached its limit — email the owner directly at "
+        f"{settings.owner_contact_email}."
+    )
+    assert fake.calls == []  # zero LLM calls, per the acceptance criteria
+
+    # The DB log stays complete even on the wrap-up path (4.3).
+    session = await _get_session(engine, "sess-1")
+    assert session is not None
+    assert session.token_budget_used == 10  # unchanged — no LLM call was made to add to it
+
+
+async def test_token_budget_used_matches_combined_loop_and_summarizer_usage(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion (Issue #12): token_budget_used matches
+    provider-reported usage, loop + summarizer combined.
+    """
+    from app.config import settings
+    from app.db import session as db_session
+
+    monkeypatch.setattr(settings, "window_high_tokens", 10)
+    monkeypatch.setattr(settings, "window_low_tokens", 5)
+    monkeypatch.setattr(
+        db_session, "_session_factory", async_sessionmaker(engine, expire_on_commit=False)
+    )
+
+    await _prime_past_turn_zero(client, "sess-1")
+    # 100 input (50 cached) + 20 output => (100-50) + 50*0.1 + 20 = 75 per turn.
+    main_usage = Usage(input_tokens=100, output_tokens=20, cached_input_tokens=50)
+    _use_fake_provider(
+        [LLMResponse(text=f"reply {i}", usage=main_usage, finish_reason="stop") for i in range(6)]
+    )
+    # 40 input (uncached) + 10 output => 50, one summarizer call.
+    summary_usage = Usage(input_tokens=40, output_tokens=10)
+    summary_json = (
+        '{"visitor_context": "chatting", "open_questions": [], '
+        '"commitments": [], "notes": []}'
+    )
+    fake_summarizer = FakeProvider(
+        responses=[LLMResponse(text=summary_json, usage=summary_usage, finish_reason="stop")]
+    )
+    app.dependency_overrides[get_summarizer_provider] = lambda: fake_summarizer
+
+    for i in range(6):
+        await client.post("/v1/chat", json={"session_id": "sess-1", "message": f"turn {i}"})
+
+    session = await _get_session(engine, "sess-1")
+    assert session is not None
+    assert session.token_budget_used == 6 * 75 + 50
+
+
 async def test_empty_session_id_returns_invalid_request_envelope(client: httpx.AsyncClient) -> None:
     _use_fake_provider([_response("unused")])
 

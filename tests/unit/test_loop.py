@@ -36,8 +36,12 @@ async def tool_context(engine: AsyncEngine) -> AsyncGenerator[ToolContext]:
         yield ToolContext(db=db, session_id="sess-1", summarizer_provider=summarizer)
 
 
-def _usage(input_tokens: int = 10, output_tokens: int = 5) -> Usage:
-    return Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+def _usage(input_tokens: int = 10, output_tokens: int = 5, cached_input_tokens: int = 0) -> Usage:
+    return Usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+    )
 
 
 def _messages() -> list[Message]:
@@ -175,6 +179,27 @@ async def test_token_usage_accumulates_across_iterations(tool_context: ToolConte
 
     assert result.input_tokens == 25
     assert result.output_tokens == 5
+
+
+async def test_cached_input_tokens_accumulate_across_iterations(tool_context: ToolContext) -> None:
+    tool_call_response = LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id="call_1", name="get_current_date", arguments={})],
+        usage=_usage(input_tokens=100, output_tokens=2, cached_input_tokens=80),
+        finish_reason="tool_calls",
+    )
+    final_response = LLMResponse(
+        text="done",
+        usage=_usage(input_tokens=150, output_tokens=3, cached_input_tokens=140),
+        finish_reason="stop",
+    )
+    provider = FakeProvider(responses=[tool_call_response, final_response])
+
+    result = await run_agent(
+        _messages(), provider, max_tokens=100, max_iterations=5, tool_context=tool_context
+    )
+
+    assert result.cached_input_tokens == 220
 
 
 async def test_infinite_tool_loop_hits_cap_and_returns_fallback(tool_context: ToolContext) -> None:

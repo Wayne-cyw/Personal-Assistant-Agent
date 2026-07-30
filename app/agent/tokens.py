@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 
+from app.agent.providers.base import Usage
+
 logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN_ESTIMATE = 4
@@ -51,3 +53,41 @@ def count_tokens(text: str) -> int:
     if encoding is None:
         return max(1, len(text) // _CHARS_PER_TOKEN_ESTIMATE) if text else 0
     return len(encoding.encode(text))  # type: ignore[attr-defined]
+
+
+# Engineering Guide 4.3: "cached input is billed at roughly 10% of the
+# standard rate, automatically." Used to weight sessions.token_budget_used
+# (Issue #12) by real cost rather than raw count, so a heavily-cached turn
+# doesn't eat into the budget as fast as an uncached one of the same size.
+CACHED_INPUT_DISCOUNT = 0.1
+
+
+def effective_tokens(*, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> int:
+    """A cost-weighted token count for budget accounting (Issue #12) —
+    distinct from count_tokens (a pre-call estimate for the eviction
+    trigger), this consumes real, provider-reported LLMResponse.usage
+    figures. `cached_input_tokens` is assumed to already be a subset of
+    `input_tokens` (matching Usage's field semantics in
+    app/agent/providers/base.py), so it's discounted rather than added on
+    top of the full input count.
+
+    Defensively clamped at 0: a malformed provider response with
+    cached_input_tokens > input_tokens (an SDK bug, not something this app
+    controls) would otherwise silently produce a negative uncached count,
+    *reducing* what a cost/safety guardrail charges rather than erroring.
+    """
+    uncached_input = max(0, input_tokens - cached_input_tokens)
+    weighted_cached = cached_input_tokens * CACHED_INPUT_DISCOUNT
+    return round(uncached_input + weighted_cached + output_tokens)
+
+
+def effective_tokens_from_usage(usage: Usage) -> int:
+    """Convenience wrapper over effective_tokens for the common case of
+    already holding a provider Usage object (every summarizer call site in
+    app/agent/memory.py) rather than loose ints.
+    """
+    return effective_tokens(
+        input_tokens=usage.input_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        output_tokens=usage.output_tokens,
+    )

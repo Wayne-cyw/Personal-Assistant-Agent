@@ -32,6 +32,11 @@ class AgentResult:
     text: str
     input_tokens: int = 0
     output_tokens: int = 0
+    # Subset of input_tokens billed at the provider's discounted cached
+    # rate (Engineering Guide 4.3) — accumulated for
+    # app/agent/tokens.py's effective_tokens (Issue #12's session budget
+    # accounting), not used anywhere within this module itself.
+    cached_input_tokens: int = 0
     hit_iteration_cap: bool = False
     tool_events: list[ToolEvent] = field(default_factory=list)
 
@@ -56,6 +61,7 @@ async def run_agent(
     working_messages = list(messages)
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cached_input_tokens = 0
     tool_events: list[ToolEvent] = []
 
     for _ in range(max_iterations):
@@ -64,12 +70,14 @@ async def run_agent(
         )
         total_input_tokens += response.usage.input_tokens
         total_output_tokens += response.usage.output_tokens
+        total_cached_input_tokens += response.usage.cached_input_tokens
 
         if not response.tool_calls:
             return AgentResult(
                 text=response.text,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cached_input_tokens=total_cached_input_tokens,
                 tool_events=tool_events,
             )
 
@@ -98,6 +106,7 @@ async def run_agent(
         text=FALLBACK_MESSAGE,
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
+        cached_input_tokens=total_cached_input_tokens,
         hit_iteration_cap=True,
         tool_events=tool_events,
     )
