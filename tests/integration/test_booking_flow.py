@@ -290,7 +290,7 @@ async def test_happy_path_through_confirmation_to_booking_created(
     )
 
     confirmed = await client.post(
-        "/v1/chat", json={"session_id": "sess-1", "message": "yes, confirm"}
+        "/v1/chat", json={"session_id": "sess-1", "message": "yes"}
     )
     assert confirmed.status_code == 200
     body = confirmed.json()
@@ -401,7 +401,7 @@ async def test_slot_taken_between_confirmation_request_and_yes_gracefully_re_pro
         ]
     )
     result = await client.post(
-        "/v1/chat", json={"session_id": "sess-1", "message": "yes, confirm"}
+        "/v1/chat", json={"session_id": "sess-1", "message": "yes"}
     )
 
     assert result.status_code == 200
