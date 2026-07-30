@@ -1,4 +1,5 @@
-from app.agent.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION
+from app.agent.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, render_booking_guidance
+from app.booking.state import Step
 
 
 def test_system_prompt_is_nonempty_string() -> None:
@@ -68,3 +69,33 @@ def test_system_prompt_is_a_static_module_constant() -> None:
     first = prompts_module.SYSTEM_PROMPT
     second = prompts_module.SYSTEM_PROMPT
     assert first is second
+
+
+# --- render_booking_guidance (Issue #20) -------------------------------------
+
+
+def test_booking_guidance_empty_for_idle() -> None:
+    assert render_booking_guidance(Step.IDLE) == ""
+
+
+def test_booking_guidance_intent_detected_mentions_timezone_and_the_tool() -> None:
+    guidance = render_booking_guidance(Step.INTENT_DETECTED)
+    assert "timezone" in guidance.lower()
+    assert "calendar_find_slots" in guidance
+
+
+def test_booking_guidance_slots_proposed_says_present_verbatim_never_invent() -> None:
+    guidance = render_booking_guidance(Step.SLOTS_PROPOSED)
+    assert "verbatim" in guidance
+    assert "never invent" in guidance.lower()
+
+
+def test_booking_guidance_empty_for_steps_not_yet_covered() -> None:
+    for step in (
+        Step.SLOT_SELECTED,
+        Step.CONTACT_INFO_COLLECTED,
+        Step.CONFIRMED,
+        Step.BOOKING_CREATED,
+        Step.ABANDONED,
+    ):
+        assert render_booking_guidance(step) == ""

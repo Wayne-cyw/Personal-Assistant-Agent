@@ -96,6 +96,18 @@ def test_render_pinned_profile_includes_name_linkedin_and_facts() -> None:
     assert "hiring for backend" in rendered
 
 
+def test_render_pinned_profile_includes_booking_timezone_when_given() -> None:
+    session = SessionRow(id="s1")
+    rendered = render_pinned_profile(session, booking_timezone="America/Toronto")
+    assert rendered == "Visitor profile:\nTimezone: America/Toronto"
+
+
+def test_render_pinned_profile_omits_timezone_line_when_none() -> None:
+    session = SessionRow(id="s1", visitor_name="Priya")
+    rendered = render_pinned_profile(session, booking_timezone=None)
+    assert "Timezone" not in rendered
+
+
 # --- assemble_messages: cache breakpoint placement --------------------------
 
 
@@ -120,6 +132,36 @@ def test_no_cache_breakpoint_message_when_nothing_pinned_or_summarized() -> None
 
     assert all(not m.cache_breakpoint for m in messages)
     assert len(messages) == 2  # just system + current message
+
+
+# --- assemble_messages: booking guidance (Issue #20) -------------------------
+
+
+def test_booking_guidance_omitted_when_empty() -> None:
+    from app.agent.memory import Memory
+
+    memory = Memory(pinned_profile_text="", summary_text="")
+    messages = assemble_messages(memory, "SYSTEM", "hello", booking_guidance="")
+
+    assert len(messages) == 2  # just system + current message, same as no booking in progress
+
+
+def test_booking_guidance_injected_right_before_the_current_message() -> None:
+    from app.agent.memory import Memory
+
+    memory = Memory(pinned_profile_text="Visitor profile:\nName: Priya", summary_text="")
+    messages = assemble_messages(
+        memory, "SYSTEM", "hello", booking_guidance="Booking guidance: ask for their timezone."
+    )
+
+    assert messages[-1].role == "user"
+    assert messages[-1].content == "hello"
+    guidance_message = messages[-2]
+    assert guidance_message.role == "system"
+    assert guidance_message.content == "Booking guidance: ask for their timezone."
+    # Not folded into the pinned+summary cache-breakpoint block — it changes
+    # every booking-step transition, unlike that rarely-changing block.
+    assert guidance_message.cache_breakpoint is False
 
 
 # --- _split_for_eviction ------------------------------------------------

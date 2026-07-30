@@ -10,10 +10,10 @@ current message (changes every turn). Provider prompt caching bills
 everything before the first changed byte at a steep discount (4.3), so an
 "harmless" reorder silently forfeits that discount on every turn.
 
-Booking-state contact/timezone fields belong in the pinned profile per 4.3,
-but the booking state machine doesn't exist until Issue #18 — the profile
-is assembled from visitor_name/visitor_linkedin/pinned_facts_json only until
-then; the seam (`render_pinned_profile`) is where #18 adds them.
+Booking-state contact/timezone fields belong in the pinned profile per 4.3.
+Issue #20 wires in the timezone (captured as part of calendar_find_slots);
+name/email are Issue #21's job, once the contact-collection step that
+actually populates them exists.
 
 Reconciliation trigger 1 (explicit correction via the input classifier's
 label set) is deferred: the classifier is Issue #25, which isn't a
@@ -88,13 +88,20 @@ class Memory:
     window_messages: list[MessageRow] = field(default_factory=list)
 
 
-def render_pinned_profile(session: SessionRow) -> str:
-    """Compact structured block (~50 tokens), never evicted (4.3)."""
+def render_pinned_profile(session: SessionRow, booking_timezone: str | None = None) -> str:
+    """Compact structured block (~50 tokens), never evicted (4.3).
+
+    `booking_timezone` (Issue #20) comes from `booking_states.timezone`, not
+    a `sessions` column — passed in by the caller (`load_memory`) rather
+    than queried here, since this function only reads `session`.
+    """
     lines: list[str] = []
     if session.visitor_name:
         lines.append(f"Name: {session.visitor_name}")
     if session.visitor_linkedin:
         lines.append(f"LinkedIn: {session.visitor_linkedin}")
+    if booking_timezone:
+        lines.append(f"Timezone: {booking_timezone}")
     for fact in session.pinned_facts_json or []:
         lines.append(f"- {fact}")
     if not lines:
@@ -124,10 +131,12 @@ def _render_summary(summary_json: dict[str, object] | None) -> str:
     return "Conversation summary:\n" + "\n".join(lines)
 
 
-async def load_memory(db: AsyncSession, session: SessionRow) -> Memory:
+async def load_memory(
+    db: AsyncSession, session: SessionRow, *, booking_timezone: str | None = None
+) -> Memory:
     window_rows = await messages_after(db, session.id, session.summary_through_message_id)
     return Memory(
-        pinned_profile_text=render_pinned_profile(session),
+        pinned_profile_text=render_pinned_profile(session, booking_timezone),
         summary_text=_render_summary(session.summary_json),
         window_messages=window_rows,
     )
@@ -146,7 +155,17 @@ def _render_window_message(message: MessageRow) -> LLMMessage:
     return LLMMessage(role=role, content=message.content)  # type: ignore[arg-type]
 
 
-def assemble_messages(memory: Memory, system_prompt: str, current_message: str) -> list[LLMMessage]:
+def assemble_messages(
+    memory: Memory, system_prompt: str, current_message: str, booking_guidance: str = ""
+) -> list[LLMMessage]:
+    """`booking_guidance` (Issue #20, Engineering Guide 4.2's `booking_context`
+    parameter) is intentionally placed after the rolling window and
+    immediately before the current message — it changes every time the
+    booking step advances, unlike the pinned+summary block above, so folding
+    it into that block's cached prefix would forfeit the cache discount on
+    every step transition. Empty ("" for idle, or no booking in progress)
+    adds nothing, so ordinary Q&A turns are unaffected.
+    """
     messages = [LLMMessage(role="system", content=system_prompt)]
 
     pinned_and_summary = "\n\n".join(
@@ -164,6 +183,8 @@ def assemble_messages(memory: Memory, system_prompt: str, current_message: str) 
         )
 
     messages.extend(_render_window_message(m) for m in memory.window_messages)
+    if booking_guidance:
+        messages.append(LLMMessage(role="system", content=booking_guidance))
     messages.append(LLMMessage(role="user", content=current_message))
     return messages
 

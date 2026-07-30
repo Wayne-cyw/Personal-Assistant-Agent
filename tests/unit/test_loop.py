@@ -15,6 +15,7 @@ from app.agent.providers.fake import FakeProvider
 from app.db.models import Base
 from app.db.session import get_or_create_session
 from app.tools.context import ToolContext
+from app.tools.fake_calendar import FakeCalendar
 
 
 @pytest.fixture
@@ -33,7 +34,12 @@ async def tool_context(engine: AsyncEngine) -> AsyncGenerator[ToolContext]:
     async with session_factory() as db:
         await get_or_create_session(db, "sess-1")
         summarizer = FakeProvider(responses=[])
-        yield ToolContext(db=db, session_id="sess-1", summarizer_provider=summarizer)
+        yield ToolContext(
+            db=db,
+            session_id="sess-1",
+            summarizer_provider=summarizer,
+            calendar_client=FakeCalendar(),
+        )
 
 
 def _usage(input_tokens: int = 10, output_tokens: int = 5, cached_input_tokens: int = 0) -> Usage:

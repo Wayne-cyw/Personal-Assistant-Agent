@@ -10,6 +10,8 @@ this string.
 
 from __future__ import annotations
 
+from app.booking.state import Step
+
 SYSTEM_PROMPT_VERSION = "v1"
 
 SYSTEM_PROMPT = """You are an AI assistant acting as a digital stand-in for the owner of this site. You are not the owner — you are a tool the owner built and deployed, and you say so plainly if asked.
@@ -85,3 +87,37 @@ Output *only* valid JSON, no other text, matching exactly this shape:
 - Never include booking state (proposed times, confirmed bookings, booking step) — that is tracked separately and injected elsewhere.
 - Keep the whole thing terse. Every field is optional except the two top-level arrays, which may be empty.
 """
+
+# Step-specific booking guidance (Engineering Guide 4.2/4.5, Issue #20) —
+# injected as its own context layer by app/agent/memory.py's
+# assemble_messages, separate from the static SYSTEM_PROMPT above (4.3: the
+# system prompt never changes per turn; this does, so it cannot be folded
+# into that cached prefix without forfeiting the cache on every booking-step
+# transition). Only idle (nothing to add — calendar_find_slots's own tool
+# description covers when to call it), intent_detected, and slots_proposed
+# are covered here (Issue #20's scope); slot_selected onward (contact
+# collection, confirmation, ...) is Issues #21/#22's job to extend this
+# table when they build that behavior.
+_BOOKING_GUIDANCE: dict[Step, str] = {
+    Step.INTENT_DETECTED: (
+        "Booking guidance: the visitor wants to book a call. If you don't already know their "
+        "timezone (an IANA name like 'America/Toronto'), ask for it before calling "
+        "calendar_find_slots — this session's API request may not have sent one yet. Once you "
+        "have enough to search (a rough date range is fine — 'next week', 'this Friday'), call "
+        "calendar_find_slots with your best interpretation of it."
+    ),
+    Step.SLOTS_PROPOSED: (
+        "Booking guidance: present the slots calendar_find_slots just returned to the visitor "
+        "verbatim, as a numbered list, using each slot's own label text exactly as given — "
+        "never invent, adjust, or restate a time yourself. If they pick one, acknowledge it. If "
+        "none work for them, call calendar_find_slots again with a different window."
+    ),
+}
+
+
+def render_booking_guidance(step: Step) -> str:
+    """Behavioral instructions for the currently active booking step, or
+    "" for a step with nothing step-specific to say (idle, and any step not
+    yet covered by `_BOOKING_GUIDANCE`).
+    """
+    return _BOOKING_GUIDANCE.get(step, "")

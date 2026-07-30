@@ -20,7 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from app.tools.calendar import CalendarClient
 
@@ -195,9 +195,19 @@ class CoarseWindow(BaseModel):
     prose).
     """
 
-    date_from: date
-    date_to: date
-    day_part: DayPart | None = None
+    date_from: date = Field(
+        description="Start of the date range to check, YYYY-MM-DD. Interpret relative phrases "
+        "like 'next week' yourself using the current date; pass a concrete date here."
+    )
+    date_to: date = Field(
+        description="End of the date range to check (inclusive), YYYY-MM-DD. For a single day, "
+        "the same value as date_from."
+    )
+    day_part: DayPart | None = Field(
+        default=None,
+        description="Restrict to morning, afternoon, or evening if the visitor said so; omit "
+        "otherwise.",
+    )
 
     @model_validator(mode="after")
     def _date_to_not_before_date_from(self) -> CoarseWindow:
