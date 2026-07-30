@@ -104,6 +104,12 @@ class Settings(BaseSettings):
     # slot for long.
     hold_minutes: int = Field(default=10, ge=1, alias="HOLD_MINUTES")
 
+    # Owner notification (Issue #22, app/notify.py). Optional: unset just
+    # means notifications no-op with a logged warning rather than crashing
+    # startup — a dev environment without a configured webhook shouldn't be
+    # blocked from booking end-to-end, only from the notification side effect.
+    owner_notify_webhook_url: str | None = Field(default=None, alias="OWNER_NOTIFY_WEBHOOK_URL")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by
