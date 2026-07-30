@@ -9,12 +9,13 @@ calendar) register here the same way in later issues (#15).
 from __future__ import annotations
 
 import logging
+import re
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from app.agent.providers.base import ToolCall, ToolDef
 from app.agent.visitor_info import extract_linkedin_url
@@ -27,6 +28,7 @@ from app.booking.slots import (
     widen_window,
 )
 from app.booking.state import (
+    BookingState,
     Event,
     EventKind,
     Step,
@@ -266,6 +268,98 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
     return {"slots": slot_dicts, "round": state.proposal_rounds}
 
 
+class ProvideContactInfoArgs(BaseModel):
+    name: str = Field(description="The visitor's full name, exactly as they gave it.")
+    email: str = Field(description="The visitor's email address, exactly as they gave it.")
+
+
+_EMAIL_MAX_LENGTH = 254  # RFC 5321's overall address length limit
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _validate_email(raw: str) -> str | None:
+    """Regex + length + no-injection-chars validation (Issue #21) — code-
+    validated, never trusted from the LLM's own judgment of what "looks
+    like an email." Returns the cleaned address, or None if it fails any
+    check. `str.isprintable()` rejects newlines/control characters (the
+    same header-injection-style concern email fields are classically
+    vulnerable to) before the shape check even runs.
+    """
+    cleaned = raw.strip()
+    if not cleaned or len(cleaned) > _EMAIL_MAX_LENGTH or not cleaned.isprintable():
+        return None
+    if not _EMAIL_RE.match(cleaned):
+        return None
+    return cleaned
+
+
+def _build_confirmation_summary(state: BookingState) -> dict[str, object]:
+    """{"slot", "timezone", "name", "email"} — Engineering Guide 4.8's
+    documented `booking_confirmation_request` data shape exactly.
+    """
+    return {
+        "slot": state.selected_slot_json,
+        "timezone": state.timezone_name,
+        "name": state.contact_name,
+        "email": state.contact_email,
+    }
+
+
+async def _provide_contact_info(args: BaseModel, context: ToolContext) -> dict[str, object]:
+    """Collects and code-validates name + email (Issue #21, 4.5's
+    contact_info_collected step) — the model never decides an email is
+    valid, only _validate_email does. On success, contact_info_collected
+    and confirmed both fire within this one call (4.5: "Valid contact info
+    -> contact_info_collected -> immediately assemble the confirmation
+    summary -> confirmed state") — the second hop is purely mechanical
+    once contact info is valid, so it doesn't need its own LLM round trip.
+    """
+    assert isinstance(args, ProvideContactInfoArgs)
+    state = await load_booking_state(context.db, context.session_id)
+
+    if state.step is not Step.SLOT_SELECTED:
+        # Defense in depth (4.2), same rationale as calendar_find_slots'
+        # own re-check: tool_defs_for_step already gates this per call, but
+        # a multi-tool-call turn could see state move on between calls.
+        return {"error": "not currently collecting contact info"}
+
+    cleaned_name = _sanitize_short_text(args.name, _NAME_MAX_LENGTH)
+    if not cleaned_name:
+        return {
+            "error": "name_invalid",
+            "message": "Ask the visitor for their name again — it came through empty.",
+        }
+
+    valid_email = _validate_email(args.email)
+    if valid_email is None:
+        return {
+            "error": "email_invalid",
+            "message": (
+                "That doesn't look like a valid email address. Ask the visitor to "
+                "double-check it and share it again."
+            ),
+        }
+
+    state = transition(
+        state,
+        Event(
+            kind=EventKind.CONTACT_COLLECTED, contact_name=cleaned_name, contact_email=valid_email
+        ),
+    )
+    state = transition(state, Event(kind=EventKind.CONFIRMED))
+    await save_booking_state(context.db, state)
+
+    # Feeds the pinned profile through its existing validated path (4.3:
+    # "Booking contact fields ... feed the profile through their existing
+    # validated paths"). Email has no dedicated `sessions` column (unlike
+    # name/LinkedIn) per 4.7's actual schema, so it's rendered from
+    # booking_states directly instead (app/agent/memory.py's
+    # render_pinned_profile), mirroring how Issue #20 surfaced timezone.
+    await set_visitor_info(context.db, context.session_id, name=cleaned_name)
+
+    return {"confirmation_summary": _build_confirmation_summary(state)}
+
+
 @dataclass
 class _RegisteredTool:
     definition: ToolDef
@@ -347,6 +441,23 @@ CALENDAR_FIND_SLOTS = _RegisteredTool(
     booking_gated=True,
 )
 
+PROVIDE_CONTACT_INFO = _RegisteredTool(
+    definition=ToolDef(
+        name="provide_contact_info",
+        description=(
+            "Submit the visitor's name and email address once they've picked a time, so the "
+            "booking can be locked in. Only call this after the visitor has actually given "
+            "you both a name and an email — don't call it with partial or guessed "
+            "information. If the email is rejected, ask the visitor to double-check it and "
+            "call this again with the corrected value."
+        ),
+        parameters=ProvideContactInfoArgs.model_json_schema(),
+    ),
+    args_model=ProvideContactInfoArgs,
+    handler=_provide_contact_info,
+    booking_gated=True,
+)
+
 _REGISTRY: dict[str, _RegisteredTool] = {
     tool.definition.name: tool
     for tool in (
@@ -354,6 +465,7 @@ _REGISTRY: dict[str, _RegisteredTool] = {
         SAVE_VISITOR_INFO,
         FLAG_SUMMARY_CONFLICT,
         CALENDAR_FIND_SLOTS,
+        PROVIDE_CONTACT_INFO,
     )
 }
 
