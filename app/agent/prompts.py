@@ -94,10 +94,10 @@ Output *only* valid JSON, no other text, matching exactly this shape:
 # system prompt never changes per turn; this does, so it cannot be folded
 # into that cached prefix without forfeiting the cache on every booking-step
 # transition). Only idle (nothing to add — calendar_find_slots's own tool
-# description covers when to call it), intent_detected, and slots_proposed
-# are covered here (Issue #20's scope); slot_selected onward (contact
-# collection, confirmation, ...) is Issues #21/#22's job to extend this
-# table when they build that behavior.
+# description covers when to call it), intent_detected, slots_proposed
+# (Issue #20), and slot_selected (Issue #21) are covered here;
+# contact_info_collected onward (confirmation) is Issue #22's job to extend
+# this table when it builds that behavior.
 _BOOKING_GUIDANCE: dict[Step, str] = {
     Step.INTENT_DETECTED: (
         "Booking guidance: the visitor wants to book a call. If you don't already know their "
@@ -111,6 +111,13 @@ _BOOKING_GUIDANCE: dict[Step, str] = {
         "verbatim, as a numbered list, using each slot's own label text exactly as given — "
         "never invent, adjust, or restate a time yourself. If they pick one, acknowledge it. If "
         "none work for them, call calendar_find_slots again with a different window."
+    ),
+    Step.SLOT_SELECTED: (
+        "Booking guidance: the visitor's chosen time is locked in for a few minutes while you "
+        "get their contact details. Ask for their full name and email address (both are "
+        "required), then call provide_contact_info with exactly what they gave you — never "
+        "guess or autofill either field. If the email is rejected, tell the visitor briefly "
+        "what's wrong and ask them to resend it, then call provide_contact_info again."
     ),
 }
 

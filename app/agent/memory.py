@@ -88,12 +88,21 @@ class Memory:
     window_messages: list[MessageRow] = field(default_factory=list)
 
 
-def render_pinned_profile(session: SessionRow, booking_timezone: str | None = None) -> str:
+def render_pinned_profile(
+    session: SessionRow,
+    booking_timezone: str | None = None,
+    booking_contact_email: str | None = None,
+) -> str:
     """Compact structured block (~50 tokens), never evicted (4.3).
 
-    `booking_timezone` (Issue #20) comes from `booking_states.timezone`, not
-    a `sessions` column — passed in by the caller (`load_memory`) rather
-    than queried here, since this function only reads `session`.
+    `booking_timezone`/`booking_contact_email` (Issues #20/#21) come from
+    `booking_states.timezone`/`booking_states.contact_email`, not `sessions`
+    columns — passed in by the caller (`load_memory`) rather than queried
+    here, since this function only reads `session`. Contact *name*, unlike
+    email, does have a dedicated `sessions.visitor_name` column (4.7), so it
+    feeds this block the same way it always has, via `session.visitor_name`
+    directly — provide_contact_info (app/tools/registry.py) writes it there
+    through set_visitor_info's existing validated path (4.3).
     """
     lines: list[str] = []
     if session.visitor_name:
@@ -102,6 +111,8 @@ def render_pinned_profile(session: SessionRow, booking_timezone: str | None = No
         lines.append(f"LinkedIn: {session.visitor_linkedin}")
     if booking_timezone:
         lines.append(f"Timezone: {booking_timezone}")
+    if booking_contact_email:
+        lines.append(f"Email: {booking_contact_email}")
     for fact in session.pinned_facts_json or []:
         lines.append(f"- {fact}")
     if not lines:
@@ -132,11 +143,15 @@ def _render_summary(summary_json: dict[str, object] | None) -> str:
 
 
 async def load_memory(
-    db: AsyncSession, session: SessionRow, *, booking_timezone: str | None = None
+    db: AsyncSession,
+    session: SessionRow,
+    *,
+    booking_timezone: str | None = None,
+    booking_contact_email: str | None = None,
 ) -> Memory:
     window_rows = await messages_after(db, session.id, session.summary_through_message_id)
     return Memory(
-        pinned_profile_text=render_pinned_profile(session, booking_timezone),
+        pinned_profile_text=render_pinned_profile(session, booking_timezone, booking_contact_email),
         summary_text=_render_summary(session.summary_json),
         window_messages=window_rows,
     )

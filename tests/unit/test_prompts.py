@@ -90,9 +90,15 @@ def test_booking_guidance_slots_proposed_says_present_verbatim_never_invent() ->
     assert "never invent" in guidance.lower()
 
 
+def test_booking_guidance_slot_selected_mentions_both_fields_and_the_tool() -> None:
+    guidance = render_booking_guidance(Step.SLOT_SELECTED)
+    assert "name" in guidance.lower()
+    assert "email" in guidance.lower()
+    assert "provide_contact_info" in guidance
+
+
 def test_booking_guidance_empty_for_steps_not_yet_covered() -> None:
     for step in (
-        Step.SLOT_SELECTED,
         Step.CONTACT_INFO_COLLECTED,
         Step.CONFIRMED,
         Step.BOOKING_CREATED,
