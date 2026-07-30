@@ -153,6 +153,25 @@ def test_slot_taken_at_recheck_returns_to_slots_proposed_excluding_burned_slot()
     assert result.proposal_rounds == 1  # fresh negotiation cycle, not the visitor's fault
 
 
+def test_confirmation_declined_returns_to_slots_proposed_excluding_declined_slot() -> None:
+    state = _state(
+        step=Step.CONFIRMED,
+        proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}, {"slot_id": "s3"}],
+        selected_slot_json={"slot_id": "s2"},
+        proposal_rounds=2,
+    )
+    result = transition(state, Event(kind=EventKind.CONFIRMATION_DECLINED))
+    assert result.step is Step.SLOTS_PROPOSED
+    assert result.proposed_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
+    assert result.selected_slot_json is None
+    assert result.proposal_rounds == 3  # unlike SLOT_TAKEN_AT_RECHECK, this counts as a round
+
+
+def test_confirmation_declined_outside_confirmed_is_illegal() -> None:
+    with pytest.raises(InvalidTransition):
+        transition(_state(step=Step.SLOT_SELECTED), Event(kind=EventKind.CONFIRMATION_DECLINED))
+
+
 @pytest.mark.parametrize(
     "step",
     [

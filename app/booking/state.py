@@ -54,7 +54,7 @@ class EventKind(StrEnum):
     """The transition() task list, in order: intent detected; tz captured;
     slots proposed; slot selected; re-propose; widen-window; email-
     fallback; contact collected; confirmed; created; slot-taken-at-
-    recheck; abandonment.
+    recheck; confirmation declined; abandonment.
     """
 
     INTENT_DETECTED = "intent_detected"
@@ -68,6 +68,12 @@ class EventKind(StrEnum):
     CONFIRMED = "confirmed"
     CREATED = "created"
     SLOT_TAKEN_AT_RECHECK = "slot_taken_at_recheck"
+    # Issue #22: the visitor said "no"/changed their mind at the
+    # confirmation step, distinct from SLOT_TAKEN_AT_RECHECK (an
+    # availability race, nobody's fault, doesn't consume the negotiation
+    # cap) — a deliberate decline *does* consume a round (task text: "'no'/
+    # change-of-mind -> back to slots_proposed (counts as a round)").
+    CONFIRMATION_DECLINED = "confirmation_declined"
     ABANDON = "abandon"
 
 
@@ -121,6 +127,29 @@ def _accumulate_excluded(state: BookingState) -> list[dict[str, object]]:
     re-offers it (see BookingState.excluded_slots_json's docstring).
     """
     return list(state.excluded_slots_json or []) + list(state.proposed_slots_json or [])
+
+
+def _back_to_slots_proposed_excluding_selected(
+    state: BookingState, *, proposal_rounds: int
+) -> BookingState:
+    """Shared body for SLOT_TAKEN_AT_RECHECK and CONFIRMATION_DECLINED
+    (Issue #22): both re-enter slots_proposed with whatever was already
+    offered, minus the one slot that just fell through — no fresh
+    calendar_find_slots call is forced immediately; the remaining
+    already-offered options (if any) are presented first, and the model can
+    still call calendar_find_slots itself (offered again at slots_proposed)
+    if none are left. `proposal_rounds` is the only thing that differs
+    between the two callers, so it's the caller's job to compute it.
+    """
+    burned_id = (state.selected_slot_json or {}).get("slot_id")
+    remaining = [s for s in (state.proposed_slots_json or []) if s.get("slot_id") != burned_id]
+    return replace(
+        state,
+        step=Step.SLOTS_PROPOSED,
+        proposed_slots_json=remaining,
+        selected_slot_json=None,
+        proposal_rounds=proposal_rounds,
+    )
 
 
 class InvalidTransition(Exception):
@@ -250,16 +279,18 @@ def transition(state: BookingState, event: Event) -> BookingState:
     if kind is EventKind.SLOT_TAKEN_AT_RECHECK:
         if step is not Step.CONFIRMED:
             raise InvalidTransition(step, kind)
-        burned_id = (state.selected_slot_json or {}).get("slot_id")
-        remaining = [s for s in (state.proposed_slots_json or []) if s.get("slot_id") != burned_id]
         # Fresh negotiation cycle: the race-condition failure isn't the
         # visitor's fault, so it doesn't consume any of their 2-round cap.
-        return replace(
-            state,
-            step=Step.SLOTS_PROPOSED,
-            proposed_slots_json=remaining,
-            selected_slot_json=None,
-            proposal_rounds=1,
+        return _back_to_slots_proposed_excluding_selected(state, proposal_rounds=1)
+
+    if kind is EventKind.CONFIRMATION_DECLINED:
+        if step is not Step.CONFIRMED:
+            raise InvalidTransition(step, kind)
+        # Unlike SLOT_TAKEN_AT_RECHECK, this *is* the visitor's own choice —
+        # it consumes a round of the negotiation cap (task text: "counts as
+        # a round"), same as a RE_PROPOSE would.
+        return _back_to_slots_proposed_excluding_selected(
+            state, proposal_rounds=state.proposal_rounds + 1
         )
 
     # Exhaustiveness guard, unreachable while every EventKind is handled above.
