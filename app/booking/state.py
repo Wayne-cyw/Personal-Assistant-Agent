@@ -9,6 +9,17 @@ the DB directly — this module never imports anything DB- or async-related.
 State transitions happen only inside execute_tool/handler code (4.5) —
 never inferred from the LLM's prose. This module is the single place that
 logic lives.
+
+4.5's ASCII diagram has a second column-17 vertical near "no slot fits
+after cap" / "slot taken at re-check" that could, read one way, imply a
+13th transition back to intent_detected once the negotiation cap is fully
+exhausted. Resolved in favor of the step-by-step table's prose, which is
+unambiguous and names only the 12 EventKinds implemented below ("re-enters
+slots_proposed with the burned slot excluded" for the race case; "≤2
+proposal rounds, then widen the window once, then offer email fallback"
+for the negotiation cap, with no mention of returning to intent_detected)
+— read as ASCII-art label placement reusing a free column for two
+unrelated annotations, not a real missing edge.
 """
 
 from __future__ import annotations
@@ -114,9 +125,12 @@ def transition(state: BookingState, event: Event) -> BookingState:
     kind = event.kind
 
     if kind is EventKind.ABANDON:
-        # 4.5: "(any step can -> abandoned)" — except the two terminals,
-        # which have nothing left to abandon.
-        if step in (Step.BOOKING_CREATED, Step.ABANDONED):
+        # 4.5: "(any step can -> abandoned)" — read as "any step *after*
+        # idle": the diagram's annotation arrow lands on intent_detected,
+        # not on idle, and semantically there is no in-progress booking to
+        # abandon from idle (nothing has started yet). Also excludes the
+        # two terminals, which have nothing left to abandon either.
+        if step in (Step.IDLE, Step.BOOKING_CREATED, Step.ABANDONED):
             raise InvalidTransition(step, kind)
         return replace(state, step=Step.ABANDONED)
 

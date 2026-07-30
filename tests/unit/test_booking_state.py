@@ -119,7 +119,6 @@ def test_slot_taken_at_recheck_returns_to_slots_proposed_excluding_burned_slot()
 @pytest.mark.parametrize(
     "step",
     [
-        Step.IDLE,
         Step.INTENT_DETECTED,
         Step.SLOTS_PROPOSED,
         Step.SLOT_SELECTED,
@@ -127,7 +126,7 @@ def test_slot_taken_at_recheck_returns_to_slots_proposed_excluding_burned_slot()
         Step.CONFIRMED,
     ],
 )
-def test_abandon_from_any_non_terminal_step(step: Step) -> None:
+def test_abandon_from_any_in_progress_step(step: Step) -> None:
     result = transition(_state(step=step), Event(kind=EventKind.ABANDON))
     assert result.step is Step.ABANDONED
 
@@ -229,8 +228,12 @@ def test_slot_taken_at_recheck_outside_confirmed_is_illegal() -> None:
         transition(_state(step=Step.SLOT_SELECTED), Event(kind=EventKind.SLOT_TAKEN_AT_RECHECK))
 
 
-@pytest.mark.parametrize("step", [Step.BOOKING_CREATED, Step.ABANDONED])
-def test_cannot_abandon_a_terminal_step(step: Step) -> None:
+@pytest.mark.parametrize("step", [Step.IDLE, Step.BOOKING_CREATED, Step.ABANDONED])
+def test_cannot_abandon_idle_or_a_terminal_step(step: Step) -> None:
+    """idle has no in-progress booking to abandon (nothing has started
+    yet); booking_created/abandoned are terminal and have nothing left to
+    abandon either.
+    """
     with pytest.raises(InvalidTransition):
         transition(_state(step=step), Event(kind=EventKind.ABANDON))
 

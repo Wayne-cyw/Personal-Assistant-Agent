@@ -2,6 +2,7 @@ import asyncio
 import subprocess
 import time
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -355,6 +356,7 @@ async def test_save_then_load_booking_state_round_trips_every_field(
         timezone_name="America/New_York",
         proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}],
         selected_slot_json=None,
+        hold_expires_at=datetime(2026, 8, 3, 12, 0, tzinfo=UTC),
         proposal_rounds=2,
         contact_name=None,
         contact_email=None,
@@ -368,6 +370,31 @@ async def test_save_then_load_booking_state_round_trips_every_field(
         loaded = await load_booking_state(db, "sess-1")
 
     assert loaded == state
+
+
+async def test_hold_expires_at_stays_timezone_aware_across_the_sqlite_round_trip(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression test: SQLite has no native timezone-aware storage — a
+    tz-aware datetime written via save_booking_state came back naive on a
+    plain reload before this was fixed, which would raise TypeError the
+    moment a future soft-hold expiry check (app/booking/holds.py, Issue
+    #21) compared it against datetime.now(UTC).
+    """
+    state = BookingState(
+        session_id="sess-1",
+        hold_expires_at=datetime(2026, 8, 3, 12, 0, tzinfo=UTC),
+    )
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await save_booking_state(db, state)
+
+    async with session_factory() as db:
+        loaded = await load_booking_state(db, "sess-1")
+
+    assert loaded.hold_expires_at is not None
+    assert loaded.hold_expires_at.tzinfo is not None
+    assert datetime.now(UTC) < loaded.hold_expires_at  # must not raise TypeError
 
 
 async def test_save_booking_state_upserts_an_existing_row(

@@ -356,11 +356,30 @@ async def load_booking_state(db: AsyncSession, session_id: str) -> BookingState:
         timezone_name=row.timezone_name,
         proposed_slots_json=cast(list[dict[str, object]] | None, row.proposed_slots_json),
         selected_slot_json=row.selected_slot_json,
-        hold_expires_at=row.hold_expires_at,
+        hold_expires_at=_reattach_utc(row.hold_expires_at),
         proposal_rounds=row.proposal_rounds,
         contact_name=row.contact_name,
         contact_email=row.contact_email,
     )
+
+
+def _reattach_utc(value: datetime | None) -> datetime | None:
+    """SQLite has no native timezone-aware storage — a tz-aware datetime
+    written via save_booking_state (the ORM's before_insert/before_update
+    guard in app/db/models.py rejects writing a naive one, so it's always
+    UTC going in) comes back naive on a plain reload, on this dialect only
+    (4.7 rule 2's documented SQLite quirk). Silently reattaching UTC here
+    matters more for hold_expires_at than most datetime fields in this
+    codebase: it's the one field a future soft-hold expiry check
+    (app/booking/holds.py, Issue #21) will compare against
+    datetime.now(UTC) — comparing aware to naive raises TypeError, and
+    that comparison would work on Postgres (TIMESTAMPTZ preserves tzinfo)
+    while silently breaking in SQLite dev/test, exactly the dialect-parity
+    trap 4.7 warns about.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 async def save_booking_state(db: AsyncSession, state: BookingState) -> None:
