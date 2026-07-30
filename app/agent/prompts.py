@@ -93,11 +93,11 @@ Output *only* valid JSON, no other text, matching exactly this shape:
 # assemble_messages, separate from the static SYSTEM_PROMPT above (4.3: the
 # system prompt never changes per turn; this does, so it cannot be folded
 # into that cached prefix without forfeiting the cache on every booking-step
-# transition). Only idle (nothing to add — calendar_find_slots's own tool
-# description covers when to call it), intent_detected, slots_proposed
-# (Issue #20), and slot_selected (Issue #21) are covered here;
-# contact_info_collected onward (confirmation) is Issue #22's job to extend
-# this table when it builds that behavior.
+# transition). Every step but idle is covered here (idle has nothing to add
+# — calendar_find_slots's own tool description covers when to call it);
+# contact_info_collected is deliberately absent — provide_contact_info's
+# handler fires contact_collected then confirmed within the same call, so
+# no turn ever actually observes that step.
 _BOOKING_GUIDANCE: dict[Step, str] = {
     Step.INTENT_DETECTED: (
         "Booking guidance: the visitor wants to book a call. If you don't already know their "
@@ -118,6 +118,13 @@ _BOOKING_GUIDANCE: dict[Step, str] = {
         "required), then call provide_contact_info with exactly what they gave you — never "
         "guess or autofill either field. If the email is rejected, tell the visitor briefly "
         "what's wrong and ask them to resend it, then call provide_contact_info again."
+    ),
+    Step.CONFIRMED: (
+        "Booking guidance: present the confirmation summary you were just given (date, time, "
+        "timezone, name, email) exactly as given, and ask the visitor to confirm. Your only "
+        "job right now is to present it and wait — never call calendar_create_booking "
+        "yourself; it only fires on a clear, unambiguous yes from the visitor. If they ask a "
+        "question or seem unsure, just answer and keep waiting."
     ),
 }
 

@@ -97,10 +97,19 @@ def test_booking_guidance_slot_selected_mentions_both_fields_and_the_tool() -> N
     assert "provide_contact_info" in guidance
 
 
+def test_booking_guidance_confirmed_says_present_and_wait_never_call_yourself() -> None:
+    guidance = render_booking_guidance(Step.CONFIRMED)
+    assert "confirm" in guidance.lower()
+    assert "calendar_create_booking" in guidance
+    assert "never call calendar_create_booking" in guidance.lower()
+
+
 def test_booking_guidance_empty_for_steps_not_yet_covered() -> None:
+    # contact_info_collected is never actually observed by any turn —
+    # provide_contact_info's handler fires contact_collected then confirmed
+    # within the same call — but it's still correctly absent from the table.
     for step in (
         Step.CONTACT_INFO_COLLECTED,
-        Step.CONFIRMED,
         Step.BOOKING_CREATED,
         Step.ABANDONED,
     ):
