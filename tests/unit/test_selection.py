@@ -61,19 +61,33 @@ def test_matches_ordinal_word() -> None:
     assert match_selection("the second one works", SLOTS) == SLOTS[1]
 
 
-def test_earliest_mentioned_ordinal_wins_not_dict_declaration_order() -> None:
+def test_negated_ordinal_excluded_leaving_the_real_choice() -> None:
     """Regression: an earlier version resolved ordinal words by iterating a
-    fixed {"first": 1, "second": 2, ...} dict and returning on the first
-    key found *in the dict*, not the first one mentioned in the text — so
-    "third one, not the second" incorrectly returned index 2 ("second"),
-    since "second" happens to be checked before "third" in the dict
-    regardless of which one actually appears first in the message.
+    fixed {"first": 1, "second": 2, ...} dict and returning on the first key
+    found *in the dict*, not the intended one — so "third one, not the
+    second" incorrectly returned index 2 ("second"), since "second" happens
+    to be checked before "third" in the dict regardless of the message's
+    actual meaning. A later "leftmost mention wins" fix got *this* case
+    right by coincidence of word order, but broke the mirror-image phrasing
+    (see test_negated_leading_reference_excluded_even_when_mentioned_first
+    below) — negation-adjacent exclusion handles both directions.
     """
     assert match_selection("third one, not the second", SLOTS) == SLOTS[2]
 
 
-def test_leftmost_digit_or_ordinal_wins_when_both_present() -> None:
-    assert match_selection("not the first, I meant 3", SLOTS) == SLOTS[0]
+def test_negated_leading_reference_excluded_even_when_mentioned_first() -> None:
+    """Regression: a message can lead with the rejected option and correct
+    afterward ("not X, I meant Y") just as easily as leading with the
+    intended one ("Y, not X") — a purely positional (leftmost-wins) rule
+    only gets one of the two directions right. "first" is immediately
+    preceded by "not the", so it's excluded as a candidate regardless of
+    appearing before "3" in the text.
+    """
+    assert match_selection("not the first, I meant 3", SLOTS) == SLOTS[2]
+
+
+def test_only_negated_references_present_does_not_match() -> None:
+    assert match_selection("not the first, not the second either", SLOTS) is None
 
 
 def test_matches_exact_slot_id() -> None:

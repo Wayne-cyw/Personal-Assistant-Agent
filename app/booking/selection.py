@@ -16,17 +16,26 @@ import re
 
 _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
 # A single combined pattern (not "try digits, then fall back to ordinal
-# words") so the leftmost mention wins regardless of which form it takes —
-# e.g. "third one, not the second" must resolve to "third" (it appears
-# first), not "second" (an earlier bug here iterated _ORDINAL_WORDS in
-# fixed dict order, which happened to check "second" before "third"
-# regardless of which one actually appeared first in the text). A bare 1-5
-# digit excludes a longer number (so "slot 12" or a year like "2026" doesn't
-# false-match) and the hour of a clock time (so "2:00" doesn't get read as
-# index 2) via negative lookaround on both sides.
+# words") — every digit/ordinal mention in the message is found and
+# evaluated (see _extract_index), not just the first one, so which form
+# comes first no longer silently decides the outcome the way a fixed
+# dict-iteration order or an unconditional "digits always win" rule used
+# to. A bare 1-5 digit excludes a longer number (so "slot 12" or a year
+# like "2026" doesn't false-match) and the hour of a clock time (so "2:00"
+# doesn't get read as index 2) via negative lookaround on both sides.
 _INDEX_RE = re.compile(
     r"(?<!\d)(?P<digit>[1-5])(?![\d:])|\b(?P<ordinal>first|second|third|fourth|fifth)\b"
 )
+# A mention immediately preceded by "not" (optionally "not the") is being
+# rejected, not selected — "not the first, I meant 3" and "third one, not
+# the second" both have exactly one *non*-negated mention once this is
+# applied, regardless of which one is textually first. Pure left-to-right
+# position (an earlier version of this fix) got the second example right
+# but silently broke the first, since natural corrections go both
+# directions ("X, not Y" and "not X, I meant Y"); this is not full
+# negation-scope parsing (double negatives, "not not the first" etc. aren't
+# handled) — just the common single-correction case.
+_NEGATION_BEFORE_RE = re.compile(r"\bnot\s+(?:the\s+)?$")
 # Labels render weekdays via strftime("%a") — "Mon", "Tue", "Wed", etc.
 # (app/booking/slots.py's _format_label) — so matching has to normalize a
 # visitor's full-name-or-abbreviation mention ("Wednesday", "Wed", "wed") to
@@ -96,12 +105,21 @@ def match_selection(
 
 
 def _extract_index(text: str) -> int | None:
-    match = _INDEX_RE.search(text)
-    if match is None:
-        return None
-    if match.group("digit"):
-        return int(match.group("digit"))
-    return _ORDINAL_WORDS[match.group("ordinal")]
+    """Every digit/ordinal mention in `text` is a candidate unless it's
+    immediately negated (see _NEGATION_BEFORE_RE) — resolved only if
+    exactly one non-negated candidate remains; zero or more than one is
+    ambiguous, same as any other unresolved reference (the caller clarifies).
+    """
+    candidates = []
+    for match in _INDEX_RE.finditer(text):
+        if _NEGATION_BEFORE_RE.search(text[: match.start()]):
+            continue
+        digit = match.group("digit")
+        value = int(digit) if digit else _ORDINAL_WORDS[match.group("ordinal")]
+        candidates.append(value)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
 
 
 def _label_matches(text: str, label: str) -> bool:

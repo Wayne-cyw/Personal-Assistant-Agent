@@ -318,10 +318,12 @@ CALENDAR_FIND_SLOTS = _RegisteredTool(
     definition=ToolDef(
         name="calendar_find_slots",
         description=(
-            "Search the owner's calendar for available meeting times in a date range. Calling "
-            "this is itself how you signal that the visitor wants to book a call — call it as "
-            "soon as you're ready to search, even in a session where nothing else has "
-            "happened yet. Needs the visitor's timezone first: if you don't have one, ask for "
+            "Search the owner's calendar for available meeting times in a date range. Only "
+            "call this once the visitor has clearly asked to schedule or book a call with the "
+            "owner — never speculatively, and never in response to an off-topic or unrelated "
+            "request, even one that mentions calendars or scheduling in passing. Calling this "
+            "is itself how the system records that booking intent was detected, so restraint "
+            "here matters. Needs the visitor's timezone first: if you don't have one, ask for "
             "it before calling this (a call made without a known timezone will just tell you "
             "to go get one instead of returning times). Returns up to 5 structured slots to "
             "present to the visitor."

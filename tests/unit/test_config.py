@@ -58,6 +58,7 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.chat_max_output_tokens == 500
     assert settings.session_token_budget == 50_000
     assert settings.google_calendar_id == "primary"
+    assert settings.hold_minutes == 10
 
 
 def test_allowed_origins_parses_comma_separated_string() -> None:
@@ -122,6 +123,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "CHAT_MAX_OUTPUT_TOKENS",
         "SESSION_TOKEN_BUDGET",
         "GOOGLE_CALENDAR_ID",
+        "HOLD_MINUTES",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -141,6 +143,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.web_concurrency is None
     assert settings.chat_max_output_tokens == 500
     assert settings.session_token_budget == 50_000
+    assert settings.hold_minutes == 10
 
 
 def test_web_concurrency_parses_numeric_env_var() -> None:
@@ -174,6 +177,16 @@ def test_chat_max_output_tokens_and_session_token_budget_zero_or_negative_reject
         _settings(OPENAI_API_KEY="key", CHAT_MAX_OUTPUT_TOKENS="0")
     with pytest.raises(ValidationError):
         _settings(OPENAI_API_KEY="key", SESSION_TOKEN_BUDGET="0")
+
+
+def test_hold_minutes_overridable_and_zero_or_negative_rejected() -> None:
+    settings = _settings(OPENAI_API_KEY="key", HOLD_MINUTES="15")
+    assert settings.hold_minutes == 15
+
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", HOLD_MINUTES="0")
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", HOLD_MINUTES="-1")
 
 
 def test_max_tokens_per_turn_too_low_for_summarizer_rejected() -> None:
