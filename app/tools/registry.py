@@ -1,9 +1,9 @@
 """Tool definitions, argument validation, and execute_tool dispatch
 (Engineering Guide 4.2, Issue #10; save_visitor_info/flag_summary_conflict
-added in Issue #11).
+added in Issue #11; calendar_find_slots added in Issue #20).
 
 `get_current_date` is a trivial proof tool — real tools (RAG search,
-calendar) register here the same way in later issues (#15, #17).
+calendar) register here the same way in later issues (#15).
 """
 
 from __future__ import annotations
@@ -18,8 +18,24 @@ from pydantic import BaseModel, ValidationError
 
 from app.agent.providers.base import ToolCall, ToolDef
 from app.agent.visitor_info import extract_linkedin_url
+from app.booking.slots import (
+    AvailabilityPolicyError,
+    CoarseWindow,
+    generate_slots,
+    get_availability_policy,
+    resolve_window,
+    widen_window,
+)
+from app.booking.state import (
+    Event,
+    EventKind,
+    Step,
+    allowed_tools_for,
+    next_proposal_event,
+    transition,
+)
 from app.config import settings
-from app.db.session import add_pinned_fact, set_visitor_info
+from app.db.session import add_pinned_fact, load_booking_state, save_booking_state, set_visitor_info
 from app.safety.pii import redact
 from app.tools.context import ToolContext
 
@@ -116,11 +132,114 @@ async def _flag_summary_conflict(args: BaseModel, context: ToolContext) -> dict[
     return {"acknowledged": True}
 
 
+async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[str, object]:
+    """Detects booking intent, ensures the timezone is known, and proposes
+    slots — all three of 4.5's intent_detected/slots_proposed row behaviors,
+    since there is no classifier yet (Issue #25) and state transitions only
+    ever happen inside execute_tool/handler code, never inferred from the
+    LLM's prose (4.5). This call itself is what signals "the visitor wants
+    to book" (see app/booking/state.py's _ALLOWED_TOOLS comment on why idle
+    is gated to this tool).
+    """
+    assert isinstance(args, CoarseWindow)
+    state = await load_booking_state(context.db, context.session_id)
+
+    if state.step is Step.IDLE:
+        state = transition(state, Event(kind=EventKind.INTENT_DETECTED))
+
+    if state.step not in (Step.INTENT_DETECTED, Step.SLOTS_PROPOSED):
+        # Defense in depth (4.2): tool_defs_for_step already gates this per
+        # LLM call, but a turn with several tool calls could see state move
+        # past these steps between calls (e.g. an earlier call in the same
+        # turn already hit the negotiation cap's email fallback).
+        await save_booking_state(context.db, state)
+        return {"error": "booking is not currently accepting a new time proposal"}
+
+    if state.timezone_name is None:
+        if context.caller_timezone:
+            state = transition(
+                state, Event(kind=EventKind.TIMEZONE_CAPTURED, timezone=context.caller_timezone)
+            )
+        else:
+            await save_booking_state(context.db, state)
+            return {
+                "error": "timezone_required",
+                "message": (
+                    "Ask the visitor for their IANA timezone (e.g. 'America/Toronto') before "
+                    "proposing times — none has been provided yet."
+                ),
+            }
+    assert state.timezone_name is not None
+    # Captured into a local: BookingState isn't frozen, so mypy discards the
+    # assert's narrowing of state.timezone_name across the function calls
+    # between here and generate_slots below.
+    timezone_name: str = state.timezone_name
+
+    try:
+        policy = get_availability_policy()
+    except AvailabilityPolicyError:
+        logger.error("calendar_find_slots called but availability policy is not configured")
+        await save_booking_state(context.db, state)
+        return {
+            "error": (
+                "Availability isn't configured yet — offer to have the owner follow up by "
+                "email instead."
+            )
+        }
+
+    event_kind = next_proposal_event(state)
+
+    if event_kind is EventKind.EMAIL_FALLBACK:
+        state = transition(state, Event(kind=EventKind.EMAIL_FALLBACK))
+        await save_booking_state(context.db, state)
+        return {
+            "fallback": True,
+            "message": (
+                "No slot has worked even after widening the search window — tell the visitor "
+                f"to email {settings.owner_contact_email} directly to find a time."
+            ),
+        }
+
+    resolved = resolve_window(args, policy)
+    if event_kind is EventKind.WIDEN_WINDOW:
+        resolved = widen_window(resolved)
+
+    # Re-proposing or widening excludes what was already offered and
+    # rejected, so the visitor never sees the exact same list twice.
+    exclude: list[tuple[datetime, datetime]] | None = None
+    if event_kind in (EventKind.RE_PROPOSE, EventKind.WIDEN_WINDOW):
+        exclude = [
+            (
+                datetime.fromisoformat(str(s["start_iso"])),
+                datetime.fromisoformat(str(s["end_iso"])),
+            )
+            for s in (state.proposed_slots_json or [])
+        ]
+
+    slots = await generate_slots(
+        context.calendar_client,
+        resolved,
+        policy,
+        timezone_name,
+        now=datetime.now(UTC),
+        exclude=exclude,
+    )
+    slot_dicts = [slot.model_dump() for slot in slots]
+    state = transition(state, Event(kind=event_kind, slots=slot_dicts))
+    await save_booking_state(context.db, state)
+    return {"slots": slot_dicts, "round": state.proposal_rounds}
+
+
 @dataclass
 class _RegisteredTool:
     definition: ToolDef
     args_model: type[BaseModel]
     handler: Callable[[BaseModel, ToolContext], Awaitable[dict[str, object]]]
+    # True for a tool whose availability is gated by the booking state
+    # machine (app/booking/state.py's allowed_tools_for) rather than always
+    # offered — used by tool_defs_for_step to decide which of the two lists
+    # a tool belongs in (Issue #20).
+    booking_gated: bool = False
     # False for tools whose outcome is either already surfaced elsewhere in
     # context (save_visitor_info -> the pinned profile) or is a pure
     # meta/side-effect with nothing visitor-facing worth a token in later
@@ -171,12 +290,52 @@ FLAG_SUMMARY_CONFLICT = _RegisteredTool(
     persist_receipt=False,
 )
 
+CALENDAR_FIND_SLOTS = _RegisteredTool(
+    definition=ToolDef(
+        name="calendar_find_slots",
+        description=(
+            "Search the owner's calendar for available meeting times in a date range. Calling "
+            "this is itself how you signal that the visitor wants to book a call — call it as "
+            "soon as you're ready to search, even in a session where nothing else has "
+            "happened yet. Needs the visitor's timezone first: if you don't have one, ask for "
+            "it before calling this (a call made without a known timezone will just tell you "
+            "to go get one instead of returning times). Returns up to 5 structured slots to "
+            "present to the visitor."
+        ),
+        parameters=CoarseWindow.model_json_schema(),
+    ),
+    args_model=CoarseWindow,
+    handler=_calendar_find_slots,
+    booking_gated=True,
+)
+
 _REGISTRY: dict[str, _RegisteredTool] = {
     tool.definition.name: tool
-    for tool in (GET_CURRENT_DATE, SAVE_VISITOR_INFO, FLAG_SUMMARY_CONFLICT)
+    for tool in (
+        GET_CURRENT_DATE,
+        SAVE_VISITOR_INFO,
+        FLAG_SUMMARY_CONFLICT,
+        CALENDAR_FIND_SLOTS,
+    )
 }
 
 TOOL_DEFS: list[ToolDef] = [tool.definition for tool in _REGISTRY.values()]
+
+
+def tool_defs_for_step(step: Step) -> list[ToolDef]:
+    """The tools actually offered to the LLM this call (Issue #20, 4.2's
+    "tool gating by state" safety property): every non-booking-gated tool,
+    plus whichever booking-gated tools allowed_tools_for(step) currently
+    permits. app/agent/loop.py recomputes this before every provider call,
+    not just once per turn, so a state transition made by an earlier tool
+    call in the same turn is reflected immediately for the next one.
+    """
+    allowed_booking_names = set(allowed_tools_for(step))
+    return [
+        tool.definition
+        for tool in _REGISTRY.values()
+        if not tool.booking_gated or tool.definition.name in allowed_booking_names
+    ]
 
 
 async def execute_tool(call: ToolCall, context: ToolContext) -> dict[str, object]:
