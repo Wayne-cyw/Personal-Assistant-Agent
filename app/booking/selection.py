@@ -86,7 +86,7 @@ _REJECTION_CUE_RE = re.compile(
     r"|\bno[- ]good\b"
     r"|\bno[- ]go\b"
     r"|\brul(?:e|ing)\s+out\b"
-    r"|\bis\s+a\s+no\b"
+    r"|\bis\s+a\s+no\b(?!-)"  # excludes "is a no-brainer" — \b matches before a hyphen too
 )
 
 

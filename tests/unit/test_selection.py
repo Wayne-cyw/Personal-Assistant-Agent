@@ -126,6 +126,35 @@ def test_rejection_phrase_overrides_an_incidental_number() -> None:
     assert match_selection("2 doesn't work, got anything else?", SLOTS) is None
 
 
+def test_no_brainer_idiom_is_not_mistaken_for_a_rejection() -> None:
+    """Regression: the "is a no" cue (for "second one is a no for me") must
+    not fire on the unrelated affirmative idiom "no-brainer" — \\b matches
+    right before the hyphen too, so a naive \\bis\\s+a\\s+no\\b would.
+    """
+    assert match_selection("this is a no-brainer, book the second", SLOTS) == SLOTS[1]
+    assert match_selection("the second is a no-brainer for me", SLOTS) == SLOTS[1]
+
+
+def test_rejection_cue_overrides_a_weekday_reference() -> None:
+    """The cue-word guard is checked before label-based (weekday/time)
+    matching, not just before number/ordinal matching — a rejected weekday
+    reference must not resolve via the label-matching path either.
+    """
+    assert match_selection("Tuesday doesn't work for me, how about Wednesday", SLOTS) is None
+
+
+def test_rejection_cue_overrides_an_exact_slot_id_reference() -> None:
+    """The cue-word guard runs before the slot_id exact-match check too —
+    an unusual combination in practice (slot_ids are normally passed by a
+    UI, not typed by a visitor alongside rejection language), but the
+    guard's placement as the very first check in match_selection means it
+    applies uniformly regardless of which resolution path would otherwise
+    have matched.
+    """
+    slot_id = "22222222-2222-2222-2222-222222222222"
+    assert match_selection(f"not {slot_id}", SLOTS) is None
+
+
 def test_none_of_those_work_phrase_does_not_match() -> None:
     assert match_selection("none of those work for me", SLOTS) is None
 
