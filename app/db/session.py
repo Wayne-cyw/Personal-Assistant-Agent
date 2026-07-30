@@ -23,8 +23,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.booking.state import BookingState
+from app.booking.state import Step as BookingStep
 from app.config import settings
 from app.db.models import Base, Message, SessionRow
+from app.db.models import BookingState as BookingStateRow
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -334,4 +337,47 @@ async def overwrite_summary_content(
     if row is None:
         raise ValueError(f"overwrite_summary_content called for unknown session_id={session_id!r}")
     row.summary_json = summary_json
+    await db.commit()
+
+
+async def load_booking_state(db: AsyncSession, session_id: str) -> BookingState:
+    """Load the booking state machine's state for `session_id` (Issue
+    #18). No row yet (the common case — most sessions never book) returns
+    a fresh, unpersisted default (step=idle) rather than raising; the row
+    only starts existing once save_booking_state is first called for this
+    session.
+    """
+    row = await db.get(BookingStateRow, session_id)
+    if row is None:
+        return BookingState(session_id=session_id)
+    return BookingState(
+        session_id=row.session_id,
+        step=BookingStep(row.step),
+        timezone_name=row.timezone_name,
+        proposed_slots_json=cast(list[dict[str, object]] | None, row.proposed_slots_json),
+        selected_slot_json=row.selected_slot_json,
+        hold_expires_at=row.hold_expires_at,
+        proposal_rounds=row.proposal_rounds,
+        contact_name=row.contact_name,
+        contact_email=row.contact_email,
+    )
+
+
+async def save_booking_state(db: AsyncSession, state: BookingState) -> None:
+    """Persist `state` (Issue #18) — insert-or-update, since a session's
+    booking_states row may not exist yet the first time the flow starts.
+    """
+    row = await db.get(BookingStateRow, state.session_id)
+    if row is None:
+        row = BookingStateRow(session_id=state.session_id, step=state.step.value)
+        db.add(row)
+    else:
+        row.step = state.step.value
+    row.timezone_name = state.timezone_name
+    row.proposed_slots_json = cast("list[object] | None", state.proposed_slots_json)
+    row.selected_slot_json = state.selected_slot_json
+    row.hold_expires_at = state.hold_expires_at
+    row.proposal_rounds = state.proposal_rounds
+    row.contact_name = state.contact_name
+    row.contact_email = state.contact_email
     await db.commit()

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.booking.state import BookingState, Step
 from app.config import settings
 from app.db import session as db_session
 from app.db.models import Base
@@ -23,10 +24,12 @@ from app.db.session import (
     append_message,
     get_engine,
     get_or_create_session,
+    load_booking_state,
     messages_after,
     messages_up_to,
     overwrite_summary_content,
     recent_messages,
+    save_booking_state,
     set_visitor_info,
 )
 
@@ -328,6 +331,66 @@ async def test_add_token_budget_used_unknown_session_raises(
     async with session_factory() as db:
         with pytest.raises(ValueError, match="unknown-session"):
             await add_token_budget_used(db, "unknown-session", 10)
+
+
+async def test_load_booking_state_no_row_yet_returns_fresh_idle_default(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        state = await load_booking_state(db, "sess-1")
+
+    assert state.session_id == "sess-1"
+    assert state.step is Step.IDLE
+    assert state.proposal_rounds == 0
+    assert state.timezone_name is None
+
+
+async def test_save_then_load_booking_state_round_trips_every_field(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    state = BookingState(
+        session_id="sess-1",
+        step=Step.SLOTS_PROPOSED,
+        timezone_name="America/New_York",
+        proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}],
+        selected_slot_json=None,
+        proposal_rounds=2,
+        contact_name=None,
+        contact_email=None,
+    )
+
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await save_booking_state(db, state)
+
+    async with session_factory() as db:
+        loaded = await load_booking_state(db, "sess-1")
+
+    assert loaded == state
+
+
+async def test_save_booking_state_upserts_an_existing_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await save_booking_state(db, BookingState(session_id="sess-1", step=Step.INTENT_DETECTED))
+        await save_booking_state(
+            db,
+            BookingState(
+                session_id="sess-1",
+                step=Step.CONFIRMED,
+                contact_name="Priya",
+                contact_email="priya@example.com",
+            ),
+        )
+
+    async with session_factory() as db:
+        loaded = await load_booking_state(db, "sess-1")
+
+    assert loaded.step is Step.CONFIRMED
+    assert loaded.contact_name == "Priya"
 
 
 def test_no_sync_db_access_outside_session_module() -> None:
