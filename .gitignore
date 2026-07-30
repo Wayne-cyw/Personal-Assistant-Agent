@@ -9,6 +9,8 @@ token.json
 # --- Database ---
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 /data/                      # if SQLite file lives in a data/ dir

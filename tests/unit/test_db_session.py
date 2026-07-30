@@ -16,7 +16,18 @@ from sqlalchemy.ext.asyncio import (
 from app.config import settings
 from app.db import session as db_session
 from app.db.models import Base
-from app.db.session import append_message, get_engine, get_or_create_session, recent_messages
+from app.db.session import (
+    add_pinned_fact,
+    advance_summary,
+    append_message,
+    get_engine,
+    get_or_create_session,
+    messages_after,
+    messages_up_to,
+    overwrite_summary_content,
+    recent_messages,
+    set_visitor_info,
+)
 
 
 @pytest.fixture
@@ -155,6 +166,117 @@ async def test_sqlite_gets_no_postgres_pool_kwargs(monkeypatch: pytest.MonkeyPat
         await db_session.dispose_engine()
 
     assert captured == {}
+
+
+async def test_add_pinned_fact_appends_dedupes_and_caps(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        assert await add_pinned_fact(db, "sess-1", "likes Rust", max_facts=2) is True
+        # Case-insensitive duplicate of an existing fact is rejected.
+        assert await add_pinned_fact(db, "sess-1", "Likes Rust", max_facts=2) is False
+        assert await add_pinned_fact(db, "sess-1", "based in NYC", max_facts=2) is True
+        # Cap reached: a third distinct fact is rejected.
+        assert await add_pinned_fact(db, "sess-1", "hiring for backend", max_facts=2) is False
+
+    async with session_factory() as db:
+        row = await get_or_create_session(db, "sess-1")
+        assert row.pinned_facts_json == ["likes Rust", "based in NYC"]
+
+
+async def test_add_pinned_fact_unknown_session_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        with pytest.raises(ValueError, match="unknown-session"):
+            await add_pinned_fact(db, "unknown-session", "fact", max_facts=5)
+
+
+async def test_messages_up_to_and_after_split_on_boundary(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        ids = []
+        for i in range(5):
+            msg = await append_message(db, "sess-1", "user", f"message {i}")
+            ids.append(msg.id)
+
+    async with session_factory() as db:
+        up_to = await messages_up_to(db, "sess-1", ids[2])
+        after = await messages_after(db, "sess-1", ids[2])
+
+    assert [m.content for m in up_to] == ["message 0", "message 1", "message 2"]
+    assert [m.content for m in after] == ["message 3", "message 4"]
+
+
+async def test_messages_after_none_returns_everything(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await append_message(db, "sess-1", "user", "only message")
+
+    async with session_factory() as db:
+        after = await messages_after(db, "sess-1", None)
+
+    assert [m.content for m in after] == ["only message"]
+
+
+async def test_advance_summary_sets_content_and_boundary(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await advance_summary(
+            db,
+            "sess-1",
+            summary_json={"visitor_context": "recruiter"},
+            summary_through_message_id=7,
+        )
+
+    async with session_factory() as db:
+        row = await get_or_create_session(db, "sess-1")
+        assert row.summary_json == {"visitor_context": "recruiter"}
+        assert row.summary_through_message_id == 7
+
+
+async def test_overwrite_summary_content_leaves_boundary_unchanged(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await advance_summary(
+            db,
+            "sess-1",
+            summary_json={"visitor_context": "stale"},
+            summary_through_message_id=7,
+        )
+        await overwrite_summary_content(db, "sess-1", summary_json={"visitor_context": "corrected"})
+
+    async with session_factory() as db:
+        row = await get_or_create_session(db, "sess-1")
+        assert row.summary_json == {"visitor_context": "corrected"}
+        assert row.summary_through_message_id == 7  # unchanged
+
+
+async def test_set_visitor_info_overwrites_unconditionally(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression test: the tool-based save_visitor_info path (Issue #11)
+    relies on set_visitor_info applying a new value even when one is already
+    set — unlike Issue #9's regex-based turn-zero capture, which gates
+    capture-once in the *caller* before ever reaching this function.
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await set_visitor_info(db, "sess-1", name="Priya")
+        await set_visitor_info(db, "sess-1", name="Priya Patel")
+
+    async with session_factory() as db:
+        row = await get_or_create_session(db, "sess-1")
+        assert row.visitor_name == "Priya Patel"
 
 
 def test_no_sync_db_access_outside_session_module() -> None:

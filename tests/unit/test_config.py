@@ -95,6 +95,11 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "SUMMARIZER_MODEL",
         "DATABASE_URL",
         "MAX_ITERATIONS",
+        "SUMMARY_MAX_TOKENS",
+        "PINNED_FACTS_MAX",
+        "SUMMARY_AUDIT_INTERVAL",
+        "ENFORCE_SINGLE_WORKER",
+        "WEB_CONCURRENCY",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -107,6 +112,26 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.summarizer_model == "gpt-5.6-luna"
     assert settings.database_url == "sqlite+aiosqlite:///./agent.db"
     assert settings.max_iterations == 5
+    assert settings.summary_max_tokens == 150
+    assert settings.pinned_facts_max == 5
+    assert settings.summary_audit_interval == 3
+    assert settings.enforce_single_worker is False
+    assert settings.web_concurrency is None
+
+
+def test_web_concurrency_parses_numeric_env_var() -> None:
+    settings = _settings(OPENAI_API_KEY="key", WEB_CONCURRENCY="3")
+    assert settings.web_concurrency == 3
+
+
+def test_web_concurrency_malformed_value_ignored_not_fatal() -> None:
+    """Regression test: WEB_CONCURRENCY is set by external tooling (gunicorn/
+    uvicorn process managers) this app doesn't control the format of — a
+    malformed value must not crash startup (app/main.py's guard treats a
+    missing signal as a no-op, not an error).
+    """
+    settings = _settings(OPENAI_API_KEY="key", WEB_CONCURRENCY="not-a-number")
+    assert settings.web_concurrency is None
 
 
 def test_max_iterations_zero_or_negative_rejected() -> None:

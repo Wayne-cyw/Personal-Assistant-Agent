@@ -14,6 +14,7 @@ dependencies = [
   "httpx",
   "numpy",
   "openai",
+  "tiktoken",
 ]
 
 [project.optional-dependencies]

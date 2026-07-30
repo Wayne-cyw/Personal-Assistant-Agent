@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import cast
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -175,9 +176,13 @@ async def set_visitor_info(
     linkedin: str | None = None,
 ) -> SessionRow:
     """Set visitor_name/visitor_linkedin on the session row (Issue #9).
-    Only overwrites a field when a non-None value is passed — callers decide
-    whether a field is already set before calling this (e.g. capture-once
-    semantics), this function does not check.
+    Only overwrites a field when a non-None value is passed. Unlike Issue
+    #9's regex-based turn-zero capture (which the caller gates to
+    capture-once, since a false positive there is unrecoverable), the
+    tool-based `save_visitor_info` path (Issue #11) calls this unconditionally
+    on every volunteered value — a deliberate model tool call is a visitor
+    correction, not a guess, so last-write-wins is the correct semantics
+    there.
     """
     row = await db.get(SessionRow, session_id)
     if row is None:
@@ -189,3 +194,105 @@ async def set_visitor_info(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+async def add_pinned_fact(
+    db: AsyncSession, session_id: str, fact: str, *, max_facts: int
+) -> bool:
+    """Append `fact` to the session's pinned_facts_json (Issue #11),
+    deduplicated case-insensitively and capped at `max_facts`. Returns
+    whether the fact was actually added (False if it was a duplicate or the
+    cap was already reached) so the caller (the save_visitor_info tool) can
+    report the outcome back to the model.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        raise ValueError(f"add_pinned_fact called for unknown session_id={session_id!r}")
+    facts: list[str] = [str(existing) for existing in (row.pinned_facts_json or [])]
+    if any(existing.strip().lower() == fact.strip().lower() for existing in facts):
+        return False
+    if len(facts) >= max_facts:
+        return False
+    facts.append(fact)
+    row.pinned_facts_json = cast(list[object], facts)
+    await db.commit()
+    return True
+
+
+async def messages_up_to(
+    db: AsyncSession, session_id: str, through_message_id: int
+) -> list[Message]:
+    """All messages for `session_id` with id <= through_message_id, oldest
+    first — the exact raw range a summary claims to cover (Issue #11), used
+    by `reload_and_reconcile` to regenerate that range from source data.
+    """
+    stmt = (
+        select(Message)
+        .where(Message.session_id == session_id, Message.id <= through_message_id)
+        .order_by(Message.id.asc())
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def messages_after(
+    db: AsyncSession, session_id: str, after_message_id: int | None
+) -> list[Message]:
+    """All messages for `session_id` with id > after_message_id (or every
+    message, if None), oldest first — the live rolling window (Issue #11):
+    everything not yet folded into the summary.
+    """
+    stmt = select(Message).where(Message.session_id == session_id)
+    if after_message_id is not None:
+        stmt = stmt.where(Message.id > after_message_id)
+    stmt = stmt.order_by(Message.id.asc())
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def advance_summary(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    summary_json: dict[str, object],
+    summary_through_message_id: int,
+) -> None:
+    """Normal eviction path (Issue #11): store the newly-merged summary and
+    advance the coverage boundary to the last evicted message id.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        raise ValueError(f"advance_summary called for unknown session_id={session_id!r}")
+    row.summary_json = summary_json
+    row.summary_through_message_id = summary_through_message_id
+    await db.commit()
+
+
+async def increment_eviction_count(db: AsyncSession, session_id: str) -> int:
+    """Bump sessions.eviction_count by one after a real eviction (Issue
+    #11), returning the new value — drives the SUMMARY_AUDIT_INTERVAL
+    scheduling check in app/agent/memory.py's run_eviction. A dedicated
+    function rather than a direct ORM mutation in memory.py, per this
+    module's own rule that every DB write goes through a named repo
+    function here.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        raise ValueError(f"increment_eviction_count called for unknown session_id={session_id!r}")
+    row.eviction_count += 1
+    await db.commit()
+    return row.eviction_count
+
+
+async def overwrite_summary_content(
+    db: AsyncSession, session_id: str, *, summary_json: dict[str, object]
+) -> None:
+    """Reconciliation path (Issue #11, `reload_and_reconcile`): correct the
+    summary's *content* without touching summary_through_message_id — no new
+    coverage was added, the existing coverage was regenerated from source.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        raise ValueError(f"overwrite_summary_content called for unknown session_id={session_id!r}")
+    row.summary_json = summary_json
+    await db.commit()
