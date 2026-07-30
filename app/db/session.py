@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -27,7 +29,7 @@ from sqlalchemy.ext.asyncio import (
 from app.booking.state import BookingState
 from app.booking.state import Step as BookingStep
 from app.config import settings
-from app.db.models import Base, Booking, Message, SessionRow
+from app.db.models import Base, Booking, Message, RateLimit, SessionRow
 from app.db.models import BookingState as BookingStateRow
 
 logger = logging.getLogger(__name__)
@@ -505,3 +507,78 @@ async def create_booking(
             session_id,
         )
     return booking
+
+
+async def check_and_increment_rate_limit(
+    db: AsyncSession, key: str, *, limit: int, window: timedelta | None
+) -> bool:
+    """Atomic fixed-window rate-limit check-and-increment against the
+    `rate_limits` table (Issue #23; the same primitive Issue #24's chat
+    message limits will reuse — 4.7's schema comment names all three key
+    prefixes, `sess:`/`ip:`/`book:`, against this one table). A single
+    `INSERT ... ON CONFLICT DO UPDATE ... RETURNING count` round trip
+    (4.7 rule 3, portable across SQLite/Postgres via each dialect's own
+    `insert()` construct — the emitted SQL is the same shape either way,
+    just built differently), so a read-then-write race under concurrent
+    callers for the same key can't lose an increment the way a Python-side
+    read-modify-write would.
+
+    `window=None` means the counter never resets (a lifetime cap, bounded
+    only by the key's own natural lifetime — e.g. a per-session key,
+    which stops mattering once the session itself is gone). Otherwise a
+    row whose window has elapsed (`now - window_start >= window`) starts a
+    fresh window at `now` with count=1, same as a brand-new key.
+
+    Returns whether this call is allowed (True) or would exceed `limit`
+    for the current window (False). A blocked call is still counted (the
+    row's count keeps incrementing past `limit` on repeated blocked
+    attempts) — simpler than clamping, and harmless: once count > limit,
+    further increments don't change the True/False verdict for the rest
+    of the window.
+    """
+    now = datetime.now(UTC)
+    is_postgres = db.bind is not None and db.bind.dialect.name == "postgresql"
+    if window is None:
+        new_window_start: object = RateLimit.window_start
+        new_count: object = RateLimit.count + 1
+    else:
+        expired = RateLimit.window_start <= now - window
+        new_window_start = case((expired, now), else_=RateLimit.window_start)
+        new_count = case((expired, 1), else_=RateLimit.count + 1)
+    set_ = {"window_start": new_window_start, "count": new_count}
+    # Each dialect's insert() returns its own Insert subclass — only that
+    # subclass exposes on_conflict_do_update, so the two branches can't be
+    # collapsed into one `insert_fn(...)` call without losing that typing
+    # (the generic Core Insert type doesn't have the method at all).
+    if is_postgres:
+        stmt = (
+            pg_insert(RateLimit)
+            .values(key=key, window_start=now, count=1)
+            .on_conflict_do_update(index_elements=[RateLimit.key], set_=set_)
+            .returning(RateLimit.count)
+        )
+    else:
+        stmt = (
+            sqlite_insert(RateLimit)
+            .values(key=key, window_start=now, count=1)
+            .on_conflict_do_update(index_elements=[RateLimit.key], set_=set_)
+            .returning(RateLimit.count)
+        )
+    result = await db.execute(stmt)
+    new_total = result.scalar_one()
+    await db.commit()
+    return bool(new_total <= limit)
+
+
+async def flag_session(db: AsyncSession, session_id: str) -> None:
+    """Set sessions.flagged (Issue #23; also the general mechanism named
+    for #16's abusive-content and #27's flagged-conversation cases). Not
+    an error if the row doesn't exist or is already flagged — flagging is
+    idempotent, and the caller (a rate-limit trip) shouldn't fail the
+    turn over a bookkeeping write.
+    """
+    row = await db.get(SessionRow, session_id)
+    if row is None:
+        return
+    row.flagged = True
+    await db.commit()
