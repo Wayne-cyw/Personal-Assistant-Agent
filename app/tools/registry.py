@@ -35,7 +35,13 @@ from app.booking.state import (
     transition,
 )
 from app.config import settings
-from app.db.session import add_pinned_fact, load_booking_state, save_booking_state, set_visitor_info
+from app.db.session import (
+    active_holds,
+    add_pinned_fact,
+    load_booking_state,
+    save_booking_state,
+    set_visitor_info,
+)
 from app.safety.pii import redact
 from app.tools.context import ToolContext
 
@@ -218,27 +224,33 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
     if event_kind is EventKind.WIDEN_WINDOW:
         resolved = widen_window(resolved)
 
-    # Re-proposing or widening excludes everything offered and rejected
-    # across the *whole* negotiation so far, not just the immediately
-    # preceding round — state.excluded_slots_json (the accumulator) plus
-    # the current round's own proposed_slots_json, which is about to be
-    # superseded and folded into that same accumulator by transition()
-    # below. Without the accumulator half, a round-3 widened window could
-    # re-offer a round-1 slot the visitor already rejected twice, since
-    # RE_PROPOSE/WIDEN_WINDOW both *replace* proposed_slots_json each round
-    # rather than growing it.
-    exclude: list[tuple[datetime, datetime]] | None = None
+    # Other sessions' unexpired soft holds (Issue #21) are additional busy
+    # time on every call, first round included — two visitors must never
+    # both be offered the same slot, not just re-proposals.
+    exclude: list[tuple[datetime, datetime]] = list(
+        await active_holds(context.db, exclude_session_id=context.session_id)
+    )
+
+    # Re-proposing or widening also excludes everything offered and
+    # rejected across the *whole* negotiation so far, not just the
+    # immediately preceding round — state.excluded_slots_json (the
+    # accumulator) plus the current round's own proposed_slots_json, which
+    # is about to be superseded and folded into that same accumulator by
+    # transition() below. Without the accumulator half, a round-3 widened
+    # window could re-offer a round-1 slot the visitor already rejected
+    # twice, since RE_PROPOSE/WIDEN_WINDOW both *replace* proposed_slots_json
+    # each round rather than growing it.
     if event_kind in (EventKind.RE_PROPOSE, EventKind.WIDEN_WINDOW):
         already_offered = list(state.excluded_slots_json or []) + list(
             state.proposed_slots_json or []
         )
-        exclude = [
+        exclude.extend(
             (
                 datetime.fromisoformat(str(s["start_iso"])),
                 datetime.fromisoformat(str(s["end_iso"])),
             )
             for s in already_offered
-        ]
+        )
 
     slots = await generate_slots(
         context.calendar_client,

@@ -5,7 +5,7 @@ tested in tests/unit/test_booking_state.py).
 """
 
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -356,6 +356,44 @@ async def test_fourth_call_falls_back_to_email_and_abandons(
     assert "email" in str(fourth["message"]).lower()
     state = await load_booking_state(db, SID)
     assert state.step is Step.ABANDONED
+
+
+# --- cross-session soft holds (Issue #21) ------------------------------------
+
+
+async def test_another_sessions_active_hold_blocks_the_first_proposal(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held slot must be excluded on a session's very first
+    calendar_find_slots call, not just on re-propose/widen — two visitors
+    must never both be offered the same slot.
+    """
+    _configure_policy(
+        monkeypatch,
+        _policy(
+            work_start_time=datetime(2000, 1, 1, 9, 0).time(),
+            work_end_time=datetime(2000, 1, 1, 9, 30).time(),
+        ),
+    )
+    await save_booking_state(
+        db,
+        BookingState(
+            session_id="sess-other",
+            step=Step.SLOT_SELECTED,
+            selected_slot_json={
+                "slot_id": "held",
+                "start_iso": "2026-08-03T09:00:00-04:00",
+                "end_iso": "2026-08-03T09:30:00-04:00",
+            },
+            hold_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        ),
+    )
+
+    result = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+
+    assert result["slots"] == []
 
 
 async def test_second_call_within_the_same_turn_is_refused_and_does_not_advance_round(
