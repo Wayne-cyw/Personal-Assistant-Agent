@@ -28,9 +28,11 @@ from app.agent.providers.fake import FakeProvider
 from app.api.chat import get_chat_calendar_client, get_main_provider
 from app.booking.slots import AvailabilityPolicy, AvailabilityPolicyError
 from app.booking.state import BookingState, Step
+from app.config import settings
 from app.db.models import Base
 from app.db.session import get_db, load_booking_state
 from app.main import app
+from app.tools.calendar import BusyInterval
 from app.tools.fake_calendar import FakeCalendar
 
 TZ = ZoneInfo("America/Toronto")
@@ -119,9 +121,30 @@ def _provide_contact_info_call(call_id: str, name: str, email: str) -> LLMRespon
     )
 
 
+def _create_booking_call(call_id: str) -> LLMResponse:
+    return LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id=call_id, name="calendar_create_booking", arguments={})],
+        usage=Usage(input_tokens=1, output_tokens=1),
+        finish_reason="tool_calls",
+    )
+
+
 def _use_fake_provider(responses: list[LLMResponse]) -> FakeProvider:
     fake = FakeProvider(responses=responses)
     app.dependency_overrides[get_main_provider] = lambda: fake
+    return fake
+
+
+def _use_fake_calendar(busy: list[BusyInterval] | None = None) -> FakeCalendar:
+    """Unlike the `client` fixture's own default override (a fresh, empty
+    FakeCalendar *per request*), this captures one instance so state
+    (created_events, busy) persists across multiple /v1/chat calls within
+    a test — needed to inspect what got created, or to mutate `.busy`
+    mid-test to simulate a race.
+    """
+    fake = FakeCalendar(busy=busy or [])
+    app.dependency_overrides[get_chat_calendar_client] = lambda: fake
     return fake
 
 
@@ -228,6 +251,194 @@ async def test_happy_path_through_contact_collection_to_confirmed(
     assert state.step is Step.CONFIRMED
     assert state.contact_name == "Priya Patel"
     assert state.contact_email == "priya@example.com"
+
+
+async def test_happy_path_through_confirmation_to_booking_created(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Issue #22 acceptance criteria: a full conversation ends with a
+    tentative event created (FakeCalendar), a bookings row, and
+    type: "booking_confirmed" with the 4.8-documented payload shape.
+    """
+    fake_calendar = _use_fake_calendar()
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider(
+        [
+            _find_slots_call("call_1"),
+            _response("Here are some times that work — let me know which suits you."),
+            _response("Great, you're set for that time. What name and email should I use?"),
+            _provide_contact_info_call("call_2", "Priya Patel", "priya@example.com"),
+            _response("Here's a summary — just confirm and I'll lock it in."),
+            _create_booking_call("call_3"),
+            _response("You're all set — see you then!"),
+        ]
+    )
+
+    proposal = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "can we book a call next week?",
+            "timezone": "America/Toronto",
+        },
+    )
+    slots = proposal.json()["data"]["slots"]
+
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+    await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "Priya Patel, priya@example.com"}
+    )
+
+    confirmed = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "yes"}
+    )
+    assert confirmed.status_code == 200
+    body = confirmed.json()
+    assert body["type"] == "booking_confirmed"
+    assert body["data"]["slot"] == slots[0]
+    assert body["data"]["timezone"] == "America/Toronto"
+    assert isinstance(body["data"]["booking_id"], int)
+    assert settings.owner_contact_email in body["data"]["next_steps"]
+
+    assert len(fake_calendar.created_events) == 1
+    created = next(iter(fake_calendar.created_events.values()))
+    assert created.attendee.email == "priya@example.com"
+
+    state = await _get_booking_state(engine, "sess-1")
+    assert state.step is Step.BOOKING_CREATED
+
+
+async def test_declining_at_confirmation_returns_to_slots_proposed(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Issue #22: a deliberate "no" at confirmed re-enters slots_proposed.
+    The first decline in a session is free (Finding 6, user-confirmed
+    design call) and doesn't consume a negotiation round; a second decline
+    does — distinct from the race-condition bounce-back, which never
+    consumes one.
+    """
+    _use_fake_calendar()
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider(
+        [
+            _find_slots_call("call_1"),
+            _response("Here are some times."),
+            _response("Great, you're set. What name and email should I use?"),
+            _provide_contact_info_call("call_2", "Priya Patel", "priya@example.com"),
+            _response("Here's a summary — just confirm and I'll lock it in."),
+        ]
+    )
+
+    await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "can we book a call next week?",
+            "timezone": "America/Toronto",
+        },
+    )
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+    await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "Priya Patel, priya@example.com"}
+    )
+    state_before = await _get_booking_state(engine, "sess-1")
+    assert state_before.step is Step.CONFIRMED
+
+    _use_fake_provider([_response("No problem — let me know if you'd like a different time.")])
+    declined = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "no, let's pick a different time"}
+    )
+
+    assert declined.status_code == 200
+    assert declined.json()["type"] == "message"  # no dedicated response type for a decline
+    state_after_first_decline = await _get_booking_state(engine, "sess-1")
+    assert state_after_first_decline.step is Step.SLOTS_PROPOSED
+    assert state_after_first_decline.proposal_rounds == state_before.proposal_rounds  # free
+
+    # Select, re-confirm, and decline a second time — this one costs a round.
+    _use_fake_provider(
+        [
+            _response("Great, you're set. What name and email should I use?"),
+            _provide_contact_info_call("call_3", "Priya Patel", "priya@example.com"),
+            _response("Here's a summary — just confirm and I'll lock it in."),
+        ]
+    )
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+    await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "Priya Patel, priya@example.com"}
+    )
+
+    _use_fake_provider([_response("No problem — let me know if you'd like a different time.")])
+    declined_again = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "no, let's pick a different time"}
+    )
+
+    assert declined_again.status_code == 200
+    state_after_second_decline = await _get_booking_state(engine, "sess-1")
+    assert state_after_second_decline.step is Step.SLOTS_PROPOSED
+    assert (
+        state_after_second_decline.proposal_rounds
+        == state_after_first_decline.proposal_rounds + 1
+    )
+
+
+async def test_slot_taken_between_confirmation_request_and_yes_gracefully_re_proposes(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Issue #22 acceptance criteria: the race test proves no event is
+    ever created for a slot that was taken between the confirmation
+    request and the visitor's "yes".
+    """
+    fake_calendar = _use_fake_calendar()
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider(
+        [
+            _find_slots_call("call_1"),
+            _response("Here are some times."),
+            _response("Great, you're set. What name and email should I use?"),
+            _provide_contact_info_call("call_2", "Priya Patel", "priya@example.com"),
+            _response("Here's a summary — just confirm and I'll lock it in."),
+        ]
+    )
+
+    proposal = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "can we book a call next week?",
+            "timezone": "America/Toronto",
+        },
+    )
+    slots = proposal.json()["data"]["slots"]
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+    await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "Priya Patel, priya@example.com"}
+    )
+
+    # Something else takes the confirmed slot before the visitor says yes —
+    # e.g. the owner manually adds an event, or (once #23/#24 exist)
+    # another booking flow gets there first.
+    confirmed_start = datetime.fromisoformat(slots[0]["start_iso"])
+    confirmed_end = datetime.fromisoformat(slots[0]["end_iso"])
+    fake_calendar.busy.append(BusyInterval(start=confirmed_start, end=confirmed_end))
+
+    _use_fake_provider(
+        [
+            _create_booking_call("call_3"),
+            _response("That time was just taken — here's what's still available."),
+        ]
+    )
+    result = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "yes"}
+    )
+
+    assert result.status_code == 200
+    assert result.json()["type"] == "message"  # no dedicated type for the race bounce-back
+    assert fake_calendar.created_events == {}
+
+    state = await _get_booking_state(engine, "sess-1")
+    assert state.step is Step.SLOTS_PROPOSED
+    assert state.selected_slot_json is None
 
 
 async def test_invalid_email_is_rejected_then_corrected_reaches_confirmed(

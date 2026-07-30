@@ -40,11 +40,13 @@ from app.config import settings
 from app.db.session import (
     active_holds,
     add_pinned_fact,
+    create_booking,
     load_booking_state,
     save_booking_state,
     set_visitor_info,
 )
 from app.safety.pii import redact
+from app.tools.calendar import Attendee, CalendarError
 from app.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -360,6 +362,214 @@ async def _provide_contact_info(args: BaseModel, context: ToolContext) -> dict[s
     return {"confirmation_summary": _build_confirmation_summary(state)}
 
 
+class CalendarCreateBookingArgs(BaseModel):
+    """No fields — the issue text is explicit: "no free arguments —
+    everything comes from persisted state" (the selected slot, timezone,
+    and contact info already collected via the earlier steps).
+    """
+
+
+async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dict[str, object]:
+    """The finale (Issue #22, 4.5's confirmed step): re-check free/busy for
+    the exact slot right now (the race-condition guard — a lot can happen
+    between proposing a slot and the visitor confirming it), then either
+    create a tentative event and persist the booking, or bounce back to
+    slots_proposed with the slot excluded if it was taken in the meantime.
+    """
+    assert isinstance(args, CalendarCreateBookingArgs)
+
+    if not context.confirmation_is_affirmative:
+        # Defense in depth (4.2): calendar_create_booking is gated to the
+        # confirmed *step*, but that doesn't know what the visitor actually
+        # said this turn — app/api/chat.py's deterministic classification
+        # of the reply (app/booking/confirmation.py) is the real gate.
+        return {
+            "error": "not_confirmed",
+            "message": (
+                "The visitor hasn't clearly confirmed yet — ask again, or wait for a clear "
+                "yes before calling this."
+            ),
+        }
+
+    state = await load_booking_state(context.db, context.session_id)
+    if state.step is not Step.CONFIRMED:
+        return {"error": "booking is not currently awaiting confirmation"}
+
+    selected = state.selected_slot_json
+    if (
+        selected is None
+        or state.contact_name is None
+        or state.contact_email is None
+        or state.timezone_name is None
+    ):
+        # Shouldn't happen — reaching confirmed already requires all four
+        # (slot_selected/contact_info_collected's own transition guards) —
+        # but degrade gracefully rather than raising if it somehow does.
+        logger.error(
+            "calendar_create_booking: incomplete state for session %s: %r",
+            context.session_id,
+            state,
+        )
+        return {
+            "error": "internal_error",
+            "message": (
+                "Something went wrong — ask the visitor to try again, or offer to have the "
+                "owner follow up by email."
+            ),
+        }
+
+    try:
+        start = datetime.fromisoformat(str(selected["start_iso"]))
+        end = datetime.fromisoformat(str(selected["end_iso"]))
+    except (KeyError, ValueError):
+        logger.error(
+            "calendar_create_booking: malformed selected_slot_json for session %s: %r",
+            context.session_id,
+            selected,
+        )
+        return {
+            "error": "internal_error",
+            "message": "Something went wrong — ask the visitor to try again.",
+        }
+
+    busy = await context.calendar_client.get_free_busy(start, end)
+    if any(b.start < end and b.end > start for b in busy):
+        new_state = transition(state, Event(kind=EventKind.SLOT_TAKEN_AT_RECHECK))
+        await save_booking_state(context.db, new_state)
+        return {
+            "taken": True,
+            "message": (
+                "That time was just taken by someone else — apologize briefly, then present "
+                "any remaining times, or search again if none are left."
+            ),
+        }
+
+    attendee = Attendee(name=state.contact_name, email=state.contact_email)
+    description = (
+        f"Call with {state.contact_name} ({state.contact_email}), booked via the site's "
+        "AI assistant."
+    )
+    try:
+        event_id = await context.calendar_client.create_event(start, end, attendee, description)
+    except CalendarError:
+        logger.error(
+            "calendar_create_booking: event creation failed for session %s", context.session_id
+        )
+        return {
+            "error": "creation_failed",
+            "message": (
+                "Something went wrong creating the event — ask the visitor to try again "
+                "shortly, or offer to have the owner follow up by email."
+            ),
+        }
+
+    # create_booking() and save_booking_state() each commit independently
+    # (two separate transactions, not one) — `booking`/`booking_id` are
+    # tracked outside the try so the except block below knows whether the
+    # *first* commit already succeeded when only the *second* one fails,
+    # and can clean up accordingly (review finding: treating both as a
+    # single atomic unit missed exactly this case). `booking_id` is
+    # captured as a plain int the moment it's available, separately from
+    # the ORM object: a rollback anywhere in the except block expires
+    # `booking`'s attributes, and logging `booking.id` after that would
+    # silently trigger a fresh (and, in an outage, likely also-failing)
+    # DB round trip just to format a log message.
+    booking = None
+    booking_id: int | None = None
+    try:
+        booking = await create_booking(
+            context.db,
+            session_id=context.session_id,
+            slot_start_iso=str(selected["start_iso"]),
+            slot_end_iso=str(selected["end_iso"]),
+            timezone_name=state.timezone_name,
+            contact_name=state.contact_name,
+            contact_email=state.contact_email,
+            gcal_event_id=event_id,
+        )
+        booking_id = booking.id
+        new_state = transition(state, Event(kind=EventKind.CREATED))
+        await save_booking_state(context.db, new_state)
+    except Exception:
+        # The calendar write above already succeeded — without this, a
+        # failure here (a DB outage, a transient error) would leave a real
+        # event on the calendar with no owner notification, permanently
+        # invisible to the app: state stays at confirmed, so a retry
+        # re-runs the free/busy re-check, sees the orphaned event as busy,
+        # and wrongly bounces the visitor into "that time was just taken by
+        # someone else" for a slot they already got. Best-effort
+        # compensating cleanup closes that window; if any of it also fails,
+        # it's logged for manual reconciliation rather than silently lost.
+        logger.error(
+            "calendar_create_booking: DB write failed after event creation for session %s "
+            "(event_id=%s) — attempting cleanup",
+            context.session_id,
+            event_id,
+        )
+        # A failed commit can leave the session's transaction unusable for
+        # further writes (including the compensating booking-row delete
+        # below, and anything app/api/chat.py does with this same session
+        # for the rest of the turn) until it's rolled back.
+        await context.db.rollback()
+        try:
+            await context.calendar_client.delete_event(event_id)
+        except Exception:
+            logger.error(
+                "calendar_create_booking: failed to delete orphaned event %s for session %s "
+                "— needs manual cleanup",
+                event_id,
+                context.session_id,
+            )
+        if booking is not None:
+            # create_booking()'s commit succeeded, so this exception must
+            # have come from transition()/save_booking_state() — the
+            # bookings row is now orphaned (event just deleted above, state
+            # never advanced past confirmed) and, left in place, would let
+            # a retry create a second event and a second bookings row for
+            # the same session.
+            try:
+                await context.db.delete(booking)
+                await context.db.commit()
+            except Exception:
+                # Same reasoning as the rollback above: leaving this
+                # session's transaction unresolved would break every
+                # subsequent write this request makes with it (e.g.
+                # app/api/chat.py persisting this turn's messages).
+                await context.db.rollback()
+                logger.error(
+                    "calendar_create_booking: failed to delete orphaned bookings row %s for "
+                    "session %s — needs manual cleanup",
+                    booking_id,
+                    context.session_id,
+                )
+        return {
+            "error": "creation_failed",
+            "message": (
+                "Something went wrong — ask the visitor to try again shortly, or offer to "
+                "have the owner follow up by email."
+            ),
+        }
+
+    # Scheduled as a background task by app/api/chat.py after run_agent
+    # returns (see ToolContext.pending_owner_notifications) — a
+    # notification failure must never affect this turn's reply, and the
+    # booking above is already durably persisted regardless.
+    context.pending_owner_notifications.append(
+        (
+            "New booking",
+            f"{state.contact_name} ({state.contact_email}) booked a call: "
+            f"{selected.get('label', '')}.",
+        )
+    )
+
+    return {
+        "booking_id": booking.id,
+        "slot": selected,
+        "timezone": state.timezone_name,
+        "next_steps": f"To reschedule or cancel, email {settings.owner_contact_email} directly.",
+    }
+
+
 @dataclass
 class _RegisteredTool:
     definition: ToolDef
@@ -458,6 +668,23 @@ PROVIDE_CONTACT_INFO = _RegisteredTool(
     booking_gated=True,
 )
 
+CALENDAR_CREATE_BOOKING = _RegisteredTool(
+    definition=ToolDef(
+        name="calendar_create_booking",
+        description=(
+            "Create the tentative calendar event for the confirmed booking. Takes no "
+            "arguments — everything comes from the slot, timezone, and contact info already "
+            "collected. Only call this after the visitor has clearly confirmed with a plain "
+            "'yes', 'confirm', 'book it', or similar — never on a hesitant reply or a "
+            "question, and never if they said no or asked for a different time."
+        ),
+        parameters=CalendarCreateBookingArgs.model_json_schema(),
+    ),
+    args_model=CalendarCreateBookingArgs,
+    handler=_calendar_create_booking,
+    booking_gated=True,
+)
+
 _REGISTRY: dict[str, _RegisteredTool] = {
     tool.definition.name: tool
     for tool in (
@@ -466,6 +693,7 @@ _REGISTRY: dict[str, _RegisteredTool] = {
         FLAG_SUMMARY_CONFLICT,
         CALENDAR_FIND_SLOTS,
         PROVIDE_CONTACT_INFO,
+        CALENDAR_CREATE_BOOKING,
     )
 }
 

@@ -151,6 +151,66 @@ def test_slot_taken_at_recheck_returns_to_slots_proposed_excluding_burned_slot()
     assert result.proposed_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
     assert result.selected_slot_json is None
     assert result.proposal_rounds == 1  # fresh negotiation cycle, not the visitor's fault
+    assert result.excluded_slots_json == [{"slot_id": "s2"}]
+
+
+def test_first_confirmation_decline_in_a_session_is_free() -> None:
+    """Finding 6 (user-confirmed design call): the first decline doesn't
+    touch proposal_rounds -- backing out right after confirming shouldn't
+    cost as much as a full reject-at-proposal round, since the visitor
+    already invested effort reaching confirmed.
+    """
+    state = _state(
+        step=Step.CONFIRMED,
+        proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}, {"slot_id": "s3"}],
+        selected_slot_json={"slot_id": "s2"},
+        proposal_rounds=2,
+    )
+    result = transition(state, Event(kind=EventKind.CONFIRMATION_DECLINED))
+    assert result.step is Step.SLOTS_PROPOSED
+    assert result.proposed_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
+    assert result.selected_slot_json is None
+    assert result.proposal_rounds == 2  # unchanged -- first decline is free
+    assert result.excluded_slots_json == [{"slot_id": "s2"}]
+    assert result.confirmation_declines == 1
+
+
+def test_second_confirmation_decline_in_a_session_counts_as_a_round() -> None:
+    state = _state(
+        step=Step.CONFIRMED,
+        proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}, {"slot_id": "s3"}],
+        selected_slot_json={"slot_id": "s2"},
+        proposal_rounds=1,
+        confirmation_declines=1,  # already used the free one earlier this session
+    )
+    result = transition(state, Event(kind=EventKind.CONFIRMATION_DECLINED))
+    assert result.step is Step.SLOTS_PROPOSED
+    assert result.proposal_rounds == 2  # second decline -- costs a round, per task text
+    assert result.confirmation_declines == 2
+
+
+def test_confirmation_declined_accumulates_onto_existing_excluded_slots() -> None:
+    """Regression test: a review pass found the declined slot dropped out
+    of *both* proposed_slots_json and excluded_slots_json at once, so a
+    later re-propose/widen call (which builds its exclude list from
+    exactly those two fields) could legitimately re-offer a slot the
+    visitor already explicitly declined at confirmation.
+    """
+    state = _state(
+        step=Step.CONFIRMED,
+        proposed_slots_json=[{"slot_id": "s2"}],
+        selected_slot_json={"slot_id": "s2"},
+        excluded_slots_json=[{"slot_id": "s1"}],
+        proposal_rounds=1,
+    )
+    result = transition(state, Event(kind=EventKind.CONFIRMATION_DECLINED))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}, {"slot_id": "s2"}]
+    assert result.proposed_slots_json == []
+
+
+def test_confirmation_declined_outside_confirmed_is_illegal() -> None:
+    with pytest.raises(InvalidTransition):
+        transition(_state(step=Step.SLOT_SELECTED), Event(kind=EventKind.CONFIRMATION_DECLINED))
 
 
 @pytest.mark.parametrize(

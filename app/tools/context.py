@@ -55,3 +55,20 @@ class ToolContext:
     # constructed per HTTP request in app/api/chat.py and reused for the
     # entire run_agent call, so this correctly scopes "once per turn."
     calendar_find_slots_used_this_turn: bool = False
+    # Set by app/api/chat.py from the deterministic classification of the
+    # visitor's raw reply (app/booking/confirmation.py) — never left to the
+    # model's own judgment of whether a reply "sounded like" a yes (4.5:
+    # "Only an affirmative reply advances"). calendar_create_booking
+    # (Issue #22) is gated to the confirmed step's tool list, but that's
+    # step-level, not per-message: this is the message-level check the
+    # handler itself enforces as defense in depth, same rationale as
+    # calendar_find_slots' own state re-check.
+    confirmation_is_affirmative: bool = False
+    # calendar_create_booking (Issue #22) appends (subject, body) pairs here
+    # instead of calling app/notify.py directly — mirrors
+    # pending_reconciliations: notifying the owner is a side effect with no
+    # bearing on this turn's reply, so app/api/chat.py schedules it as a
+    # background task after run_agent returns, the same "never add
+    # user-facing latency for a side effect the visitor isn't waiting on"
+    # discipline as eviction/reconciliation (Engineering Guide 4.3).
+    pending_owner_notifications: list[tuple[str, str]] = field(default_factory=list)

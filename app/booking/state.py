@@ -54,7 +54,7 @@ class EventKind(StrEnum):
     """The transition() task list, in order: intent detected; tz captured;
     slots proposed; slot selected; re-propose; widen-window; email-
     fallback; contact collected; confirmed; created; slot-taken-at-
-    recheck; abandonment.
+    recheck; confirmation declined; abandonment.
     """
 
     INTENT_DETECTED = "intent_detected"
@@ -68,6 +68,14 @@ class EventKind(StrEnum):
     CONFIRMED = "confirmed"
     CREATED = "created"
     SLOT_TAKEN_AT_RECHECK = "slot_taken_at_recheck"
+    # Issue #22: the visitor said "no"/changed their mind at the
+    # confirmation step, distinct from SLOT_TAKEN_AT_RECHECK (an
+    # availability race, nobody's fault, doesn't consume the negotiation
+    # cap) — a deliberate decline consumes a round (task text: "'no'/
+    # change-of-mind -> back to slots_proposed (counts as a round)"), except
+    # the first one in a session, which is free (Finding 6, user-confirmed
+    # design call — see the handler below).
+    CONFIRMATION_DECLINED = "confirmation_declined"
     ABANDON = "abandon"
 
 
@@ -112,6 +120,10 @@ class BookingState:
     # list built only from `proposed_slots_json` only ever sees the single
     # most recent round.
     excluded_slots_json: list[dict[str, object]] | None = None
+    # How many times CONFIRMATION_DECLINED has fired this session (Issue #22
+    # review Finding 6). The first decline is free (doesn't touch
+    # proposal_rounds) — see CONFIRMATION_DECLINED's handler below for why.
+    confirmation_declines: int = 0
 
 
 def _accumulate_excluded(state: BookingState) -> list[dict[str, object]]:
@@ -121,6 +133,45 @@ def _accumulate_excluded(state: BookingState) -> list[dict[str, object]]:
     re-offers it (see BookingState.excluded_slots_json's docstring).
     """
     return list(state.excluded_slots_json or []) + list(state.proposed_slots_json or [])
+
+
+def _back_to_slots_proposed_excluding_selected(
+    state: BookingState, *, proposal_rounds: int
+) -> BookingState:
+    """Shared body for SLOT_TAKEN_AT_RECHECK and CONFIRMATION_DECLINED
+    (Issue #22): both re-enter slots_proposed with whatever was already
+    offered, minus the one slot that just fell through — no fresh
+    calendar_find_slots call is forced immediately; the remaining
+    already-offered options (if any) are presented first, and the model can
+    still call calendar_find_slots itself (offered again at slots_proposed)
+    if none are left. `proposal_rounds` is the only thing that differs
+    between the two callers, so it's the caller's job to compute it.
+
+    The burned slot is also folded into excluded_slots_json (review fix):
+    without this, it drops out of both proposed_slots_json *and*
+    excluded_slots_json at once, so a later re-propose/widen call — which
+    builds its exclude list from exactly those two fields — could
+    legitimately re-offer it. Harmless-but-redundant for
+    SLOT_TAKEN_AT_RECHECK (the slot is genuinely busy, so generate_slots'
+    own free/busy check would filter it out anyway); load-bearing for
+    CONFIRMATION_DECLINED, where the slot is still free and nothing else
+    would otherwise stop it from being re-offered right back to the
+    visitor who just said no to it.
+    """
+    burned = state.selected_slot_json
+    burned_id = (burned or {}).get("slot_id")
+    remaining = [s for s in (state.proposed_slots_json or []) if s.get("slot_id") != burned_id]
+    excluded = list(state.excluded_slots_json or [])
+    if burned is not None:
+        excluded.append(burned)
+    return replace(
+        state,
+        step=Step.SLOTS_PROPOSED,
+        proposed_slots_json=remaining,
+        selected_slot_json=None,
+        proposal_rounds=proposal_rounds,
+        excluded_slots_json=excluded,
+    )
 
 
 class InvalidTransition(Exception):
@@ -250,17 +301,28 @@ def transition(state: BookingState, event: Event) -> BookingState:
     if kind is EventKind.SLOT_TAKEN_AT_RECHECK:
         if step is not Step.CONFIRMED:
             raise InvalidTransition(step, kind)
-        burned_id = (state.selected_slot_json or {}).get("slot_id")
-        remaining = [s for s in (state.proposed_slots_json or []) if s.get("slot_id") != burned_id]
         # Fresh negotiation cycle: the race-condition failure isn't the
         # visitor's fault, so it doesn't consume any of their 2-round cap.
-        return replace(
-            state,
-            step=Step.SLOTS_PROPOSED,
-            proposed_slots_json=remaining,
-            selected_slot_json=None,
-            proposal_rounds=1,
-        )
+        return _back_to_slots_proposed_excluding_selected(state, proposal_rounds=1)
+
+    if kind is EventKind.CONFIRMATION_DECLINED:
+        if step is not Step.CONFIRMED:
+            raise InvalidTransition(step, kind)
+        # Unlike SLOT_TAKEN_AT_RECHECK, this *is* the visitor's own choice,
+        # so the task text ("counts as a round") applies -- but not to the
+        # *first* decline in a session (Finding 6, user-confirmed): backing
+        # out right after confirming shouldn't cost the same as a full
+        # reject-at-proposal round, since the visitor already invested
+        # effort reaching confirmed. confirmation_declines tracks how many
+        # times this event has fired so only the second and later declines
+        # increment proposal_rounds, same as a RE_PROPOSE would; without
+        # this counter, every decline would look identical to the first and
+        # the leniency could never expire, letting a session loop
+        # select/confirm/decline indefinitely without ever hitting the cap.
+        first_decline = state.confirmation_declines == 0
+        new_rounds = state.proposal_rounds if first_decline else state.proposal_rounds + 1
+        new_state = _back_to_slots_proposed_excluding_selected(state, proposal_rounds=new_rounds)
+        return replace(new_state, confirmation_declines=state.confirmation_declines + 1)
 
     # Exhaustiveness guard, unreachable while every EventKind is handled above.
     raise AssertionError(f"unhandled event kind: {kind!r}")  # pragma: no cover

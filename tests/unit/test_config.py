@@ -59,6 +59,7 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.session_token_budget == 50_000
     assert settings.google_calendar_id == "primary"
     assert settings.hold_minutes == 10
+    assert settings.owner_notify_webhook_url is None
 
 
 def test_allowed_origins_parses_comma_separated_string() -> None:
@@ -124,6 +125,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "SESSION_TOKEN_BUDGET",
         "GOOGLE_CALENDAR_ID",
         "HOLD_MINUTES",
+        "OWNER_NOTIFY_WEBHOOK_URL",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -144,6 +146,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.chat_max_output_tokens == 500
     assert settings.session_token_budget == 50_000
     assert settings.hold_minutes == 10
+    assert settings.owner_notify_webhook_url is None
 
 
 def test_web_concurrency_parses_numeric_env_var() -> None:
@@ -187,6 +190,13 @@ def test_hold_minutes_overridable_and_zero_or_negative_rejected() -> None:
         _settings(OPENAI_API_KEY="key", HOLD_MINUTES="0")
     with pytest.raises(ValidationError):
         _settings(OPENAI_API_KEY="key", HOLD_MINUTES="-1")
+
+
+def test_owner_notify_webhook_url_overridable() -> None:
+    settings = _settings(
+        OPENAI_API_KEY="key", OWNER_NOTIFY_WEBHOOK_URL="https://example.com/hook"
+    )
+    assert settings.owner_notify_webhook_url == "https://example.com/hook"
 
 
 def test_max_tokens_per_turn_too_low_for_summarizer_rejected() -> None:

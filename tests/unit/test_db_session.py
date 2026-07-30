@@ -25,6 +25,7 @@ from app.db.session import (
     add_token_budget_used,
     advance_summary,
     append_message,
+    create_booking,
     get_engine,
     get_or_create_session,
     load_booking_state,
@@ -363,6 +364,7 @@ async def test_save_then_load_booking_state_round_trips_every_field(
         contact_name=None,
         contact_email=None,
         excluded_slots_json=[{"slot_id": "s0"}],
+        confirmation_declines=1,
     )
 
     async with session_factory() as db:
@@ -553,6 +555,83 @@ async def test_active_holds_skips_a_row_with_a_non_dict_selected_slot_json(
     assert holds == [
         (datetime(2026, 8, 3, 9, 0, tzinfo=UTC), datetime(2026, 8, 3, 9, 30, tzinfo=UTC))
     ]
+
+
+# --- create_booking (Issue #22) -----------------------------------------------
+
+
+async def test_create_booking_inserts_a_tentative_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        booking = await create_booking(
+            db,
+            session_id="sess-1",
+            slot_start_iso="2026-08-03T09:00:00-04:00",
+            slot_end_iso="2026-08-03T09:30:00-04:00",
+            timezone_name="America/Toronto",
+            contact_name="Priya Patel",
+            contact_email="priya@example.com",
+            gcal_event_id="gcal-event-123",
+        )
+
+    assert booking.id is not None
+    assert booking.session_id == "sess-1"
+    assert booking.slot_start_iso == "2026-08-03T09:00:00-04:00"
+    assert booking.slot_end_iso == "2026-08-03T09:30:00-04:00"
+    assert booking.timezone_name == "America/Toronto"
+    assert booking.contact_name == "Priya Patel"
+    assert booking.contact_email == "priya@example.com"
+    assert booking.gcal_event_id == "gcal-event-123"
+    assert booking.status == "tentative"
+    # Not asserting tzinfo here: like hold_expires_at elsewhere in this
+    # file, a value re-read via db.refresh() comes back naive on SQLite's
+    # round-trip (no native tz-aware storage) — a pre-existing, documented
+    # quirk, not something create_booking needs to compensate for, since
+    # created_at is never compared against another datetime anywhere.
+    assert isinstance(booking.created_at, datetime)
+
+
+async def test_create_booking_survives_a_refresh_failure_after_a_successful_commit(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found that create_booking()'s
+    unconditional db.refresh() call after the commit meant a refresh
+    failure (e.g. a connectivity blip right after the commit) propagated
+    out of create_booking() before it returned a Booking -- even though the
+    row was already durably committed. That mattered to
+    app/tools/registry.py's calendar_create_booking, whose
+    compensating-cleanup logic decides whether to delete an orphaned row
+    based on whether create_booking() returned successfully; a refresh-only
+    failure there would make it wrongly conclude no row exists and skip
+    cleanup of one that does. create_booking() now swallows a refresh
+    failure and returns the pre-commit object, since `id` (an autoincrement
+    PK) is already populated at flush time and `created_at` is set
+    client-side by the column's Python default, both independent of
+    whether the refresh itself succeeds.
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")  # itself calls db.refresh -- do this first
+
+        async def _raise(_self: AsyncSession, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("refresh failed")
+
+        monkeypatch.setattr(AsyncSession, "refresh", _raise)
+
+        booking = await create_booking(
+            db,
+            session_id="sess-1",
+            slot_start_iso="2026-08-03T09:00:00-04:00",
+            slot_end_iso="2026-08-03T09:30:00-04:00",
+            timezone_name="America/Toronto",
+            contact_name="Priya Patel",
+            contact_email="priya@example.com",
+            gcal_event_id="gcal-event-123",
+        )
+
+    assert booking.id is not None
+    assert booking.session_id == "sess-1"
 
 
 def test_no_sync_db_access_outside_session_module() -> None:

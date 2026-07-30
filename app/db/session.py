@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import (
 from app.booking.state import BookingState
 from app.booking.state import Step as BookingStep
 from app.config import settings
-from app.db.models import Base, Message, SessionRow
+from app.db.models import Base, Booking, Message, SessionRow
 from app.db.models import BookingState as BookingStateRow
 
 logger = logging.getLogger(__name__)
@@ -364,6 +364,7 @@ async def load_booking_state(db: AsyncSession, session_id: str) -> BookingState:
         contact_name=row.contact_name,
         contact_email=row.contact_email,
         excluded_slots_json=cast(list[dict[str, object]] | None, row.excluded_slots_json),
+        confirmation_declines=row.confirmation_declines,
     )
 
 
@@ -404,6 +405,7 @@ async def save_booking_state(db: AsyncSession, state: BookingState) -> None:
     row.contact_name = state.contact_name
     row.contact_email = state.contact_email
     row.excluded_slots_json = cast("list[object] | None", state.excluded_slots_json)
+    row.confirmation_declines = state.confirmation_declines
     await db.commit()
 
 
@@ -449,3 +451,57 @@ async def active_holds(
                 slot,
             )
     return holds
+
+
+async def create_booking(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    slot_start_iso: str,
+    slot_end_iso: str,
+    timezone_name: str,
+    contact_name: str,
+    contact_email: str,
+    gcal_event_id: str,
+) -> Booking:
+    """Insert the `bookings` row for a newly-created tentative event (Issue
+    #22) — the durable, permanent record, independent of `booking_states`
+    (which tracks the in-progress flow and can be overwritten/reset;
+    `bookings` never is). `status` starts "tentative", matching the real
+    Google Calendar event's own status (app/tools/calendar.py's
+    `create_event`); nothing in v1 ever transitions it to "cancelled" —
+    that's out of scope here (rescheduling/cancellation is by email, per
+    the issue text).
+    """
+    booking = Booking(
+        session_id=session_id,
+        slot_start_iso=slot_start_iso,
+        slot_end_iso=slot_end_iso,
+        timezone_name=timezone_name,
+        contact_name=contact_name,
+        contact_email=contact_email,
+        gcal_event_id=gcal_event_id,
+        status="tentative",
+    )
+    db.add(booking)
+    await db.commit()
+    try:
+        await db.refresh(booking)
+    except Exception:
+        # The commit above already succeeded and durably created the row —
+        # `id` was already populated on `booking` at flush time (standard
+        # SQLAlchemy behavior for an autoincrement PK, independent of this
+        # refresh) and `created_at` was set client-side by the column's
+        # Python default before the insert, so a refresh failure here
+        # doesn't leave `booking` missing anything a caller actually reads.
+        # Letting it propagate instead would make create_booking() look
+        # like it failed even though the row is committed — which matters
+        # to app/tools/registry.py's calendar_create_booking: it decides
+        # whether to attempt a compensating delete of an orphaned bookings
+        # row based on whether this function returned a Booking at all.
+        logger.warning(
+            "create_booking: row committed for session %s but refresh failed — continuing "
+            "with the pre-commit object",
+            session_id,
+        )
+    return booking
