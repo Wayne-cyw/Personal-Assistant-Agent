@@ -10,6 +10,7 @@ DB only through the repository functions below, using portable SQL.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import cast
@@ -28,6 +29,8 @@ from app.booking.state import Step as BookingStep
 from app.config import settings
 from app.db.models import Base, Message, SessionRow
 from app.db.models import BookingState as BookingStateRow
+
+logger = logging.getLogger(__name__)
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -402,3 +405,41 @@ async def save_booking_state(db: AsyncSession, state: BookingState) -> None:
     row.contact_email = state.contact_email
     row.excluded_slots_json = cast("list[object] | None", state.excluded_slots_json)
     await db.commit()
+
+
+async def active_holds(
+    db: AsyncSession, *, exclude_session_id: str
+) -> list[tuple[datetime, datetime]]:
+    """Every *other* session's currently-held slot (Issue #21, 4.5's
+    slot_selected step) — soft holds are DB-only, never written to the
+    calendar, so calendar_find_slots (app/tools/registry.py) has to treat
+    them as additional busy time itself when proposing to a different
+    session. Expiry is checked lazily as part of the query
+    (`hold_expires_at > now`) rather than via any separate cleanup job — an
+    expired hold simply stops being returned, no row is deleted or reset.
+    """
+    now = datetime.now(UTC)
+    stmt = select(BookingStateRow).where(
+        BookingStateRow.session_id != exclude_session_id,
+        BookingStateRow.hold_expires_at.is_not(None),
+        BookingStateRow.hold_expires_at > now,
+        BookingStateRow.selected_slot_json.is_not(None),
+    )
+    result = await db.execute(stmt)
+    holds: list[tuple[datetime, datetime]] = []
+    for row in result.scalars():
+        slot = cast("dict[str, object]", row.selected_slot_json)
+        try:
+            holds.append(
+                (
+                    datetime.fromisoformat(str(slot["start_iso"])),
+                    datetime.fromisoformat(str(slot["end_iso"])),
+                )
+            )
+        except (KeyError, ValueError):
+            logger.error(
+                "active_holds: session %s has a malformed selected_slot_json, skipping: %r",
+                row.session_id,
+                slot,
+            )
+    return holds
