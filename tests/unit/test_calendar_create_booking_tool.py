@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -20,7 +21,7 @@ from app.agent.providers.base import ToolCall
 from app.agent.providers.fake import FakeProvider
 from app.booking.state import BookingState, Step
 from app.config import settings
-from app.db.models import Base
+from app.db.models import Base, Booking
 from app.db.session import get_or_create_session, load_booking_state, save_booking_state
 from app.tools.calendar import Attendee, BusyInterval, CalendarError
 from app.tools.context import ToolContext
@@ -257,5 +258,45 @@ async def test_db_write_failure_after_event_creation_deletes_the_orphaned_event(
 
     assert result["error"] == "creation_failed"
     assert calendar.created_events == {}
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.CONFIRMED  # unchanged; visitor can retry
+
+
+async def test_state_write_failure_after_a_successful_booking_row_deletes_the_orphaned_row(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found that create_booking() and
+    save_booking_state() each commit independently -- if create_booking()
+    succeeds but the *second* commit (inside save_booking_state) is what
+    fails, the earlier fix (which only ever monkeypatched create_booking
+    itself to raise) never exercised this case. Without a fix here, the
+    bookings row survives with booking_state stuck at confirmed, and
+    because the state never advanced, a retry could create a *second* real
+    calendar event and a second bookings row for the same session --
+    exactly the "orphaned, invisible to the app" failure mode the
+    compensating delete exists to prevent, just on the DB side instead of
+    the calendar side.
+    """
+    await save_booking_state(db, _confirmed_state())
+    calendar = FakeCalendar()
+    context = _context(db, calendar_client=calendar)
+
+    async def _raise(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("db write failed")
+
+    # Only patched *after* the setup save above, so create_booking() (the
+    # first, independent commit) still runs for real and succeeds -- this
+    # only fails the second commit, the one save_booking_state makes after
+    # create_booking() has already returned.
+    monkeypatch.setattr("app.tools.registry.save_booking_state", _raise)
+
+    result = await execute_tool(_call(), context)
+
+    assert result["error"] == "creation_failed"
+    assert calendar.created_events == {}  # compensating delete_event ran
+
+    bookings = (await db.execute(select(Booking).where(Booking.session_id == SID))).scalars().all()
+    assert bookings == []  # compensating DB delete ran -- no orphaned row survives
+
     state = await load_booking_state(db, SID)
     assert state.step is Step.CONFIRMED  # unchanged; visitor can retry

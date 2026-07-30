@@ -463,6 +463,13 @@ async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dic
             ),
         }
 
+    # create_booking() and save_booking_state() each commit independently
+    # (two separate transactions, not one) — `booking` is tracked outside
+    # the try so the except block below knows whether the *first* commit
+    # already succeeded when only the *second* one fails, and can clean up
+    # accordingly (review finding: treating both as a single atomic unit
+    # missed exactly this case).
+    booking = None
     try:
         booking = await create_booking(
             context.db,
@@ -479,29 +486,50 @@ async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dic
     except Exception:
         # The calendar write above already succeeded — without this, a
         # failure here (a DB outage, a transient error) would leave a real
-        # event on the calendar with no bookings row and no owner
-        # notification, permanently invisible to the app: state stays at
-        # confirmed, so a retry re-runs the free/busy re-check, sees the
-        # orphaned event as busy, and wrongly bounces the visitor into
-        # "that time was just taken by someone else" for a slot they
-        # already got. Best-effort compensating delete closes that window;
-        # if the delete itself also fails, this is logged for manual
-        # reconciliation rather than silently lost.
+        # event on the calendar with no owner notification, permanently
+        # invisible to the app: state stays at confirmed, so a retry
+        # re-runs the free/busy re-check, sees the orphaned event as busy,
+        # and wrongly bounces the visitor into "that time was just taken by
+        # someone else" for a slot they already got. Best-effort
+        # compensating cleanup closes that window; if any of it also fails,
+        # it's logged for manual reconciliation rather than silently lost.
         logger.error(
             "calendar_create_booking: DB write failed after event creation for session %s "
-            "(event_id=%s) — attempting to delete the orphaned event",
+            "(event_id=%s) — attempting cleanup",
             context.session_id,
             event_id,
         )
+        # A failed commit can leave the session's transaction unusable for
+        # further writes (including the compensating booking-row delete
+        # below, and anything app/api/chat.py does with this same session
+        # for the rest of the turn) until it's rolled back.
+        await context.db.rollback()
         try:
             await context.calendar_client.delete_event(event_id)
-        except CalendarError:
+        except Exception:
             logger.error(
                 "calendar_create_booking: failed to delete orphaned event %s for session %s "
                 "— needs manual cleanup",
                 event_id,
                 context.session_id,
             )
+        if booking is not None:
+            # create_booking()'s commit succeeded, so this exception must
+            # have come from transition()/save_booking_state() — the
+            # bookings row is now orphaned (event just deleted above, state
+            # never advanced past confirmed) and, left in place, would let
+            # a retry create a second event and a second bookings row for
+            # the same session.
+            try:
+                await context.db.delete(booking)
+                await context.db.commit()
+            except Exception:
+                logger.error(
+                    "calendar_create_booking: failed to delete orphaned bookings row %s for "
+                    "session %s — needs manual cleanup",
+                    booking.id,
+                    context.session_id,
+                )
         return {
             "error": "creation_failed",
             "message": (
