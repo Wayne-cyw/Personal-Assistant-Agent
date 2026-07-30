@@ -18,7 +18,9 @@ from app.booking.state import BookingState, Step
 from app.config import settings
 from app.db import session as db_session
 from app.db.models import Base
+from app.db.models import BookingState as BookingStateRow
 from app.db.session import (
+    active_holds,
     add_pinned_fact,
     add_token_budget_used,
     advance_summary,
@@ -419,6 +421,138 @@ async def test_save_booking_state_upserts_an_existing_row(
 
     assert loaded.step is Step.CONFIRMED
     assert loaded.contact_name == "Priya"
+
+
+# --- active_holds (Issue #21) -------------------------------------------------
+
+_HELD_SLOT: dict[str, object] = {
+    "slot_id": "s1",
+    "start_iso": "2026-08-03T09:00:00+00:00",
+    "end_iso": "2026-08-03T09:30:00+00:00",
+}
+
+
+async def test_active_holds_returns_another_sessions_unexpired_hold(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    slot = _HELD_SLOT
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-other")
+        await save_booking_state(
+            db,
+            BookingState(
+                session_id="sess-other",
+                step=Step.SLOT_SELECTED,
+                selected_slot_json=slot,
+                hold_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+            ),
+        )
+
+    async with session_factory() as db:
+        holds = await active_holds(db, exclude_session_id="sess-1")
+
+    assert holds == [
+        (datetime(2026, 8, 3, 9, 0, tzinfo=UTC), datetime(2026, 8, 3, 9, 30, tzinfo=UTC))
+    ]
+
+
+async def test_active_holds_excludes_the_callers_own_session(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    slot = _HELD_SLOT
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await save_booking_state(
+            db,
+            BookingState(
+                session_id="sess-1",
+                step=Step.SLOT_SELECTED,
+                selected_slot_json=slot,
+                hold_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+            ),
+        )
+
+    async with session_factory() as db:
+        holds = await active_holds(db, exclude_session_id="sess-1")
+
+    assert holds == []
+
+
+async def test_active_holds_excludes_an_expired_hold(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    slot = _HELD_SLOT
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-other")
+        await save_booking_state(
+            db,
+            BookingState(
+                session_id="sess-other",
+                step=Step.SLOT_SELECTED,
+                selected_slot_json=slot,
+                hold_expires_at=datetime(2020, 1, 1, tzinfo=UTC),  # in the past
+            ),
+        )
+
+    async with session_factory() as db:
+        holds = await active_holds(db, exclude_session_id="sess-1")
+
+    assert holds == []
+
+
+async def test_active_holds_excludes_a_session_with_no_hold(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-other")
+        await save_booking_state(
+            db, BookingState(session_id="sess-other", step=Step.INTENT_DETECTED)
+        )
+
+    async with session_factory() as db:
+        holds = await active_holds(db, exclude_session_id="sess-1")
+
+    assert holds == []
+
+
+async def test_active_holds_skips_a_row_with_a_non_dict_selected_slot_json(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression test: a prior version only caught KeyError/ValueError
+    around the fromisoformat() calls, so a selected_slot_json that isn't
+    even a dict (a list, a bare string, ...) raised TypeError uncaught —
+    failing the whole query for every session, not just skipping the one
+    corrupted row, since this runs on every calendar_find_slots call.
+    """
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-other")
+        await get_or_create_session(db, "sess-good")
+        row = BookingStateRow(
+            session_id="sess-other",
+            step="slot_selected",
+            hold_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+            selected_slot_json=["not", "a", "dict"],
+        )
+        db.add(row)
+        await db.commit()
+        await save_booking_state(
+            db,
+            BookingState(
+                session_id="sess-good",
+                step=Step.SLOT_SELECTED,
+                selected_slot_json=_HELD_SLOT,
+                hold_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+            ),
+        )
+
+    async with session_factory() as db:
+        holds = await active_holds(db, exclude_session_id="sess-1")
+
+    # The corrupted row is skipped, not raised; the well-formed row still
+    # comes back.
+    assert holds == [
+        (datetime(2026, 8, 3, 9, 0, tzinfo=UTC), datetime(2026, 8, 3, 9, 30, tzinfo=UTC))
+    ]
 
 
 def test_no_sync_db_access_outside_session_module() -> None:

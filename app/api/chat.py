@@ -27,6 +27,7 @@ gating, booking guidance) already reflects the new step.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
@@ -54,6 +55,7 @@ from app.booking.state import Event, EventKind, Step, transition
 from app.config import settings
 from app.db.models import SessionRow
 from app.db.session import (
+    active_holds,
     add_token_budget_used,
     append_message,
     get_db,
@@ -137,27 +139,51 @@ def _session_budget_exceeded_message() -> str:
     )
 
 
+async def _slot_is_held_by_another_session(
+    db: AsyncSession, slot: dict[str, object], *, exclude_session_id: str
+) -> bool:
+    """Guards the moment a hold is actually granted (Issue #21 review
+    finding), not just proposal time — active_holds() is also consulted in
+    app/tools/registry.py's calendar_find_slots, but a slot could still be
+    proposed to two sessions before either selects, so the grant itself
+    needs its own re-check.
+    """
+    held = await active_holds(db, exclude_session_id=exclude_session_id)
+    start = datetime.fromisoformat(str(slot["start_iso"]))
+    end = datetime.fromisoformat(str(slot["end_iso"]))
+    return any(held_start < end and held_end > start for held_start, held_end in held)
+
+
+_BOOKING_TOOL_NAMES = ("calendar_find_slots", "provide_contact_info")
+
+
 def _booking_response(
     tool_events: list[ToolEvent],
 ) -> tuple[ResponseType, dict[str, object] | None]:
     """A turn whose tool activity produced a fresh slot proposal maps to
     `type: "booking_proposal"` with the slots in `data` (Issue #20, 4.8's
-    documented shape: `{"slots": [...], "round": N}`). The last matching
-    call wins if calendar_find_slots was somehow invoked more than once in
-    one turn. The negotiation cap's email-fallback result has no dedicated
-    response type in 4.8 — it surfaces as an ordinary "message" reply, with
-    the model's own prose (informed by the tool result's "message" field)
-    explaining it.
+    documented shape: `{"slots": [...], "round": N}`); one that produced a
+    confirmation summary maps to `type: "booking_confirmation_request"`
+    (Issue #21, 4.8's `{"slot", "timezone", "name", "email"}` shape,
+    already built exactly that way by provide_contact_info). Only the most
+    recent booking-tool call in the turn is considered — the negotiation
+    cap's email-fallback result and an invalid-email rejection both have no
+    dedicated response type in 4.8, so they surface as an ordinary
+    "message" reply, with the model's own prose (informed by the tool
+    result's "message" field) explaining it.
     """
     for event in reversed(tool_events):
-        if event.name != "calendar_find_slots":
-            continue
-        if "slots" in event.result:
+        if event.name == "calendar_find_slots" and "slots" in event.result:
             return ResponseType.BOOKING_PROPOSAL, {
                 "slots": event.result["slots"],
                 "round": event.result["round"],
             }
-        break  # most recent calendar_find_slots call was an error/fallback, not a proposal
+        if event.name == "provide_contact_info" and "confirmation_summary" in event.result:
+            summary = event.result["confirmation_summary"]
+            assert isinstance(summary, dict)
+            return ResponseType.BOOKING_CONFIRMATION_REQUEST, summary
+        if event.name in _BOOKING_TOOL_NAMES:
+            break  # most recent booking-tool call was an error/fallback, not a success
     return ResponseType.MESSAGE, None
 
 
@@ -214,13 +240,39 @@ async def chat(
             matched_slot = match_selection(
                 request.message, booking_state.proposed_slots_json or []
             )
-            if matched_slot is not None:
+            if matched_slot is not None and not await _slot_is_held_by_another_session(
+                db, matched_slot, exclude_session_id=request.session_id
+            ):
+                # DB-only soft hold (Issue #21, 4.5) — never written to the
+                # calendar. calendar_find_slots (app/tools/registry.py)
+                # treats other sessions' unexpired holds as busy via
+                # app/db/session.py's active_holds(), but that's only
+                # checked at *proposal* time — two sessions could still be
+                # offered the same slot before either selects it, so this
+                # re-checks right before actually granting the hold too
+                # (review finding: without this, both could reach
+                # slot_selected/confirmed for the identical slot). Still a
+                # narrow, best-effort soft-hold guarantee, not a hard one —
+                # the real guarantee against a genuine double-booking is
+                # Issue #22's free/busy re-check right before the actual
+                # Google Calendar event gets created.
+                hold_expires_at = datetime.now(UTC) + timedelta(minutes=settings.hold_minutes)
                 booking_state = transition(
-                    booking_state, Event(kind=EventKind.SLOT_SELECTED, slot=matched_slot)
+                    booking_state,
+                    Event(
+                        kind=EventKind.SLOT_SELECTED,
+                        slot=matched_slot,
+                        hold_expires_at=hold_expires_at,
+                    ),
                 )
                 await save_booking_state(db, booking_state)
 
-        memory = await load_memory(db, session, booking_timezone=booking_state.timezone_name)
+        memory = await load_memory(
+            db,
+            session,
+            booking_timezone=booking_state.timezone_name,
+            booking_contact_email=booking_state.contact_email,
+        )
         messages = assemble_messages(
             memory,
             SYSTEM_PROMPT,

@@ -82,6 +82,7 @@ class Event:
     timezone: str | None = None
     slots: list[dict[str, object]] | None = None
     slot: dict[str, object] | None = None
+    hold_expires_at: datetime | None = None
     contact_name: str | None = None
     contact_email: str | None = None
 
@@ -215,7 +216,14 @@ def transition(state: BookingState, event: Event) -> BookingState:
             raise InvalidTransition(step, kind)
         if event.slot is None:
             raise ValueError("slot_selected event requires a slot")
-        return replace(state, step=Step.SLOT_SELECTED, selected_slot_json=event.slot)
+        if event.hold_expires_at is None:
+            raise ValueError("slot_selected event requires hold_expires_at")
+        return replace(
+            state,
+            step=Step.SLOT_SELECTED,
+            selected_slot_json=event.slot,
+            hold_expires_at=event.hold_expires_at,
+        )
 
     if kind is EventKind.CONTACT_COLLECTED:
         if step is not Step.SLOT_SELECTED:
@@ -277,6 +285,7 @@ _ALLOWED_TOOLS: dict[Step, tuple[str, ...]] = {
     Step.IDLE: ("calendar_find_slots",),
     Step.INTENT_DETECTED: ("calendar_find_slots",),
     Step.SLOTS_PROPOSED: ("calendar_find_slots",),
+    Step.SLOT_SELECTED: ("provide_contact_info",),
     Step.CONFIRMED: ("calendar_create_booking",),
 }
 

@@ -106,6 +106,19 @@ def _find_slots_call(
     )
 
 
+def _provide_contact_info_call(call_id: str, name: str, email: str) -> LLMResponse:
+    return LLMResponse(
+        text="",
+        tool_calls=[
+            ToolCall(
+                id=call_id, name="provide_contact_info", arguments={"name": name, "email": email}
+            )
+        ],
+        usage=Usage(input_tokens=1, output_tokens=1),
+        finish_reason="tool_calls",
+    )
+
+
 def _use_fake_provider(responses: list[LLMResponse]) -> FakeProvider:
     fake = FakeProvider(responses=responses)
     app.dependency_overrides[get_main_provider] = lambda: fake
@@ -165,6 +178,211 @@ async def test_happy_path_intent_to_slot_selected(
     state_after_selection = await _get_booking_state(engine, "sess-1")
     assert state_after_selection.step is Step.SLOT_SELECTED
     assert state_after_selection.selected_slot_json == slots[1]
+
+
+async def test_happy_path_through_contact_collection_to_confirmed(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Issue #21: valid contact info reaches confirmed with an exact
+    booking_confirmation_request summary in one call — no extra LLM round
+    trip for the mechanical contact_info_collected -> confirmed hop.
+    """
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider(
+        [
+            _find_slots_call("call_1"),
+            _response("Here are some times that work — let me know which suits you."),
+            _response("Great, you're set for that time. What name and email should I use?"),
+            _provide_contact_info_call("call_2", "Priya Patel", "priya@example.com"),
+            _response("Here's a summary — just confirm and I'll lock it in."),
+        ]
+    )
+
+    proposal = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "can we book a call next week?",
+            "timezone": "America/Toronto",
+        },
+    )
+    slots = proposal.json()["data"]["slots"]
+
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+
+    confirmation = await client.post(
+        "/v1/chat",
+        json={"session_id": "sess-1", "message": "Priya Patel, priya@example.com"},
+    )
+    assert confirmation.status_code == 200
+    body = confirmation.json()
+    assert body["type"] == "booking_confirmation_request"
+    assert body["data"] == {
+        "slot": slots[0],
+        "timezone": "America/Toronto",
+        "name": "Priya Patel",
+        "email": "priya@example.com",
+    }
+
+    state = await _get_booking_state(engine, "sess-1")
+    assert state.step is Step.CONFIRMED
+    assert state.contact_name == "Priya Patel"
+    assert state.contact_email == "priya@example.com"
+
+
+async def test_invalid_email_is_rejected_then_corrected_reaches_confirmed(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    await _prime_past_turn_zero(client, "sess-1")
+    _use_fake_provider(
+        [
+            _find_slots_call("call_1"),
+            _response("Here are some times."),
+            _response("Got it — what name and email should I use?"),
+            _provide_contact_info_call("call_2", "Priya Patel", "not-an-email"),
+            _response("That email didn't look right — could you double check it?"),
+            _provide_contact_info_call("call_3", "Priya Patel", "priya@example.com"),
+            _response("Thanks — here's the summary to confirm."),
+        ]
+    )
+
+    await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "can we book a call next week?",
+            "timezone": "America/Toronto",
+        },
+    )
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+
+    rejected = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "Priya Patel, not-an-email"}
+    )
+    assert rejected.json()["type"] == "message"  # no dedicated type for a rejected email
+    state_after_rejection = await _get_booking_state(engine, "sess-1")
+    assert state_after_rejection.step is Step.SLOT_SELECTED  # never advanced
+
+    corrected = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "sorry, it's priya@example.com"}
+    )
+    assert corrected.json()["type"] == "booking_confirmation_request"
+    state_after_correction = await _get_booking_state(engine, "sess-1")
+    assert state_after_correction.step is Step.CONFIRMED
+
+
+async def test_a_held_slot_blocks_a_concurrent_sessions_selection(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (review finding): active_holds() was only consulted
+    at *proposal* time, so two sessions proposed the identical slot before
+    either had selected anything could both go on to select it and both
+    hold it -- the actual moment a hold is granted needs its own re-check,
+    not just the proposal step.
+    """
+    monkeypatch.setattr(
+        registry_module,
+        "get_availability_policy",
+        lambda: AvailabilityPolicy(
+            timezone=TZ,
+            timezone_name="America/Toronto",
+            work_start_day=0,
+            work_end_day=4,
+            work_start_time=datetime(2000, 1, 1, 9, 0).time(),
+            work_end_time=datetime(2000, 1, 1, 9, 30).time(),
+            meeting_length=timedelta(minutes=30),
+            buffer=timedelta(0),
+            min_notice=timedelta(hours=1),
+        ),
+    )
+
+    # Both sessions propose before either selects -- at proposal time,
+    # neither has a hold yet, so both legitimately see the same one slot.
+    await _prime_past_turn_zero(client, "sess-a")
+    _use_fake_provider([_find_slots_call("call_a1"), _response("Here's the only slot.")])
+    proposal_a = await client.post(
+        "/v1/chat",
+        json={"session_id": "sess-a", "message": "book a call", "timezone": "America/Toronto"},
+    )
+    assert len(proposal_a.json()["data"]["slots"]) == 1
+
+    await _prime_past_turn_zero(client, "sess-b")
+    _use_fake_provider([_find_slots_call("call_b1"), _response("Here's the only slot.")])
+    proposal_b = await client.post(
+        "/v1/chat",
+        json={"session_id": "sess-b", "message": "book a call", "timezone": "America/Toronto"},
+    )
+    assert len(proposal_b.json()["data"]["slots"]) == 1
+
+    # Session A selects first -- grants the hold.
+    _use_fake_provider([_response("Locked in for you.")])
+    await client.post("/v1/chat", json={"session_id": "sess-a", "message": "1"})
+    state_a = await _get_booking_state(engine, "sess-a")
+    assert state_a.step is Step.SLOT_SELECTED
+
+    # Session B selects the same (only) slot next -- must be refused the
+    # hold even though its own stored proposal still lists it.
+    _use_fake_provider([_response("Let me check what else is available.")])
+    await client.post("/v1/chat", json={"session_id": "sess-b", "message": "1"})
+    state_b = await _get_booking_state(engine, "sess-b")
+    assert state_b.step is Step.SLOTS_PROPOSED  # never advanced
+    assert state_b.selected_slot_json is None
+
+
+async def test_a_held_slot_blocks_a_concurrent_sessions_proposal(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #21 acceptance criteria: two parallel sessions cannot both be
+    offered the same slot. A narrow one-slot-per-day policy makes the
+    exclusion unambiguous to assert on.
+    """
+    monkeypatch.setattr(
+        registry_module,
+        "get_availability_policy",
+        lambda: AvailabilityPolicy(
+            timezone=TZ,
+            timezone_name="America/Toronto",
+            work_start_day=0,
+            work_end_day=4,
+            work_start_time=datetime(2000, 1, 1, 9, 0).time(),
+            work_end_time=datetime(2000, 1, 1, 9, 30).time(),
+            meeting_length=timedelta(minutes=30),
+            buffer=timedelta(0),
+            min_notice=timedelta(hours=1),
+        ),
+    )
+
+    await _prime_past_turn_zero(client, "sess-a")
+    _use_fake_provider(
+        [
+            _find_slots_call("call_1"),
+            _response("Here's the only slot available."),
+            _response("Locked in for you."),
+        ]
+    )
+    proposal_a = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-a",
+            "message": "book a call",
+            "timezone": "America/Toronto",
+        },
+    )
+    assert len(proposal_a.json()["data"]["slots"]) == 1
+    await client.post("/v1/chat", json={"session_id": "sess-a", "message": "1"})
+
+    await _prime_past_turn_zero(client, "sess-b")
+    _use_fake_provider([_find_slots_call("call_2"), _response("No times work right now.")])
+    proposal_b = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-b",
+            "message": "book a call",
+            "timezone": "America/Toronto",
+        },
+    )
+
+    assert proposal_b.json()["data"]["slots"] == []
 
 
 async def test_repeated_rejection_widens_then_falls_back_to_email(
