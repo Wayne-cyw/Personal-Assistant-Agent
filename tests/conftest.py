@@ -12,6 +12,9 @@ import pytest
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("OWNER_CONTACT_EMAIL", "owner@example.com")
+os.environ.setdefault("GOOGLE_CLIENT_ID", "test-client-id")
+os.environ.setdefault("GOOGLE_CLIENT_SECRET", "test-client-secret")
+os.environ.setdefault("GOOGLE_REFRESH_TOKEN", "test-refresh-token")
 
 
 @pytest.fixture(autouse=True)
@@ -29,3 +32,13 @@ def _reset_session_locks() -> None:
     import app.agent.session_lock as session_lock_module
 
     session_lock_module._locks.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_calendar_health_cache() -> None:
+    """Same event-loop-per-test hazard as _reset_session_locks above, for
+    app/api/health.py's module-global calendar-check cache/lock.
+    """
+    from app.api.health import _reset_calendar_health_cache as reset
+
+    reset()

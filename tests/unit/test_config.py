@@ -28,6 +28,15 @@ def test_missing_owner_contact_email_raises_naming_the_var(monkeypatch: pytest.M
     assert "OWNER_CONTACT_EMAIL" in str(exc_info.value)
 
 
+def test_missing_google_credentials_raise_naming_the_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            _settings(OPENAI_API_KEY="key")
+        assert var in str(exc_info.value)
+        monkeypatch.setenv(var, "restored-for-next-iteration")
+
+
 def test_invalid_llm_provider_value_rejected() -> None:
     with pytest.raises(ValidationError):
         _settings(LLM_PROVIDER="not-a-real-provider", OPENAI_API_KEY="key")
@@ -48,6 +57,7 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.log_level == "INFO"
     assert settings.chat_max_output_tokens == 500
     assert settings.session_token_budget == 50_000
+    assert settings.google_calendar_id == "primary"
 
 
 def test_allowed_origins_parses_comma_separated_string() -> None:
@@ -111,6 +121,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "WEB_CONCURRENCY",
         "CHAT_MAX_OUTPUT_TOKENS",
         "SESSION_TOKEN_BUDGET",
+        "GOOGLE_CALENDAR_ID",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -200,6 +211,10 @@ def test_every_credential_and_model_name_is_env_overridable() -> None:
         CLASSIFIER_MODEL="gpt-5.6-luna-classifier-test",
         SUMMARIZER_MODEL="gpt-5.6-luna-summarizer-test",
         OWNER_CONTACT_EMAIL="owner-test@example.com",
+        GOOGLE_CLIENT_ID="test-client-id-override",
+        GOOGLE_CLIENT_SECRET="test-client-secret-override",
+        GOOGLE_REFRESH_TOKEN="test-refresh-token-override",
+        GOOGLE_CALENDAR_ID="owner@example.com",
     )
 
     assert settings.openai_api_key == "sk-test-arbitrary"
@@ -208,6 +223,10 @@ def test_every_credential_and_model_name_is_env_overridable() -> None:
     assert settings.classifier_model == "gpt-5.6-luna-classifier-test"
     assert settings.summarizer_model == "gpt-5.6-luna-summarizer-test"
     assert settings.owner_contact_email == "owner-test@example.com"
+    assert settings.google_client_id == "test-client-id-override"
+    assert settings.google_client_secret == "test-client-secret-override"
+    assert settings.google_refresh_token == "test-refresh-token-override"
+    assert settings.google_calendar_id == "owner@example.com"
 
 
 def test_log_level_normalized_to_uppercase() -> None:

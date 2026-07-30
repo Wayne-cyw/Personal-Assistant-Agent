@@ -86,6 +86,17 @@ class Settings(BaseSettings):
     # visitor-facing response.
     owner_contact_email: str = Field(alias="OWNER_CONTACT_EMAIL")
 
+    # Google Calendar (Engineering Guide Tech Stack, Issue #17). Required, no
+    # default (same pattern as openai_api_key) — obtained via the one-time
+    # local OAuth flow, scripts/gcal_auth.py; see README's setup section.
+    google_client_id: str = Field(alias="GOOGLE_CLIENT_ID")
+    google_client_secret: str = Field(alias="GOOGLE_CLIENT_SECRET")
+    google_refresh_token: str = Field(alias="GOOGLE_REFRESH_TOKEN")
+    # "primary" is the Google Calendar API's own alias for the account's
+    # default calendar — a sensible non-secret default; override only if the
+    # owner books off a dedicated secondary calendar.
+    google_calendar_id: str = Field(default="primary", alias="GOOGLE_CALENDAR_ID")
+
     # CORS (Engineering Guide 4.8): empty in v1, comma-separated when set.
     # NoDecode stops pydantic-settings from JSON-decoding the raw env string
     # before our validator runs (list-typed fields are decoded as JSON by
