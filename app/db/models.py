@@ -132,6 +132,10 @@ class BookingState(Base):
     excluded_slots_json: Mapped[list[object] | None] = mapped_column(PortableJSON, default=None)
     contact_name: Mapped[str | None] = mapped_column(Text, default=None)
     contact_email: Mapped[str | None] = mapped_column(Text, default=None)
+    # How many times CONFIRMATION_DECLINED has fired (Issue #22 Finding 6) —
+    # see app.booking.state.BookingState's field docstring for why this is
+    # tracked separately from proposal_rounds.
+    confirmation_declines: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )

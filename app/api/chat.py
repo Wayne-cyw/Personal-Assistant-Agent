@@ -283,8 +283,9 @@ async def chat(
         # Deterministic confirmation-reply classification (Issue #22, 4.5:
         # "Only an affirmative reply advances") — never left to the LLM's
         # own judgment, mirroring slot selection above. A clear "no"
-        # re-enters the negotiation immediately (counts as a round, per
-        # CONFIRMATION_DECLINED); "affirmative" only flags the tool as
+        # re-enters the negotiation immediately (counts as a round after
+        # the first free one, per CONFIRMATION_DECLINED); "affirmative"
+        # only flags the tool as
         # legal to call this turn — the actual booking-creation side
         # effects still only ever happen inside calendar_create_booking's
         # own handler. "unclear" (a question, hesitation) leaves both state

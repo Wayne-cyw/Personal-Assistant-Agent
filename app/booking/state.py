@@ -71,8 +71,10 @@ class EventKind(StrEnum):
     # Issue #22: the visitor said "no"/changed their mind at the
     # confirmation step, distinct from SLOT_TAKEN_AT_RECHECK (an
     # availability race, nobody's fault, doesn't consume the negotiation
-    # cap) — a deliberate decline *does* consume a round (task text: "'no'/
-    # change-of-mind -> back to slots_proposed (counts as a round)").
+    # cap) — a deliberate decline consumes a round (task text: "'no'/
+    # change-of-mind -> back to slots_proposed (counts as a round)"), except
+    # the first one in a session, which is free (Finding 6, user-confirmed
+    # design call — see the handler below).
     CONFIRMATION_DECLINED = "confirmation_declined"
     ABANDON = "abandon"
 
@@ -118,6 +120,10 @@ class BookingState:
     # list built only from `proposed_slots_json` only ever sees the single
     # most recent round.
     excluded_slots_json: list[dict[str, object]] | None = None
+    # How many times CONFIRMATION_DECLINED has fired this session (Issue #22
+    # review Finding 6). The first decline is free (doesn't touch
+    # proposal_rounds) — see CONFIRMATION_DECLINED's handler below for why.
+    confirmation_declines: int = 0
 
 
 def _accumulate_excluded(state: BookingState) -> list[dict[str, object]]:
@@ -302,12 +308,21 @@ def transition(state: BookingState, event: Event) -> BookingState:
     if kind is EventKind.CONFIRMATION_DECLINED:
         if step is not Step.CONFIRMED:
             raise InvalidTransition(step, kind)
-        # Unlike SLOT_TAKEN_AT_RECHECK, this *is* the visitor's own choice —
-        # it consumes a round of the negotiation cap (task text: "counts as
-        # a round"), same as a RE_PROPOSE would.
-        return _back_to_slots_proposed_excluding_selected(
-            state, proposal_rounds=state.proposal_rounds + 1
-        )
+        # Unlike SLOT_TAKEN_AT_RECHECK, this *is* the visitor's own choice,
+        # so the task text ("counts as a round") applies -- but not to the
+        # *first* decline in a session (Finding 6, user-confirmed): backing
+        # out right after confirming shouldn't cost the same as a full
+        # reject-at-proposal round, since the visitor already invested
+        # effort reaching confirmed. confirmation_declines tracks how many
+        # times this event has fired so only the second and later declines
+        # increment proposal_rounds, same as a RE_PROPOSE would; without
+        # this counter, every decline would look identical to the first and
+        # the leniency could never expire, letting a session loop
+        # select/confirm/decline indefinitely without ever hitting the cap.
+        first_decline = state.confirmation_declines == 0
+        new_rounds = state.proposal_rounds if first_decline else state.proposal_rounds + 1
+        new_state = _back_to_slots_proposed_excluding_selected(state, proposal_rounds=new_rounds)
+        return replace(new_state, confirmation_declines=state.confirmation_declines + 1)
 
     # Exhaustiveness guard, unreachable while every EventKind is handled above.
     raise AssertionError(f"unhandled event kind: {kind!r}")  # pragma: no cover

@@ -364,6 +364,7 @@ async def test_save_then_load_booking_state_round_trips_every_field(
         contact_name=None,
         contact_email=None,
         excluded_slots_json=[{"slot_id": "s0"}],
+        confirmation_declines=1,
     )
 
     async with session_factory() as db:

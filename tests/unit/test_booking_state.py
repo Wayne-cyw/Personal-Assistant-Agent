@@ -154,7 +154,12 @@ def test_slot_taken_at_recheck_returns_to_slots_proposed_excluding_burned_slot()
     assert result.excluded_slots_json == [{"slot_id": "s2"}]
 
 
-def test_confirmation_declined_returns_to_slots_proposed_excluding_declined_slot() -> None:
+def test_first_confirmation_decline_in_a_session_is_free() -> None:
+    """Finding 6 (user-confirmed design call): the first decline doesn't
+    touch proposal_rounds -- backing out right after confirming shouldn't
+    cost as much as a full reject-at-proposal round, since the visitor
+    already invested effort reaching confirmed.
+    """
     state = _state(
         step=Step.CONFIRMED,
         proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}, {"slot_id": "s3"}],
@@ -165,8 +170,23 @@ def test_confirmation_declined_returns_to_slots_proposed_excluding_declined_slot
     assert result.step is Step.SLOTS_PROPOSED
     assert result.proposed_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
     assert result.selected_slot_json is None
-    assert result.proposal_rounds == 3  # unlike SLOT_TAKEN_AT_RECHECK, this counts as a round
+    assert result.proposal_rounds == 2  # unchanged -- first decline is free
     assert result.excluded_slots_json == [{"slot_id": "s2"}]
+    assert result.confirmation_declines == 1
+
+
+def test_second_confirmation_decline_in_a_session_counts_as_a_round() -> None:
+    state = _state(
+        step=Step.CONFIRMED,
+        proposed_slots_json=[{"slot_id": "s1"}, {"slot_id": "s2"}, {"slot_id": "s3"}],
+        selected_slot_json={"slot_id": "s2"},
+        proposal_rounds=1,
+        confirmation_declines=1,  # already used the free one earlier this session
+    )
+    result = transition(state, Event(kind=EventKind.CONFIRMATION_DECLINED))
+    assert result.step is Step.SLOTS_PROPOSED
+    assert result.proposal_rounds == 2  # second decline -- costs a round, per task text
+    assert result.confirmation_declines == 2
 
 
 def test_confirmation_declined_accumulates_onto_existing_excluded_slots() -> None:

@@ -311,9 +311,11 @@ async def test_happy_path_through_confirmation_to_booking_created(
 async def test_declining_at_confirmation_returns_to_slots_proposed(
     client: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:
-    """Issue #22: a deliberate "no" at confirmed re-enters slots_proposed
-    and consumes a negotiation round — distinct from the race-condition
-    bounce-back, which doesn't.
+    """Issue #22: a deliberate "no" at confirmed re-enters slots_proposed.
+    The first decline in a session is free (Finding 6, user-confirmed
+    design call) and doesn't consume a negotiation round; a second decline
+    does — distinct from the race-condition bounce-back, which never
+    consumes one.
     """
     _use_fake_calendar()
     await _prime_past_turn_zero(client, "sess-1")
@@ -349,9 +351,35 @@ async def test_declining_at_confirmation_returns_to_slots_proposed(
 
     assert declined.status_code == 200
     assert declined.json()["type"] == "message"  # no dedicated response type for a decline
-    state_after = await _get_booking_state(engine, "sess-1")
-    assert state_after.step is Step.SLOTS_PROPOSED
-    assert state_after.proposal_rounds == state_before.proposal_rounds + 1
+    state_after_first_decline = await _get_booking_state(engine, "sess-1")
+    assert state_after_first_decline.step is Step.SLOTS_PROPOSED
+    assert state_after_first_decline.proposal_rounds == state_before.proposal_rounds  # free
+
+    # Select, re-confirm, and decline a second time — this one costs a round.
+    _use_fake_provider(
+        [
+            _response("Great, you're set. What name and email should I use?"),
+            _provide_contact_info_call("call_3", "Priya Patel", "priya@example.com"),
+            _response("Here's a summary — just confirm and I'll lock it in."),
+        ]
+    )
+    await client.post("/v1/chat", json={"session_id": "sess-1", "message": "1"})
+    await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "Priya Patel, priya@example.com"}
+    )
+
+    _use_fake_provider([_response("No problem — let me know if you'd like a different time.")])
+    declined_again = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "no, let's pick a different time"}
+    )
+
+    assert declined_again.status_code == 200
+    state_after_second_decline = await _get_booking_state(engine, "sess-1")
+    assert state_after_second_decline.step is Step.SLOTS_PROPOSED
+    assert (
+        state_after_second_decline.proposal_rounds
+        == state_after_first_decline.proposal_rounds + 1
+    )
 
 
 async def test_slot_taken_between_confirmation_request_and_yes_gracefully_re_proposes(
