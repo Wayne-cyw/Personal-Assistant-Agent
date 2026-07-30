@@ -151,6 +151,7 @@ def test_slot_taken_at_recheck_returns_to_slots_proposed_excluding_burned_slot()
     assert result.proposed_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
     assert result.selected_slot_json is None
     assert result.proposal_rounds == 1  # fresh negotiation cycle, not the visitor's fault
+    assert result.excluded_slots_json == [{"slot_id": "s2"}]
 
 
 def test_confirmation_declined_returns_to_slots_proposed_excluding_declined_slot() -> None:
@@ -165,6 +166,26 @@ def test_confirmation_declined_returns_to_slots_proposed_excluding_declined_slot
     assert result.proposed_slots_json == [{"slot_id": "s1"}, {"slot_id": "s3"}]
     assert result.selected_slot_json is None
     assert result.proposal_rounds == 3  # unlike SLOT_TAKEN_AT_RECHECK, this counts as a round
+    assert result.excluded_slots_json == [{"slot_id": "s2"}]
+
+
+def test_confirmation_declined_accumulates_onto_existing_excluded_slots() -> None:
+    """Regression test: a review pass found the declined slot dropped out
+    of *both* proposed_slots_json and excluded_slots_json at once, so a
+    later re-propose/widen call (which builds its exclude list from
+    exactly those two fields) could legitimately re-offer a slot the
+    visitor already explicitly declined at confirmation.
+    """
+    state = _state(
+        step=Step.CONFIRMED,
+        proposed_slots_json=[{"slot_id": "s2"}],
+        selected_slot_json={"slot_id": "s2"},
+        excluded_slots_json=[{"slot_id": "s1"}],
+        proposal_rounds=1,
+    )
+    result = transition(state, Event(kind=EventKind.CONFIRMATION_DECLINED))
+    assert result.excluded_slots_json == [{"slot_id": "s1"}, {"slot_id": "s2"}]
+    assert result.proposed_slots_json == []
 
 
 def test_confirmation_declined_outside_confirmed_is_illegal() -> None:

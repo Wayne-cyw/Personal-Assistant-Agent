@@ -140,15 +140,31 @@ def _back_to_slots_proposed_excluding_selected(
     still call calendar_find_slots itself (offered again at slots_proposed)
     if none are left. `proposal_rounds` is the only thing that differs
     between the two callers, so it's the caller's job to compute it.
+
+    The burned slot is also folded into excluded_slots_json (review fix):
+    without this, it drops out of both proposed_slots_json *and*
+    excluded_slots_json at once, so a later re-propose/widen call — which
+    builds its exclude list from exactly those two fields — could
+    legitimately re-offer it. Harmless-but-redundant for
+    SLOT_TAKEN_AT_RECHECK (the slot is genuinely busy, so generate_slots'
+    own free/busy check would filter it out anyway); load-bearing for
+    CONFIRMATION_DECLINED, where the slot is still free and nothing else
+    would otherwise stop it from being re-offered right back to the
+    visitor who just said no to it.
     """
-    burned_id = (state.selected_slot_json or {}).get("slot_id")
+    burned = state.selected_slot_json
+    burned_id = (burned or {}).get("slot_id")
     remaining = [s for s in (state.proposed_slots_json or []) if s.get("slot_id") != burned_id]
+    excluded = list(state.excluded_slots_json or [])
+    if burned is not None:
+        excluded.append(burned)
     return replace(
         state,
         step=Step.SLOTS_PROPOSED,
         proposed_slots_json=remaining,
         selected_slot_json=None,
         proposal_rounds=proposal_rounds,
+        excluded_slots_json=excluded,
     )
 
 
