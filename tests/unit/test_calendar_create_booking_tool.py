@@ -300,3 +300,47 @@ async def test_state_write_failure_after_a_successful_booking_row_deletes_the_or
 
     state = await load_booking_state(db, SID)
     assert state.step is Step.CONFIRMED  # unchanged; visitor can retry
+
+
+async def test_a_failed_compensating_delete_also_rolls_back(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found the compensating booking-row
+    delete/commit (added for the fix above) had no rollback of its own if
+    *it* also failed -- e.g. the same outage that caused the original
+    save_booking_state failure hasn't cleared yet. Without a rollback there
+    too, the session's transaction is left unresolved for the rest of the
+    request (on Postgres in particular, an aborted transaction rejects all
+    further statements until rolled back), breaking whatever
+    app/api/chat.py does next with this same session. Spies on
+    db.rollback() to prove it's called for *both* failures -- the original
+    one and the compensating-delete one -- not just the first.
+    """
+    await save_booking_state(db, _confirmed_state())
+    calendar = FakeCalendar()
+    context = _context(db, calendar_client=calendar)
+
+    async def _raise_save(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("db write failed")
+
+    monkeypatch.setattr("app.tools.registry.save_booking_state", _raise_save)
+
+    async def _raise_delete(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("delete failed")
+
+    monkeypatch.setattr(db, "delete", _raise_delete)
+
+    real_rollback = db.rollback
+    rollback_calls = 0
+
+    async def _spy_rollback() -> None:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        await real_rollback()
+
+    monkeypatch.setattr(db, "rollback", _spy_rollback)
+
+    result = await execute_tool(_call(), context)
+
+    assert result["error"] == "creation_failed"
+    assert rollback_calls == 2

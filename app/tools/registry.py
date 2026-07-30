@@ -464,12 +464,18 @@ async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dic
         }
 
     # create_booking() and save_booking_state() each commit independently
-    # (two separate transactions, not one) — `booking` is tracked outside
-    # the try so the except block below knows whether the *first* commit
-    # already succeeded when only the *second* one fails, and can clean up
-    # accordingly (review finding: treating both as a single atomic unit
-    # missed exactly this case).
+    # (two separate transactions, not one) — `booking`/`booking_id` are
+    # tracked outside the try so the except block below knows whether the
+    # *first* commit already succeeded when only the *second* one fails,
+    # and can clean up accordingly (review finding: treating both as a
+    # single atomic unit missed exactly this case). `booking_id` is
+    # captured as a plain int the moment it's available, separately from
+    # the ORM object: a rollback anywhere in the except block expires
+    # `booking`'s attributes, and logging `booking.id` after that would
+    # silently trigger a fresh (and, in an outage, likely also-failing)
+    # DB round trip just to format a log message.
     booking = None
+    booking_id: int | None = None
     try:
         booking = await create_booking(
             context.db,
@@ -481,6 +487,7 @@ async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dic
             contact_email=state.contact_email,
             gcal_event_id=event_id,
         )
+        booking_id = booking.id
         new_state = transition(state, Event(kind=EventKind.CREATED))
         await save_booking_state(context.db, new_state)
     except Exception:
@@ -524,10 +531,15 @@ async def _calendar_create_booking(args: BaseModel, context: ToolContext) -> dic
                 await context.db.delete(booking)
                 await context.db.commit()
             except Exception:
+                # Same reasoning as the rollback above: leaving this
+                # session's transaction unresolved would break every
+                # subsequent write this request makes with it (e.g.
+                # app/api/chat.py persisting this turn's messages).
+                await context.db.rollback()
                 logger.error(
                     "calendar_create_booking: failed to delete orphaned bookings row %s for "
                     "session %s — needs manual cleanup",
-                    booking.id,
+                    booking_id,
                     context.session_id,
                 )
         return {
