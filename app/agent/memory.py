@@ -204,6 +204,7 @@ async def persist_turn(
     tool_events: list[ToolEvent],
     *,
     user_already_persisted: bool = False,
+    response_type: str | None = None,
 ) -> bool:
     """Append the turn to the messages log and run the eviction check.
     Returns True if the window has crossed WINDOW_HIGH_TOKENS and eviction
@@ -216,6 +217,11 @@ async def persist_turn(
     even a provider failure, so app/api/chat.py appends it eagerly before
     calling the provider at all, rather than only here after a successful
     reply.
+
+    `response_type` (Issue #20) is written onto the assistant row's
+    `response_type` column (`messages.response_type`, Engineering Guide
+    4.7/4.8) — e.g. "booking_proposal" — for the DB log, independent of
+    what's kept in the LLM context window.
     """
     if not user_already_persisted:
         await append_message(db, session_id, "user", user_message)
@@ -230,7 +236,7 @@ async def persist_turn(
             tool_name=event.name,
             tool_payload=event.result,
         )
-    await append_message(db, session_id, "assistant", assistant_reply)
+    await append_message(db, session_id, "assistant", assistant_reply, response_type=response_type)
 
     session = await db.get(SessionRow, session_id)
     assert session is not None, f"persist_turn called for unknown session_id={session_id!r}"

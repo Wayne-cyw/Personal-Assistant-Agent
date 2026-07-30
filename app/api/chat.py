@@ -2,9 +2,10 @@
 
 Walking skeleton (Issue #5), real system prompt (Issue #8), turn-zero prefix
 (Issue #9), real orchestration loop with tool-call execution (Issue #10),
-and the full conversation memory system (Issue #11): a deterministic,
-zero-LLM-token intro on a brand-new session, then the memory-assembled
-context (pinned profile + summary + token-budgeted window + current
+the full conversation memory system (Issue #11), and the booking flow's
+intent/proposal/selection half (Issue #20): a deterministic, zero-LLM-token
+intro on a brand-new session, then the memory-assembled context (pinned
+profile + summary + token-budgeted window + booking guidance + current
 message) run through the tool-calling agent loop on every later turn. Turn
 processing is serialized per session_id (4.3's concurrency guard). No
 classifier (#25) yet — that upgrades this handler in a later issue without
@@ -16,6 +17,11 @@ except turn zero itself — turn zero spends zero LLM tokens by design, so a
 tool call is structurally impossible there, and the regex extractor remains
 the only option for that one turn (see `_maybe_capture_visitor_info_turn_
 zero`).
+
+Slot selection is matched deterministically in code (app/booking/selection.py),
+*before* the agent loop runs, not inferred by the LLM (4.5) — a match fires
+the slot_selected transition immediately, so the rest of the turn (tool
+gating, booking guidance) already reflects the new step.
 """
 
 from __future__ import annotations
@@ -30,18 +36,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.intro import INTRO_MESSAGE
 from app.agent.loop import run_agent
 from app.agent.memory import (
+    ToolEvent,
     assemble_messages,
     load_memory,
     persist_turn,
     run_eviction,
     run_reconciliation,
 )
-from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.prompts import SYSTEM_PROMPT, render_booking_guidance
 from app.agent.providers import get_provider
 from app.agent.providers.base import LLMProvider
 from app.agent.session_lock import session_turn_lock
 from app.agent.tokens import effective_tokens
 from app.agent.visitor_info import extract_linkedin_url, extract_name
+from app.booking.selection import match_selection
+from app.booking.state import Event, EventKind, Step, transition
 from app.config import settings
 from app.db.models import SessionRow
 from app.db.session import (
@@ -49,9 +58,12 @@ from app.db.session import (
     append_message,
     get_db,
     get_or_create_session,
+    load_booking_state,
     recent_messages,
+    save_booking_state,
     set_visitor_info,
 )
+from app.tools.calendar import CalendarClient, get_calendar_client
 from app.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -93,6 +105,14 @@ def get_summarizer_provider() -> LLMProvider:
     return get_provider("summarizer")
 
 
+def get_chat_calendar_client() -> CalendarClient:
+    """FastAPI dependency wrapping get_calendar_client() — mirrors
+    app/api/health.py's get_health_calendar_client (Issue #17), overridable
+    in tests with a FakeCalendar.
+    """
+    return get_calendar_client()
+
+
 async def _maybe_capture_visitor_info_turn_zero(
     db: AsyncSession, session: SessionRow, message: str
 ) -> None:
@@ -117,6 +137,30 @@ def _session_budget_exceeded_message() -> str:
     )
 
 
+def _booking_response(
+    tool_events: list[ToolEvent],
+) -> tuple[ResponseType, dict[str, object] | None]:
+    """A turn whose tool activity produced a fresh slot proposal maps to
+    `type: "booking_proposal"` with the slots in `data` (Issue #20, 4.8's
+    documented shape: `{"slots": [...], "round": N}`). The last matching
+    call wins if calendar_find_slots was somehow invoked more than once in
+    one turn. The negotiation cap's email-fallback result has no dedicated
+    response type in 4.8 — it surfaces as an ordinary "message" reply, with
+    the model's own prose (informed by the tool result's "message" field)
+    explaining it.
+    """
+    for event in reversed(tool_events):
+        if event.name != "calendar_find_slots":
+            continue
+        if "slots" in event.result:
+            return ResponseType.BOOKING_PROPOSAL, {
+                "slots": event.result["slots"],
+                "round": event.result["round"],
+            }
+        break  # most recent calendar_find_slots call was an error/fallback, not a proposal
+    return ResponseType.MESSAGE, None
+
+
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -125,6 +169,7 @@ async def chat(
     db: AsyncSession = Depends(get_db),
     provider: LLMProvider = Depends(get_main_provider),
     summarizer_provider: LLMProvider = Depends(get_summarizer_provider),
+    calendar_client: CalendarClient = Depends(get_chat_calendar_client),
 ) -> ChatResponse:
     # Read by the logging middleware (Issue #6) after this handler returns.
     http_request.state.session_id = request.session_id
@@ -156,8 +201,32 @@ async def chat(
             await append_message(db, request.session_id, "assistant", reply_text)
             return ChatResponse(reply=reply_text, type=ResponseType.MESSAGE, data=None)
 
-        memory = await load_memory(db, session)
-        messages = assemble_messages(memory, SYSTEM_PROMPT, request.message)
+        # Deterministic slot selection (4.5): the visitor's raw reply is
+        # matched against the stored proposal list in code, *before* the
+        # agent loop runs — never inferred by the LLM. A match fires
+        # slot_selected immediately, so tool gating and booking guidance
+        # below already reflect the new step for this same turn. No match
+        # leaves state untouched; the booking guidance for slots_proposed
+        # tells the model to ask for clarification, which doesn't consume a
+        # negotiation round (only a real calendar_find_slots call does).
+        booking_state = await load_booking_state(db, request.session_id)
+        if booking_state.step is Step.SLOTS_PROPOSED:
+            matched_slot = match_selection(
+                request.message, booking_state.proposed_slots_json or []
+            )
+            if matched_slot is not None:
+                booking_state = transition(
+                    booking_state, Event(kind=EventKind.SLOT_SELECTED, slot=matched_slot)
+                )
+                await save_booking_state(db, booking_state)
+
+        memory = await load_memory(db, session, booking_timezone=booking_state.timezone_name)
+        messages = assemble_messages(
+            memory,
+            SYSTEM_PROMPT,
+            request.message,
+            booking_guidance=render_booking_guidance(booking_state.step),
+        )
 
         # The user's message is persisted before the provider call, per
         # 4.3's "the DB log is complete" invariant — even a message that
@@ -166,7 +235,11 @@ async def chat(
         await append_message(db, request.session_id, "user", request.message)
 
         tool_context = ToolContext(
-            db=db, session_id=request.session_id, summarizer_provider=summarizer_provider
+            db=db,
+            session_id=request.session_id,
+            summarizer_provider=summarizer_provider,
+            calendar_client=calendar_client,
+            caller_timezone=request.timezone,
         )
         # CHAT_MAX_OUTPUT_TOKENS is the tighter, chat-reply-specific cap
         # (pairs with #8's brevity rule); MAX_TOKENS_PER_TURN remains the
@@ -193,6 +266,8 @@ async def chat(
             ),
         )
 
+        response_type, response_data = _booking_response(result.tool_events)
+
         needs_eviction = await persist_turn(
             db,
             request.session_id,
@@ -200,6 +275,7 @@ async def chat(
             result.text,
             result.tool_events,
             user_already_persisted=True,
+            response_type=response_type.value,
         )
         if needs_eviction:
             background_tasks.add_task(run_eviction, request.session_id, summarizer_provider)
@@ -217,4 +293,4 @@ async def chat(
                 detail=explanation,
             )
 
-        return ChatResponse(reply=result.text, type=ResponseType.MESSAGE, data=None)
+        return ChatResponse(reply=result.text, type=response_type, data=response_data)
