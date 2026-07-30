@@ -18,6 +18,7 @@ dependencies = [
   "google-api-python-client",
   "google-auth",
   "google-auth-oauthlib",
+  "tzdata",
 ]
 
 [project.optional-dependencies]
