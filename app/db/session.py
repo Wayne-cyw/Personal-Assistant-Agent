@@ -23,8 +23,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.booking.state import BookingState
+from app.booking.state import Step as BookingStep
 from app.config import settings
 from app.db.models import Base, Message, SessionRow
+from app.db.models import BookingState as BookingStateRow
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -334,4 +337,66 @@ async def overwrite_summary_content(
     if row is None:
         raise ValueError(f"overwrite_summary_content called for unknown session_id={session_id!r}")
     row.summary_json = summary_json
+    await db.commit()
+
+
+async def load_booking_state(db: AsyncSession, session_id: str) -> BookingState:
+    """Load the booking state machine's state for `session_id` (Issue
+    #18). No row yet (the common case — most sessions never book) returns
+    a fresh, unpersisted default (step=idle) rather than raising; the row
+    only starts existing once save_booking_state is first called for this
+    session.
+    """
+    row = await db.get(BookingStateRow, session_id)
+    if row is None:
+        return BookingState(session_id=session_id)
+    return BookingState(
+        session_id=row.session_id,
+        step=BookingStep(row.step),
+        timezone_name=row.timezone_name,
+        proposed_slots_json=cast(list[dict[str, object]] | None, row.proposed_slots_json),
+        selected_slot_json=row.selected_slot_json,
+        hold_expires_at=_reattach_utc(row.hold_expires_at),
+        proposal_rounds=row.proposal_rounds,
+        contact_name=row.contact_name,
+        contact_email=row.contact_email,
+    )
+
+
+def _reattach_utc(value: datetime | None) -> datetime | None:
+    """SQLite has no native timezone-aware storage — a tz-aware datetime
+    written via save_booking_state (the ORM's before_insert/before_update
+    guard in app/db/models.py rejects writing a naive one, so it's always
+    UTC going in) comes back naive on a plain reload, on this dialect only
+    (4.7 rule 2's documented SQLite quirk). Silently reattaching UTC here
+    matters more for hold_expires_at than most datetime fields in this
+    codebase: it's the one field a future soft-hold expiry check
+    (app/booking/holds.py, Issue #21) will compare against
+    datetime.now(UTC) — comparing aware to naive raises TypeError, and
+    that comparison would work on Postgres (TIMESTAMPTZ preserves tzinfo)
+    while silently breaking in SQLite dev/test, exactly the dialect-parity
+    trap 4.7 warns about.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+async def save_booking_state(db: AsyncSession, state: BookingState) -> None:
+    """Persist `state` (Issue #18) — insert-or-update, since a session's
+    booking_states row may not exist yet the first time the flow starts.
+    """
+    row = await db.get(BookingStateRow, state.session_id)
+    if row is None:
+        row = BookingStateRow(session_id=state.session_id, step=state.step.value)
+        db.add(row)
+    else:
+        row.step = state.step.value
+    row.timezone_name = state.timezone_name
+    row.proposed_slots_json = cast("list[object] | None", state.proposed_slots_json)
+    row.selected_slot_json = state.selected_slot_json
+    row.hold_expires_at = state.hold_expires_at
+    row.proposal_rounds = state.proposal_rounds
+    row.contact_name = state.contact_name
+    row.contact_email = state.contact_email
     await db.commit()
