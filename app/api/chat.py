@@ -50,6 +50,7 @@ from app.agent.providers.base import LLMProvider
 from app.agent.session_lock import session_turn_lock
 from app.agent.tokens import effective_tokens
 from app.agent.visitor_info import extract_linkedin_url, extract_name
+from app.booking.confirmation import classify_confirmation_reply
 from app.booking.selection import match_selection
 from app.booking.state import Event, EventKind, Step, transition
 from app.config import settings
@@ -65,6 +66,7 @@ from app.db.session import (
     save_booking_state,
     set_visitor_info,
 )
+from app.notify import get_notifier
 from app.tools.calendar import CalendarClient, get_calendar_client
 from app.tools.context import ToolContext
 
@@ -154,7 +156,7 @@ async def _slot_is_held_by_another_session(
     return any(held_start < end and held_end > start for held_start, held_end in held)
 
 
-_BOOKING_TOOL_NAMES = ("calendar_find_slots", "provide_contact_info")
+_BOOKING_TOOL_NAMES = ("calendar_find_slots", "provide_contact_info", "calendar_create_booking")
 
 
 def _booking_response(
@@ -165,12 +167,16 @@ def _booking_response(
     documented shape: `{"slots": [...], "round": N}`); one that produced a
     confirmation summary maps to `type: "booking_confirmation_request"`
     (Issue #21, 4.8's `{"slot", "timezone", "name", "email"}` shape,
-    already built exactly that way by provide_contact_info). Only the most
-    recent booking-tool call in the turn is considered — the negotiation
-    cap's email-fallback result and an invalid-email rejection both have no
-    dedicated response type in 4.8, so they surface as an ordinary
-    "message" reply, with the model's own prose (informed by the tool
-    result's "message" field) explaining it.
+    already built exactly that way by provide_contact_info); one that
+    actually created the event maps to `type: "booking_confirmed"` (Issue
+    #22, 4.8's `{"booking_id", "slot", "timezone", "next_steps"}` shape,
+    already built exactly that way by calendar_create_booking). Only the
+    most recent booking-tool call in the turn is considered — the
+    negotiation cap's email-fallback result, an invalid-email rejection,
+    and a slot-taken-at-recheck bounce-back all have no dedicated response
+    type in 4.8, so they surface as an ordinary "message" reply, with the
+    model's own prose (informed by the tool result's "message" field)
+    explaining it.
     """
     for event in reversed(tool_events):
         if event.name == "calendar_find_slots" and "slots" in event.result:
@@ -182,6 +188,13 @@ def _booking_response(
             summary = event.result["confirmation_summary"]
             assert isinstance(summary, dict)
             return ResponseType.BOOKING_CONFIRMATION_REQUEST, summary
+        if event.name == "calendar_create_booking" and "booking_id" in event.result:
+            return ResponseType.BOOKING_CONFIRMED, {
+                "booking_id": event.result["booking_id"],
+                "slot": event.result["slot"],
+                "timezone": event.result["timezone"],
+                "next_steps": event.result["next_steps"],
+            }
         if event.name in _BOOKING_TOOL_NAMES:
             break  # most recent booking-tool call was an error/fallback, not a success
     return ResponseType.MESSAGE, None
@@ -267,6 +280,27 @@ async def chat(
                 )
                 await save_booking_state(db, booking_state)
 
+        # Deterministic confirmation-reply classification (Issue #22, 4.5:
+        # "Only an affirmative reply advances") — never left to the LLM's
+        # own judgment, mirroring slot selection above. A clear "no"
+        # re-enters the negotiation immediately (counts as a round, per
+        # CONFIRMATION_DECLINED); "affirmative" only flags the tool as
+        # legal to call this turn — the actual booking-creation side
+        # effects still only ever happen inside calendar_create_booking's
+        # own handler. "unclear" (a question, hesitation) leaves both state
+        # and the flag untouched, so the model just answers and keeps
+        # waiting, per the confirmed-step guidance below.
+        confirmation_is_affirmative = False
+        if booking_state.step is Step.CONFIRMED:
+            classification = classify_confirmation_reply(request.message)
+            if classification == "negative":
+                booking_state = transition(
+                    booking_state, Event(kind=EventKind.CONFIRMATION_DECLINED)
+                )
+                await save_booking_state(db, booking_state)
+            elif classification == "affirmative":
+                confirmation_is_affirmative = True
+
         memory = await load_memory(
             db,
             session,
@@ -292,6 +326,7 @@ async def chat(
             summarizer_provider=summarizer_provider,
             calendar_client=calendar_client,
             caller_timezone=request.timezone,
+            confirmation_is_affirmative=confirmation_is_affirmative,
         )
         # CHAT_MAX_OUTPUT_TOKENS is the tighter, chat-reply-specific cap
         # (pairs with #8's brevity rule); MAX_TOKENS_PER_TURN remains the
@@ -344,5 +379,13 @@ async def chat(
                 trigger="model_detected",
                 detail=explanation,
             )
+
+        # calendar_create_booking (app/tools/registry.py) only records
+        # intent on tool_context during the loop above too — same rationale
+        # as reconciliation: a notification failure must never affect this
+        # turn's reply, and the booking it's reporting on is already
+        # durably persisted regardless (Issue #22).
+        for subject, body in tool_context.pending_owner_notifications:
+            background_tasks.add_task(get_notifier().notify, subject, body)
 
         return ChatResponse(reply=result.text, type=response_type, data=response_data)
