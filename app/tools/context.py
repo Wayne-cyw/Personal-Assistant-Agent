@@ -35,6 +35,23 @@ class ToolContext:
     # "I'm in EST" in v1). None until the visitor's client sends it; the
     # booking flow's own guidance asks for it while it's still missing.
     caller_timezone: str | None = None
+    # The visitor's IP address, from the request (app/api/chat.py's
+    # http_request.client.host — same source the logging middleware
+    # already uses). calendar_find_slots (Issue #23) uses this for the
+    # per-IP booking-attempt rate limit; None if unavailable (e.g. no
+    # client info on the request), in which case only the per-session cap
+    # applies. Unlike Issue #24's general message rate limits, this
+    # doesn't honor X-Forwarded-For — that's explicitly deferred to #24's
+    # "trusted host proxy" handling, not duplicated here.
+    #
+    # Known interim gap (review finding, user-confirmed acceptable for
+    # now): behind a reverse proxy (Render/Railway/Fly.io, per the Tech
+    # Stack), `client.host` is typically the proxy's own address, not the
+    # visitor's real IP — every visitor could share one bucket, or the cap
+    # could be a no-op, depending on the platform's proxy behavior, until
+    # #24 adds real client-IP resolution. The per-session cap is
+    # unaffected either way (it never depends on IP).
+    caller_ip: str | None = None
     # flag_summary_conflict (app/tools/registry.py) appends the model's
     # explanation here instead of running reconciliation synchronously —
     # reload_and_reconcile makes a real summarizer LLM call, and 4.3's

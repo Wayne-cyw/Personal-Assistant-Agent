@@ -2,7 +2,7 @@ import asyncio
 import subprocess
 import time
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import (
 from app.booking.state import BookingState, Step
 from app.config import settings
 from app.db import session as db_session
-from app.db.models import Base
+from app.db.models import Base, SessionRow
 from app.db.models import BookingState as BookingStateRow
 from app.db.session import (
     active_holds,
@@ -25,7 +25,9 @@ from app.db.session import (
     add_token_budget_used,
     advance_summary,
     append_message,
+    check_and_increment_rate_limit,
     create_booking,
+    flag_session,
     get_engine,
     get_or_create_session,
     load_booking_state,
@@ -632,6 +634,95 @@ async def test_create_booking_survives_a_refresh_failure_after_a_successful_comm
 
     assert booking.id is not None
     assert booking.session_id == "sess-1"
+
+
+# --- check_and_increment_rate_limit / flag_session (Issue #23) ----------------
+
+
+async def test_check_and_increment_rate_limit_allows_up_to_the_limit_then_blocks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        assert await check_and_increment_rate_limit(db, "book:sess:s1", limit=3, window=None)
+        assert await check_and_increment_rate_limit(db, "book:sess:s1", limit=3, window=None)
+        assert await check_and_increment_rate_limit(db, "book:sess:s1", limit=3, window=None)
+        assert not await check_and_increment_rate_limit(db, "book:sess:s1", limit=3, window=None)
+        # Still blocked, not just once -- a repeated attempt after the cap
+        # is reached must keep being refused, not reset or slip through.
+        assert not await check_and_increment_rate_limit(db, "book:sess:s1", limit=3, window=None)
+
+
+async def test_check_and_increment_rate_limit_is_per_key(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        assert await check_and_increment_rate_limit(db, "book:sess:s1", limit=1, window=None)
+        assert not await check_and_increment_rate_limit(db, "book:sess:s1", limit=1, window=None)
+        # A different key (e.g. a different session, or the per-IP
+        # counter) has its own independent count.
+        assert await check_and_increment_rate_limit(db, "book:sess:s2", limit=1, window=None)
+
+
+async def test_check_and_increment_rate_limit_resets_after_the_window_elapses(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-IP-per-day cap (unlike the lifetime per-session cap) rolls
+    over -- simulated here by monkeypatching datetime.now via the module's
+    own `datetime` reference, since the function computes "now" internally.
+    """
+    calls = 0
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:  # type: ignore[override]
+            # Deliberately returns a plain datetime, not a _FrozenDatetime
+            # instance (which mypy's override check technically wants,
+            # since the real datetime.now returns Self) -- the return
+            # value here is bound directly as a SQL parameter inside
+            # check_and_increment_rate_limit, and sqlite3's default
+            # adapter can't serialize an arbitrary datetime *subclass*,
+            # only the exact base type. Returning cls(...) would satisfy
+            # mypy but break the query with a ProgrammingError instead.
+            nonlocal calls
+            calls += 1
+            # First call (the initial increment) uses the real time; the
+            # second call (the check after the simulated day has passed)
+            # is shifted forward by 25 hours, past the 24h window.
+            base = datetime(2026, 1, 1, tzinfo=UTC)
+            return base if calls == 1 else base + timedelta(hours=25)
+
+    monkeypatch.setattr(db_session, "datetime", _FrozenDatetime)
+
+    async with session_factory() as db:
+        assert await check_and_increment_rate_limit(
+            db, "book:ip:1.2.3.4", limit=1, window=timedelta(days=1)
+        )
+        # Within the same window, the cap (1) is already used up.
+        # (Not asserted here directly -- the next call exercises the
+        # window having elapsed instead, which is the behavior under test.)
+        assert await check_and_increment_rate_limit(
+            db, "book:ip:1.2.3.4", limit=1, window=timedelta(days=1)
+        )
+
+
+async def test_flag_session_sets_the_flag(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await get_or_create_session(db, "sess-1")
+        await flag_session(db, "sess-1")
+
+    async with session_factory() as db:
+        row = await db.get(SessionRow, "sess-1")
+        assert row is not None
+        assert row.flagged is True
+
+
+async def test_flag_session_on_an_unknown_session_id_is_a_no_op(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as db:
+        await flag_session(db, "does-not-exist")  # must not raise
 
 
 def test_no_sync_db_access_outside_session_module() -> None:

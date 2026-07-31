@@ -141,6 +141,13 @@ def _session_budget_exceeded_message() -> str:
     )
 
 
+def _booking_rate_limited_message() -> str:
+    return (
+        "This conversation has reached its limit on booking attempts — email the owner "
+        f"directly at {settings.owner_contact_email} to schedule a call."
+    )
+
+
 async def _slot_is_held_by_another_session(
     db: AsyncSession, slot: dict[str, object], *, exclude_session_id: str
 ) -> bool:
@@ -161,7 +168,7 @@ _BOOKING_TOOL_NAMES = ("calendar_find_slots", "provide_contact_info", "calendar_
 
 def _booking_response(
     tool_events: list[ToolEvent],
-) -> tuple[ResponseType, dict[str, object] | None]:
+) -> tuple[ResponseType, dict[str, object] | None, str | None]:
     """A turn whose tool activity produced a fresh slot proposal maps to
     `type: "booking_proposal"` with the slots in `data` (Issue #20, 4.8's
     documented shape: `{"slots": [...], "round": N}`); one that produced a
@@ -170,34 +177,49 @@ def _booking_response(
     already built exactly that way by provide_contact_info); one that
     actually created the event maps to `type: "booking_confirmed"` (Issue
     #22, 4.8's `{"booking_id", "slot", "timezone", "next_steps"}` shape,
-    already built exactly that way by calendar_create_booking). Only the
-    most recent booking-tool call in the turn is considered — the
-    negotiation cap's email-fallback result, an invalid-email rejection,
-    and a slot-taken-at-recheck bounce-back all have no dedicated response
-    type in 4.8, so they surface as an ordinary "message" reply, with the
-    model's own prose (informed by the tool result's "message" field)
-    explaining it.
+    already built exactly that way by calendar_create_booking). A
+    calendar_find_slots call that tripped the booking-attempt rate limit
+    (Issue #23) maps to `type: "refusal"` — the third return value is a
+    fixed, deterministic reply text (matching
+    _session_budget_exceeded_message()'s pattern) that overrides whatever
+    prose the model produced, since this is a hard "no more booking
+    attempts" cutoff rather than an ordinary retryable hiccup and
+    shouldn't be left to the model to paraphrase (or be talked out of by
+    the visitor). Every other case's third value is None, meaning "use the
+    model's own reply text unchanged." Only the most recent booking-tool
+    call in the turn is considered — the negotiation cap's email-fallback
+    result, an invalid-email rejection, and a slot-taken-at-recheck
+    bounce-back all have no dedicated response type in 4.8, so they
+    surface as an ordinary "message" reply, with the model's own prose
+    (informed by the tool result's "message" field) explaining it.
     """
     for event in reversed(tool_events):
+        if event.name == "calendar_find_slots" and event.result.get("rate_limited"):
+            return ResponseType.REFUSAL, None, _booking_rate_limited_message()
         if event.name == "calendar_find_slots" and "slots" in event.result:
-            return ResponseType.BOOKING_PROPOSAL, {
-                "slots": event.result["slots"],
-                "round": event.result["round"],
-            }
+            return (
+                ResponseType.BOOKING_PROPOSAL,
+                {"slots": event.result["slots"], "round": event.result["round"]},
+                None,
+            )
         if event.name == "provide_contact_info" and "confirmation_summary" in event.result:
             summary = event.result["confirmation_summary"]
             assert isinstance(summary, dict)
-            return ResponseType.BOOKING_CONFIRMATION_REQUEST, summary
+            return ResponseType.BOOKING_CONFIRMATION_REQUEST, summary, None
         if event.name == "calendar_create_booking" and "booking_id" in event.result:
-            return ResponseType.BOOKING_CONFIRMED, {
-                "booking_id": event.result["booking_id"],
-                "slot": event.result["slot"],
-                "timezone": event.result["timezone"],
-                "next_steps": event.result["next_steps"],
-            }
+            return (
+                ResponseType.BOOKING_CONFIRMED,
+                {
+                    "booking_id": event.result["booking_id"],
+                    "slot": event.result["slot"],
+                    "timezone": event.result["timezone"],
+                    "next_steps": event.result["next_steps"],
+                },
+                None,
+            )
         if event.name in _BOOKING_TOOL_NAMES:
             break  # most recent booking-tool call was an error/fallback, not a success
-    return ResponseType.MESSAGE, None
+    return ResponseType.MESSAGE, None, None
 
 
 @router.post("/v1/chat", response_model=ChatResponse)
@@ -327,6 +349,7 @@ async def chat(
             summarizer_provider=summarizer_provider,
             calendar_client=calendar_client,
             caller_timezone=request.timezone,
+            caller_ip=http_request.client.host if http_request.client else None,
             confirmation_is_affirmative=confirmation_is_affirmative,
         )
         # CHAT_MAX_OUTPUT_TOKENS is the tighter, chat-reply-specific cap
@@ -354,13 +377,14 @@ async def chat(
             ),
         )
 
-        response_type, response_data = _booking_response(result.tool_events)
+        response_type, response_data, reply_override = _booking_response(result.tool_events)
+        reply_text = reply_override if reply_override is not None else result.text
 
         needs_eviction = await persist_turn(
             db,
             request.session_id,
             request.message,
-            result.text,
+            reply_text,
             result.tool_events,
             user_already_persisted=True,
             response_type=response_type.value,
@@ -389,4 +413,4 @@ async def chat(
         for subject, body in tool_context.pending_owner_notifications:
             background_tasks.add_task(get_notifier().notify, subject, body)
 
-        return ChatResponse(reply=result.text, type=response_type, data=response_data)
+        return ChatResponse(reply=reply_text, type=response_type, data=response_data)

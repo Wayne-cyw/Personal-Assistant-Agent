@@ -23,8 +23,10 @@ from app.agent.providers.base import ToolCall
 from app.agent.providers.fake import FakeProvider
 from app.booking.slots import AvailabilityPolicy, AvailabilityPolicyError
 from app.booking.state import BookingState, Step, allowed_tools_for
-from app.db.models import Base
+from app.config import settings
+from app.db.models import Base, SessionRow
 from app.db.session import get_or_create_session, load_booking_state, save_booking_state
+from app.tools.calendar import CalendarError
 from app.tools.context import ToolContext
 from app.tools.fake_calendar import FakeCalendar
 from app.tools.registry import execute_tool, tool_defs_for_step
@@ -87,7 +89,10 @@ async def db(engine: AsyncEngine) -> AsyncGenerator[AsyncSession]:
 
 
 def _new_context(
-    db: AsyncSession, *, caller_timezone: str | None = "America/Toronto"
+    db: AsyncSession,
+    *,
+    caller_timezone: str | None = "America/Toronto",
+    caller_ip: str | None = None,
 ) -> ToolContext:
     """One ToolContext per simulated turn — app/api/chat.py constructs a
     fresh ToolContext per HTTP request, and calendar_find_slots_used_this_
@@ -103,6 +108,7 @@ def _new_context(
         summarizer_provider=FakeProvider(responses=[]),
         calendar_client=FakeCalendar(),
         caller_timezone=caller_timezone,
+        caller_ip=caller_ip,
     )
 
 
@@ -434,3 +440,286 @@ async def test_handler_refuses_when_state_has_moved_past_reachable_steps(
     assert "error" in result
     state = await load_booking_state(context.db, SID)
     assert state.step is Step.CONFIRMED  # unchanged
+
+
+# --- booking-specific rate limits (Issue #23) ---------------------------------
+
+
+async def test_a_call_that_only_asks_for_the_timezone_does_not_consume_an_attempt(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found the rate-limit check originally
+    ran before the timezone-required early return, so a visitor who simply
+    hadn't sent their timezone yet -- an ordinary, spec-anticipated case,
+    not abuse -- burned one of their limited attempts just asking for it.
+    The check now runs after the timezone/policy guards, right before the
+    call's real work, so it's the negotiation flow's own legitimate call
+    count (initial proposal, re-propose, widen, one more call that lands
+    on email fallback -- 4, exactly BOOKING_ATTEMPTS_PER_SESSION's
+    default) that's actually being counted.
+    """
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 4)
+
+    ask = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_timezone=None),
+    )
+    assert ask["error"] == "timezone_required"
+
+    # All 4 of a full legitimate negotiation's real calls still succeed --
+    # none of the cap was spent on the timezone-ask call above.
+    for _ in range(3):
+        result = await execute_tool(
+            _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+        )
+        assert "rate_limited" not in result
+    fourth = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert fourth["fallback"] is True  # negotiation cap's own conclusion, not a rate limit
+
+
+async def test_session_cap_allows_up_to_the_limit_then_refuses(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 2)
+
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "rate_limited" not in first
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "rate_limited" not in second
+
+    third = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+
+    assert third["rate_limited"] is True
+    assert settings.owner_contact_email in str(third["message"])
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.ABANDONED  # there was an in-progress flow to abandon
+    row = await db.get(SessionRow, SID)
+    assert row is not None
+    assert row.flagged is True
+
+
+async def test_session_blocked_only_by_a_shared_ip_is_not_flagged(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session whose *own* attempts never exceeded its own cap, but
+    which gets refused because another session already exhausted their
+    shared IP's daily quota, is an innocent bystander -- not evidence of
+    this session being suspicious (review finding: flagging every
+    IP-capped session would false-positive on shared office/NAT IPs once
+    flagged sessions start driving owner notifications, Issues #16/#27).
+    Only a session whose own per-session cap trips gets flagged (see
+    test_session_cap_allows_up_to_the_limit_then_refuses above).
+
+    The rate-limit check runs after intent_detected/timezone_captured
+    already fired for this call (it only guards the call's real work, not
+    the bookkeeping that happens on the way there -- see the handler's own
+    comment), so by the time it's evaluated there's already a real,
+    abandon-able in-progress flow, even on this session's very first call.
+    """
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 1)
+    monkeypatch.setattr(settings, "booking_attempts_per_ip_per_day", 1)
+
+    # Burn the shared IP's daily cap from a different session first.
+    await get_or_create_session(db, "sess-other")
+    other_context = ToolContext(
+        db=db,
+        session_id="sess-other",
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=FakeCalendar(),
+        caller_timezone="America/Toronto",
+        caller_ip="1.2.3.4",
+    )
+    burned = await execute_tool(
+        ToolCall(
+            id="call_1",
+            name="calendar_find_slots",
+            arguments={"date_from": "2026-08-03", "date_to": "2026-08-03"},
+        ),
+        other_context,
+    )
+    assert "rate_limited" not in burned
+
+    result = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_ip="1.2.3.4"),
+    )
+
+    assert result["rate_limited"] is True
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.ABANDONED  # a real flow had already started this call
+    row = await db.get(SessionRow, SID)
+    assert row is not None
+    assert row.flagged is False  # this session's own cap was never exceeded
+
+
+async def test_ip_cap_is_shared_across_sessions_from_the_same_ip(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_ip_per_day", 1)
+
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_ip="9.9.9.9"),
+    )
+    assert "rate_limited" not in first
+
+    await get_or_create_session(db, "sess-2")
+    second_context = ToolContext(
+        db=db,
+        session_id="sess-2",
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=FakeCalendar(),
+        caller_timezone="America/Toronto",
+        caller_ip="9.9.9.9",
+    )
+    second = await execute_tool(
+        ToolCall(
+            id="call_1",
+            name="calendar_find_slots",
+            arguments={"date_from": "2026-08-03", "date_to": "2026-08-03"},
+        ),
+        second_context,
+    )
+
+    assert second["rate_limited"] is True
+
+
+async def test_no_caller_ip_skips_the_ip_cap(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """caller_ip is None whenever the request has no client info (Issue
+    #23) -- the per-IP cap simply doesn't apply then, rather than blocking
+    or erroring; only the per-session cap is checked.
+    """
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_ip_per_day", 1)
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 2)
+
+    for _ in range(2):
+        result = await execute_tool(
+            _call(date_from="2026-08-03", date_to="2026-08-03"),
+            _new_context(db, caller_ip=None),
+        )
+        assert "rate_limited" not in result
+
+
+async def test_calendar_failure_after_the_rate_limit_check_still_persists_state(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found the rate-limit check's
+    increment (already committed by this point) is followed by a real
+    calendar_client.get_free_busy() call inside generate_slots that can
+    raise CalendarError -- without a try/except around it, that exception
+    would propagate past every save_booking_state call in this function,
+    silently discarding this call's own state.py progress (idle ->
+    intent_detected, timezone_captured) even though the rate-limit
+    increment itself was never undone. This doesn't refund the attempt
+    (accepted trade-off, see the handler's own comment) but does verify
+    the in-memory state progress this call made isn't lost on top of that.
+    """
+    _configure_policy(monkeypatch, _policy())
+    failing_calendar = FakeCalendar(fail_with=CalendarError("boom"))
+    context = ToolContext(
+        db=db,
+        session_id=SID,
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=failing_calendar,
+        caller_timezone="America/Toronto",
+    )
+
+    result = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+
+    assert "error" in result
+    assert "rate_limited" not in result
+    state = await load_booking_state(db, SID)
+    # The failure happened after timezone_captured already fired in-memory
+    # this same call -- that progress must survive the calendar failure.
+    assert state.step is Step.INTENT_DETECTED
+    assert state.timezone_name == "America/Toronto"
+
+
+async def test_a_malformed_timezone_also_still_persists_state(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass on the fix above found it only
+    caught CalendarError, but generate_slots also constructs a ZoneInfo
+    from the caller-supplied timezone_name -- which is never
+    format-validated before reaching here (ChatRequest.timezone has no
+    validator, TIMEZONE_CAPTURED only checks truthiness) -- and raises
+    ZoneInfoNotFoundError, not CalendarError, on a malformed value. That
+    trigger is fully caller-controlled (no real Calendar outage needed)
+    and would have kept silently discarding this call's own progress if
+    the except clause weren't broadened.
+    """
+    _configure_policy(monkeypatch, _policy())
+    context = ToolContext(
+        db=db,
+        session_id=SID,
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=FakeCalendar(),
+        caller_timezone="Not/ARealZone",
+    )
+
+    result = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+
+    assert "error" in result
+    assert "rate_limited" not in result
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.INTENT_DETECTED
+    assert state.timezone_name == "Not/ARealZone"
+
+
+async def test_an_extreme_date_to_reaching_the_widen_round_degrades_gracefully(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found resolve_window/widen_window sat
+    outside the try/except that degrades gracefully with a booking-
+    specific message. widen_window does unchecked date arithmetic on a
+    caller-supplied date_to with no upper bound and raises OverflowError
+    given a value near datetime.MAXYEAR -- fully caller-controlled, no
+    real Calendar outage needed, and reached only on the widen round (the
+    3rd call). execute_tool's own generic outer catch-all already turns
+    any uncaught handler exception into *some* structured error (so this
+    was never a crash), but without wrapping resolve_window/widen_window,
+    the visitor would get that generic, non-actionable "calendar_find_
+    slots failed to execute." fallback instead of this function's own
+    specific "offer to have the owner follow up by email" message -- the
+    same distinction save_booking_state's own placement doesn't actually
+    add anything for *this* particular trigger, since round 1/2's own
+    progress was already durably persisted by their own successful calls
+    before the widen round ever runs.
+    """
+    _configure_policy(monkeypatch, _policy())
+
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "error" not in first
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "error" not in second
+
+    third = await execute_tool(
+        _call(date_from="2026-08-03", date_to="9999-12-30"), _new_context(db)
+    )
+
+    assert third["error"] == (
+        "Something went wrong checking availability — offer to have the owner follow up by "
+        "email instead."
+    )
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.SLOTS_PROPOSED  # round 1/2 progress, already persisted
+    assert state.proposal_rounds == 2

@@ -60,6 +60,8 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.google_calendar_id == "primary"
     assert settings.hold_minutes == 10
     assert settings.owner_notify_webhook_url is None
+    assert settings.booking_attempts_per_session == 4
+    assert settings.booking_attempts_per_ip_per_day == 10
 
 
 def test_allowed_origins_parses_comma_separated_string() -> None:
@@ -126,6 +128,8 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "GOOGLE_CALENDAR_ID",
         "HOLD_MINUTES",
         "OWNER_NOTIFY_WEBHOOK_URL",
+        "BOOKING_ATTEMPTS_PER_SESSION",
+        "BOOKING_ATTEMPTS_PER_IP_PER_DAY",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -147,6 +151,8 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.session_token_budget == 50_000
     assert settings.hold_minutes == 10
     assert settings.owner_notify_webhook_url is None
+    assert settings.booking_attempts_per_session == 4
+    assert settings.booking_attempts_per_ip_per_day == 10
 
 
 def test_web_concurrency_parses_numeric_env_var() -> None:
@@ -197,6 +203,21 @@ def test_owner_notify_webhook_url_overridable() -> None:
         OPENAI_API_KEY="key", OWNER_NOTIFY_WEBHOOK_URL="https://example.com/hook"
     )
     assert settings.owner_notify_webhook_url == "https://example.com/hook"
+
+
+def test_booking_attempt_caps_overridable_and_zero_or_negative_rejected() -> None:
+    settings = _settings(
+        OPENAI_API_KEY="key",
+        BOOKING_ATTEMPTS_PER_SESSION="5",
+        BOOKING_ATTEMPTS_PER_IP_PER_DAY="20",
+    )
+    assert settings.booking_attempts_per_session == 5
+    assert settings.booking_attempts_per_ip_per_day == 20
+
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", BOOKING_ATTEMPTS_PER_SESSION="0")
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", BOOKING_ATTEMPTS_PER_IP_PER_DAY="0")
 
 
 def test_max_tokens_per_turn_too_low_for_summarizer_rejected() -> None:

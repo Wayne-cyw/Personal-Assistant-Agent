@@ -200,7 +200,7 @@ def transition(state: BookingState, event: Event) -> BookingState:
         # not on idle, and semantically there is no in-progress booking to
         # abandon from idle (nothing has started yet). Also excludes the
         # two terminals, which have nothing left to abandon either.
-        if step in (Step.IDLE, Step.BOOKING_CREATED, Step.ABANDONED):
+        if not can_abandon(step):
             raise InvalidTransition(step, kind)
         return replace(state, step=Step.ABANDONED)
 
@@ -354,6 +354,17 @@ _ALLOWED_TOOLS: dict[Step, tuple[str, ...]] = {
 
 def allowed_tools_for(step: Step) -> list[str]:
     return list(_ALLOWED_TOOLS.get(step, ()))
+
+
+# The exact condition transition()'s ABANDON branch below guards on,
+# exported so callers that need to decide *before* calling transition()
+# whether an ABANDON would even be legal (Issue #23's rate-limit handler:
+# it wants to abandon an in-progress flow but leave a session with no
+# flow yet alone) can ask this instead of duplicating the tuple — a
+# duplicated copy would silently drift out of sync if this condition ever
+# changed here without the copy being updated too.
+def can_abandon(step: Step) -> bool:
+    return step not in (Step.IDLE, Step.BOOKING_CREATED, Step.ABANDONED)
 
 
 def next_proposal_event(state: BookingState) -> EventKind:
