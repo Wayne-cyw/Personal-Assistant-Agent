@@ -23,7 +23,8 @@ from app.agent.providers.base import ToolCall
 from app.agent.providers.fake import FakeProvider
 from app.booking.slots import AvailabilityPolicy, AvailabilityPolicyError
 from app.booking.state import BookingState, Step, allowed_tools_for
-from app.db.models import Base
+from app.config import settings
+from app.db.models import Base, SessionRow
 from app.db.session import get_or_create_session, load_booking_state, save_booking_state
 from app.tools.context import ToolContext
 from app.tools.fake_calendar import FakeCalendar
@@ -87,7 +88,10 @@ async def db(engine: AsyncEngine) -> AsyncGenerator[AsyncSession]:
 
 
 def _new_context(
-    db: AsyncSession, *, caller_timezone: str | None = "America/Toronto"
+    db: AsyncSession,
+    *,
+    caller_timezone: str | None = "America/Toronto",
+    caller_ip: str | None = None,
 ) -> ToolContext:
     """One ToolContext per simulated turn — app/api/chat.py constructs a
     fresh ToolContext per HTTP request, and calendar_find_slots_used_this_
@@ -103,6 +107,7 @@ def _new_context(
         summarizer_provider=FakeProvider(responses=[]),
         calendar_client=FakeCalendar(),
         caller_timezone=caller_timezone,
+        caller_ip=caller_ip,
     )
 
 
@@ -434,3 +439,130 @@ async def test_handler_refuses_when_state_has_moved_past_reachable_steps(
     assert "error" in result
     state = await load_booking_state(context.db, SID)
     assert state.step is Step.CONFIRMED  # unchanged
+
+
+# --- booking-specific rate limits (Issue #23) ---------------------------------
+
+
+async def test_session_cap_allows_up_to_the_limit_then_refuses(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 2)
+
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "rate_limited" not in first
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "rate_limited" not in second
+
+    third = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+
+    assert third["rate_limited"] is True
+    assert settings.owner_contact_email in str(third["message"])
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.ABANDONED  # there was an in-progress flow to abandon
+    row = await db.get(SessionRow, SID)
+    assert row is not None
+    assert row.flagged is True
+
+
+async def test_session_cap_refusal_from_idle_leaves_state_at_idle(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the very first calendar_find_slots call for a session is
+    already rate-limited (only possible via the per-IP cap -- see the test
+    below), there's no in-progress flow to abandon (ABANDON is illegal
+    from idle, app/booking/state.py). Unlike the "there was a flow"
+    case above, state should stay at idle -- the rate limiter itself, not
+    the FSM step, is what keeps blocking this session's future attempts.
+    """
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 1)
+    monkeypatch.setattr(settings, "booking_attempts_per_ip_per_day", 1)
+
+    # Burn the shared IP's daily cap from a different session first.
+    await get_or_create_session(db, "sess-other")
+    other_context = ToolContext(
+        db=db,
+        session_id="sess-other",
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=FakeCalendar(),
+        caller_timezone="America/Toronto",
+        caller_ip="1.2.3.4",
+    )
+    burned = await execute_tool(
+        ToolCall(
+            id="call_1",
+            name="calendar_find_slots",
+            arguments={"date_from": "2026-08-03", "date_to": "2026-08-03"},
+        ),
+        other_context,
+    )
+    assert "rate_limited" not in burned
+
+    result = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_ip="1.2.3.4"),
+    )
+
+    assert result["rate_limited"] is True
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.IDLE  # nothing to abandon
+
+
+async def test_ip_cap_is_shared_across_sessions_from_the_same_ip(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_ip_per_day", 1)
+
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_ip="9.9.9.9"),
+    )
+    assert "rate_limited" not in first
+
+    await get_or_create_session(db, "sess-2")
+    second_context = ToolContext(
+        db=db,
+        session_id="sess-2",
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=FakeCalendar(),
+        caller_timezone="America/Toronto",
+        caller_ip="9.9.9.9",
+    )
+    second = await execute_tool(
+        ToolCall(
+            id="call_1",
+            name="calendar_find_slots",
+            arguments={"date_from": "2026-08-03", "date_to": "2026-08-03"},
+        ),
+        second_context,
+    )
+
+    assert second["rate_limited"] is True
+
+
+async def test_no_caller_ip_skips_the_ip_cap(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """caller_ip is None whenever the request has no client info (Issue
+    #23) -- the per-IP cap simply doesn't apply then, rather than blocking
+    or erroring; only the per-session cap is checked.
+    """
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_ip_per_day", 1)
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 2)
+
+    for _ in range(2):
+        result = await execute_tool(
+            _call(date_from="2026-08-03", date_to="2026-08-03"),
+            _new_context(db, caller_ip=None),
+        )
+        assert "rate_limited" not in result
