@@ -319,14 +319,41 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
             for s in already_offered
         )
 
-    slots = await generate_slots(
-        context.calendar_client,
-        resolved,
-        policy,
-        timezone_name,
-        now=datetime.now(UTC),
-        exclude=exclude,
-    )
+    try:
+        slots = await generate_slots(
+            context.calendar_client,
+            resolved,
+            policy,
+            timezone_name,
+            now=datetime.now(UTC),
+            exclude=exclude,
+        )
+    except CalendarError:
+        # The rate-limit increment above has already committed by this
+        # point (review finding) — a transient Google Calendar failure
+        # here still costs the visitor one of their limited attempts, a
+        # known, accepted trade-off (refunding it would need a decrement
+        # primitive and reintroduce exactly the check-then-write race the
+        # atomic upsert exists to avoid for the per-IP counter, shared
+        # across sessions that aren't otherwise serialized against each
+        # other). What *is* fixed here: without this except block, this
+        # exception would propagate past every save_booking_state call in
+        # this function, silently discarding whatever state.py transitions
+        # already happened earlier in this same call (idle -> intent_
+        # detected, timezone_captured) — persisting them (this session's
+        # honest progress toward its own cap, not the calendar failure)
+        # before degrading gracefully, same pattern as the
+        # AvailabilityPolicyError case above.
+        logger.error(
+            "calendar_find_slots: get_free_busy failed for session %s", context.session_id
+        )
+        await save_booking_state(context.db, state)
+        return {
+            "error": (
+                "Something went wrong checking availability — offer to have the owner follow "
+                "up by email instead."
+            )
+        }
     slot_dicts = [slot.model_dump() for slot in slots]
     state = transition(state, Event(kind=event_kind, slots=slot_dicts))
     await save_booking_state(context.db, state)

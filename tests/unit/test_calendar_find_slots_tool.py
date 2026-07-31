@@ -26,6 +26,7 @@ from app.booking.state import BookingState, Step, allowed_tools_for
 from app.config import settings
 from app.db.models import Base, SessionRow
 from app.db.session import get_or_create_session, load_booking_state, save_booking_state
+from app.tools.calendar import CalendarError
 from app.tools.context import ToolContext
 from app.tools.fake_calendar import FakeCalendar
 from app.tools.registry import execute_tool, tool_defs_for_step
@@ -612,3 +613,38 @@ async def test_no_caller_ip_skips_the_ip_cap(
             _new_context(db, caller_ip=None),
         )
         assert "rate_limited" not in result
+
+
+async def test_calendar_failure_after_the_rate_limit_check_still_persists_state(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found the rate-limit check's
+    increment (already committed by this point) is followed by a real
+    calendar_client.get_free_busy() call inside generate_slots that can
+    raise CalendarError -- without a try/except around it, that exception
+    would propagate past every save_booking_state call in this function,
+    silently discarding this call's own state.py progress (idle ->
+    intent_detected, timezone_captured) even though the rate-limit
+    increment itself was never undone. This doesn't refund the attempt
+    (accepted trade-off, see the handler's own comment) but does verify
+    the in-memory state progress this call made isn't lost on top of that.
+    """
+    _configure_policy(monkeypatch, _policy())
+    failing_calendar = FakeCalendar(fail_with=CalendarError("boom"))
+    context = ToolContext(
+        db=db,
+        session_id=SID,
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=failing_calendar,
+        caller_timezone="America/Toronto",
+    )
+
+    result = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+
+    assert "error" in result
+    assert "rate_limited" not in result
+    state = await load_booking_state(db, SID)
+    # The failure happened after timezone_captured already fired in-memory
+    # this same call -- that progress must survive the calendar failure.
+    assert state.step is Step.INTENT_DETECTED
+    assert state.timezone_name == "America/Toronto"
