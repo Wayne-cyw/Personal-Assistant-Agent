@@ -679,3 +679,47 @@ async def test_a_malformed_timezone_also_still_persists_state(
     state = await load_booking_state(db, SID)
     assert state.step is Step.INTENT_DETECTED
     assert state.timezone_name == "Not/ARealZone"
+
+
+async def test_an_extreme_date_to_reaching_the_widen_round_degrades_gracefully(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found resolve_window/widen_window sat
+    outside the try/except that degrades gracefully with a booking-
+    specific message. widen_window does unchecked date arithmetic on a
+    caller-supplied date_to with no upper bound and raises OverflowError
+    given a value near datetime.MAXYEAR -- fully caller-controlled, no
+    real Calendar outage needed, and reached only on the widen round (the
+    3rd call). execute_tool's own generic outer catch-all already turns
+    any uncaught handler exception into *some* structured error (so this
+    was never a crash), but without wrapping resolve_window/widen_window,
+    the visitor would get that generic, non-actionable "calendar_find_
+    slots failed to execute." fallback instead of this function's own
+    specific "offer to have the owner follow up by email" message -- the
+    same distinction save_booking_state's own placement doesn't actually
+    add anything for *this* particular trigger, since round 1/2's own
+    progress was already durably persisted by their own successful calls
+    before the widen round ever runs.
+    """
+    _configure_policy(monkeypatch, _policy())
+
+    first = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "error" not in first
+    second = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert "error" not in second
+
+    third = await execute_tool(
+        _call(date_from="2026-08-03", date_to="9999-12-30"), _new_context(db)
+    )
+
+    assert third["error"] == (
+        "Something went wrong checking availability — offer to have the owner follow up by "
+        "email instead."
+    )
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.SLOTS_PROPOSED  # round 1/2 progress, already persisted
+    assert state.proposal_rounds == 2

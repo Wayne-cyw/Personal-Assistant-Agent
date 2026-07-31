@@ -287,39 +287,41 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
             ),
         }
 
-    resolved = resolve_window(args, policy)
-    if event_kind is EventKind.WIDEN_WINDOW:
-        resolved = widen_window(resolved)
-
-    # Other sessions' unexpired soft holds (Issue #21) are additional busy
-    # time on every call, first round included — two visitors must never
-    # both be offered the same slot, not just re-proposals.
-    exclude: list[tuple[datetime, datetime]] = list(
-        await active_holds(context.db, exclude_session_id=context.session_id)
-    )
-
-    # Re-proposing or widening also excludes everything offered and
-    # rejected across the *whole* negotiation so far, not just the
-    # immediately preceding round — state.excluded_slots_json (the
-    # accumulator) plus the current round's own proposed_slots_json, which
-    # is about to be superseded and folded into that same accumulator by
-    # transition() below. Without the accumulator half, a round-3 widened
-    # window could re-offer a round-1 slot the visitor already rejected
-    # twice, since RE_PROPOSE/WIDEN_WINDOW both *replace* proposed_slots_json
-    # each round rather than growing it.
-    if event_kind in (EventKind.RE_PROPOSE, EventKind.WIDEN_WINDOW):
-        already_offered = list(state.excluded_slots_json or []) + list(
-            state.proposed_slots_json or []
-        )
-        exclude.extend(
-            (
-                datetime.fromisoformat(str(s["start_iso"])),
-                datetime.fromisoformat(str(s["end_iso"])),
-            )
-            for s in already_offered
-        )
-
     try:
+        resolved = resolve_window(args, policy)
+        if event_kind is EventKind.WIDEN_WINDOW:
+            resolved = widen_window(resolved)
+
+        # Other sessions' unexpired soft holds (Issue #21) are additional
+        # busy time on every call, first round included — two visitors
+        # must never both be offered the same slot, not just
+        # re-proposals.
+        exclude: list[tuple[datetime, datetime]] = list(
+            await active_holds(context.db, exclude_session_id=context.session_id)
+        )
+
+        # Re-proposing or widening also excludes everything offered and
+        # rejected across the *whole* negotiation so far, not just the
+        # immediately preceding round — state.excluded_slots_json (the
+        # accumulator) plus the current round's own proposed_slots_json,
+        # which is about to be superseded and folded into that same
+        # accumulator by transition() below. Without the accumulator
+        # half, a round-3 widened window could re-offer a round-1 slot
+        # the visitor already rejected twice, since RE_PROPOSE/
+        # WIDEN_WINDOW both *replace* proposed_slots_json each round
+        # rather than growing it.
+        if event_kind in (EventKind.RE_PROPOSE, EventKind.WIDEN_WINDOW):
+            already_offered = list(state.excluded_slots_json or []) + list(
+                state.proposed_slots_json or []
+            )
+            exclude.extend(
+                (
+                    datetime.fromisoformat(str(s["start_iso"])),
+                    datetime.fromisoformat(str(s["end_iso"])),
+                )
+                for s in already_offered
+            )
+
         slots = await generate_slots(
             context.calendar_client,
             resolved,
@@ -336,22 +338,26 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
         # exactly the check-then-write race the atomic upsert exists to
         # avoid for the per-IP counter, shared across sessions that aren't
         # otherwise serialized against each other). What *is* fixed here:
-        # without this except block, an exception here would propagate
-        # past every save_booking_state call in this function, silently
-        # discarding whatever state.py transitions already happened
-        # earlier in this same call (idle -> intent_detected, timezone_
-        # captured) — persisting them (this session's honest progress
-        # toward its own cap, not the failure) before degrading
-        # gracefully, same pattern as the AvailabilityPolicyError case
-        # above. Deliberately broad (not just CalendarError, the review
-        # finding's original trigger): generate_slots also constructs a
-        # ZoneInfo from the caller-supplied timezone_name, which is never
-        # format-validated before reaching here (ChatRequest.timezone has
-        # no validator, TIMEZONE_CAPTURED only checks truthiness) and
-        # raises ZoneInfoNotFoundError, not CalendarError, on a malformed
-        # value — narrowing this to CalendarError would have left that
-        # trigger (fully caller-controlled, no real Calendar outage
-        # needed) still silently discarding progress.
+        # without this except block, an exception anywhere in this real-
+        # work block would propagate past every save_booking_state call
+        # in this function, silently discarding whatever state.py
+        # transitions already happened earlier in this same call (idle ->
+        # intent_detected, timezone_captured) — persisting them (this
+        # session's honest progress toward its own cap, not the failure)
+        # before degrading gracefully, same pattern as the
+        # AvailabilityPolicyError case above. Deliberately broad (not
+        # just CalendarError, the original trigger this block was written
+        # for) and deliberately wraps resolve_window/widen_window too
+        # (review finding): generate_slots constructs a ZoneInfo from the
+        # caller-supplied timezone_name, which is never format-validated
+        # before reaching here and raises ZoneInfoNotFoundError, not
+        # CalendarError, on a malformed value; widen_window does
+        # unchecked date arithmetic on a caller-supplied date_to with no
+        # upper bound, and can raise OverflowError given a value near
+        # datetime.MAXYEAR. Both are fully caller-controlled triggers, no
+        # real Calendar outage needed, and both would otherwise silently
+        # discard progress and repeatedly burn rate-limited attempts on a
+        # retry that hits the identical failure every time.
         logger.error(
             "calendar_find_slots: failed to generate slots for session %s", context.session_id
         )
