@@ -33,6 +33,7 @@ from app.booking.state import (
     EventKind,
     Step,
     allowed_tools_for,
+    can_abandon,
     next_proposal_event,
     transition,
 )
@@ -170,50 +171,6 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
 
     state = await load_booking_state(context.db, context.session_id)
 
-    # Booking-specific rate limits (Issue #23, PRD: "booking abuse is
-    # costlier than Q&A abuse" — stricter and separate from #24's general
-    # chat-message limits). Each calendar_find_slots call is one "booking
-    # attempt," whether it's a flow's first entry or a re-propose/widen
-    # within an ongoing negotiation (the negotiation cap already bounds
-    # legitimate reuse within one flow to a handful of calls; this guards
-    # against abuse across many flows/turns instead). Checked before any
-    # FSM progression below, so a rate-limited call never advances
-    # intent_detected/timezone_captured on its way to being refused.
-    session_allowed = await check_and_increment_rate_limit(
-        context.db,
-        f"book:sess:{context.session_id}",
-        limit=settings.booking_attempts_per_session,
-        window=None,
-    )
-    ip_allowed = True
-    if context.caller_ip is not None:
-        ip_allowed = await check_and_increment_rate_limit(
-            context.db,
-            f"book:ip:{context.caller_ip}",
-            limit=settings.booking_attempts_per_ip_per_day,
-            window=timedelta(days=1),
-        )
-    if not session_allowed or not ip_allowed:
-        # "state -> abandoned" (issue text) only applies once there's an
-        # actual in-progress flow to abandon. From idle -- possible only
-        # on this session's very first attempt, blocked because it shares
-        # an already-exhausted IP with other sessions -- there's nothing
-        # to abandon, and the rate limiter itself (not the FSM step) is
-        # what keeps blocking this session's future attempts regardless
-        # of step, so leaving state at idle is still correctly locked out.
-        if state.step not in (Step.IDLE, Step.BOOKING_CREATED, Step.ABANDONED):
-            state = transition(state, Event(kind=EventKind.ABANDON))
-        await save_booking_state(context.db, state)
-        await flag_session(context.db, context.session_id)
-        return {
-            "rate_limited": True,
-            "message": (
-                "The visitor has exceeded the limit on booking attempts for this "
-                "conversation. Do not call calendar_find_slots again -- tell them to email "
-                f"{settings.owner_contact_email} directly to schedule a call."
-            ),
-        }
-
     if state.step is Step.IDLE:
         state = transition(state, Event(kind=EventKind.INTENT_DETECTED))
 
@@ -255,6 +212,66 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
                 "Availability isn't configured yet — offer to have the owner follow up by "
                 "email instead."
             )
+        }
+
+    # Booking-specific rate limits (Issue #23, PRD: "booking abuse is
+    # costlier than Q&A abuse" — stricter and separate from #24's general
+    # chat-message limits). Checked here — after the timezone/policy
+    # guards above, right before the call actually does its real work
+    # (compute a proposal, re-propose, widen, or land on email fallback) —
+    # not earlier: a call that only asked for a missing timezone, or that
+    # bounced off a step mismatch or an unconfigured availability policy,
+    # never produced a real proposal and shouldn't burn one of the
+    # visitor's limited attempts (review finding: checking any earlier
+    # meant a visitor who simply hadn't sent their timezone yet could be
+    # rate-limited and flagged before ever getting a real proposal, and
+    # the negotiation flow's own legitimate proposal/re-propose/widen/
+    # fallback call count — 4, the default this cap is tuned to — no
+    # longer matched what was actually being counted).
+    session_allowed = await check_and_increment_rate_limit(
+        context.db,
+        f"book:sess:{context.session_id}",
+        limit=settings.booking_attempts_per_session,
+        window=None,
+    )
+    ip_allowed = True
+    if context.caller_ip is not None:
+        ip_allowed = await check_and_increment_rate_limit(
+            context.db,
+            f"book:ip:{context.caller_ip}",
+            limit=settings.booking_attempts_per_ip_per_day,
+            window=timedelta(days=1),
+        )
+    if not session_allowed or not ip_allowed:
+        # "state -> abandoned" (issue text) only applies once there's an
+        # actual in-progress flow to abandon (can_abandon, the same guard
+        # transition()'s own ABANDON branch uses — shared rather than
+        # duplicated, so the two can't silently drift apart). From idle --
+        # possible only when this session's very first attempt is blocked
+        # because it shares an already-exhausted IP with other sessions --
+        # there's nothing to abandon, and the rate limiter itself (not the
+        # FSM step) is what keeps blocking this session's future attempts
+        # regardless of step, so leaving state at idle is still correctly
+        # locked out.
+        if can_abandon(state.step):
+            state = transition(state, Event(kind=EventKind.ABANDON))
+        await save_booking_state(context.db, state)
+        if not session_allowed:
+            # Only flag when *this* session's own attempts tripped its own
+            # cap -- not when it's merely an innocent bystander blocked by
+            # another session having already exhausted their shared IP's
+            # daily quota (review finding: flagging every IP-capped
+            # session as suspicious would false-positive on shared
+            # office/NAT IPs once flagged sessions start driving owner
+            # notifications, Issues #16/#27).
+            await flag_session(context.db, context.session_id)
+        return {
+            "rate_limited": True,
+            "message": (
+                "The visitor has exceeded the limit on booking attempts for this "
+                "conversation. Do not call calendar_find_slots again -- tell them to email "
+                f"{settings.owner_contact_email} directly to schedule a call."
+            ),
         }
 
     event_kind = next_proposal_event(state)

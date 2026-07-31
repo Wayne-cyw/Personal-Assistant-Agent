@@ -444,6 +444,41 @@ async def test_handler_refuses_when_state_has_moved_past_reachable_steps(
 # --- booking-specific rate limits (Issue #23) ---------------------------------
 
 
+async def test_a_call_that_only_asks_for_the_timezone_does_not_consume_an_attempt(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found the rate-limit check originally
+    ran before the timezone-required early return, so a visitor who simply
+    hadn't sent their timezone yet -- an ordinary, spec-anticipated case,
+    not abuse -- burned one of their limited attempts just asking for it.
+    The check now runs after the timezone/policy guards, right before the
+    call's real work, so it's the negotiation flow's own legitimate call
+    count (initial proposal, re-propose, widen, one more call that lands
+    on email fallback -- 4, exactly BOOKING_ATTEMPTS_PER_SESSION's
+    default) that's actually being counted.
+    """
+    _configure_policy(monkeypatch, _policy())
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 4)
+
+    ask = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"),
+        _new_context(db, caller_timezone=None),
+    )
+    assert ask["error"] == "timezone_required"
+
+    # All 4 of a full legitimate negotiation's real calls still succeed --
+    # none of the cap was spent on the timezone-ask call above.
+    for _ in range(3):
+        result = await execute_tool(
+            _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+        )
+        assert "rate_limited" not in result
+    fourth = await execute_tool(
+        _call(date_from="2026-08-03", date_to="2026-08-03"), _new_context(db)
+    )
+    assert fourth["fallback"] is True  # negotiation cap's own conclusion, not a rate limit
+
+
 async def test_session_cap_allows_up_to_the_limit_then_refuses(
     db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -472,15 +507,23 @@ async def test_session_cap_allows_up_to_the_limit_then_refuses(
     assert row.flagged is True
 
 
-async def test_session_cap_refusal_from_idle_leaves_state_at_idle(
+async def test_session_blocked_only_by_a_shared_ip_is_not_flagged(
     db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the very first calendar_find_slots call for a session is
-    already rate-limited (only possible via the per-IP cap -- see the test
-    below), there's no in-progress flow to abandon (ABANDON is illegal
-    from idle, app/booking/state.py). Unlike the "there was a flow"
-    case above, state should stay at idle -- the rate limiter itself, not
-    the FSM step, is what keeps blocking this session's future attempts.
+    """A session whose *own* attempts never exceeded its own cap, but
+    which gets refused because another session already exhausted their
+    shared IP's daily quota, is an innocent bystander -- not evidence of
+    this session being suspicious (review finding: flagging every
+    IP-capped session would false-positive on shared office/NAT IPs once
+    flagged sessions start driving owner notifications, Issues #16/#27).
+    Only a session whose own per-session cap trips gets flagged (see
+    test_session_cap_allows_up_to_the_limit_then_refuses above).
+
+    The rate-limit check runs after intent_detected/timezone_captured
+    already fired for this call (it only guards the call's real work, not
+    the bookkeeping that happens on the way there -- see the handler's own
+    comment), so by the time it's evaluated there's already a real,
+    abandon-able in-progress flow, even on this session's very first call.
     """
     _configure_policy(monkeypatch, _policy())
     monkeypatch.setattr(settings, "booking_attempts_per_session", 1)
@@ -513,7 +556,10 @@ async def test_session_cap_refusal_from_idle_leaves_state_at_idle(
 
     assert result["rate_limited"] is True
     state = await load_booking_state(db, SID)
-    assert state.step is Step.IDLE  # nothing to abandon
+    assert state.step is Step.ABANDONED  # a real flow had already started this call
+    row = await db.get(SessionRow, SID)
+    assert row is not None
+    assert row.flagged is False  # this session's own cap was never exceeded
 
 
 async def test_ip_cap_is_shared_across_sessions_from_the_same_ip(
