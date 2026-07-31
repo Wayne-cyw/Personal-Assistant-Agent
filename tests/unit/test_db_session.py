@@ -674,7 +674,15 @@ async def test_check_and_increment_rate_limit_resets_after_the_window_elapses(
 
     class _FrozenDatetime(datetime):
         @classmethod
-        def now(cls, tz: object = None) -> datetime:
+        def now(cls, tz: object = None) -> datetime:  # type: ignore[override]
+            # Deliberately returns a plain datetime, not a _FrozenDatetime
+            # instance (which mypy's override check technically wants,
+            # since the real datetime.now returns Self) -- the return
+            # value here is bound directly as a SQL parameter inside
+            # check_and_increment_rate_limit, and sqlite3's default
+            # adapter can't serialize an arbitrary datetime *subclass*,
+            # only the exact base type. Returning cls(...) would satisfy
+            # mypy but break the query with a ProgrammingError instead.
             nonlocal calls
             calls += 1
             # First call (the initial increment) uses the real time; the
