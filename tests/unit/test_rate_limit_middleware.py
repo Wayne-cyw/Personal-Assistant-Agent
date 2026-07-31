@@ -66,14 +66,37 @@ def test_client_ip_uses_raw_peer_when_untrusted(monkeypatch: pytest.MonkeyPatch)
     assert _client_ip(request) == "1.2.3.4"
 
 
-def test_client_ip_uses_forwarded_header_first_entry_when_trusted(
+def test_client_ip_uses_forwarded_header_last_entry_when_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The *last* entry, not the first (review finding): with exactly one
+    trusted hop, the last entry is the one that hop itself appended --
+    everything to its left is attacker-suppliable.
+    """
     monkeypatch.setattr(settings, "trust_x_forwarded_for", True)
     request = _request(
         headers={"X-Forwarded-For": "9.9.9.9, 10.0.0.1, 10.0.0.2"}, client=("1.2.3.4", 123)
     )
-    assert _client_ip(request) == "9.9.9.9"
+    assert _client_ip(request) == "10.0.0.2"
+
+
+def test_client_ip_ignores_a_spoofed_leading_entry_when_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: a review pass found the original implementation
+    trusted the *first* (client-suppliable) entry, which would let a
+    caller freely spoof a different IP per request and defeat the per-IP
+    cap entirely in production (the only setting where trust_x_forwarded_for
+    is ever true). A single-hop header (just the trusted proxy's own
+    observed peer, no attacker-prepended entries) must resolve to that
+    one real value regardless of what a *different* request claims.
+    """
+    monkeypatch.setattr(settings, "trust_x_forwarded_for", True)
+    spoofed = _request(
+        headers={"X-Forwarded-For": "6.6.6.6, 10.0.0.5"}, client=("10.0.0.5", 123)
+    )
+    genuine = _request(headers={"X-Forwarded-For": "10.0.0.5"}, client=("10.0.0.5", 123))
+    assert _client_ip(spoofed) == _client_ip(genuine) == "10.0.0.5"
 
 
 def test_client_ip_falls_back_to_peer_when_trusted_but_header_absent(
@@ -88,6 +111,47 @@ def test_client_ip_none_when_no_peer_and_not_trusted(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(settings, "trust_x_forwarded_for", False)
     request = _request(client=None)
     assert _client_ip(request) is None
+
+
+# --- method/path scoping ------------------------------------------------------
+
+
+async def test_non_post_requests_to_the_chat_path_bypass_rate_limiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: a review pass found the method wasn't checked --
+    any HTTP method to /v1/chat (not just POST) had its body buffered and
+    consumed a rate-limit slot, instead of falling straight through to
+    routing's own 405 the way a GET to a POST-only route normally would.
+    """
+    checked = False
+
+    async def _fake_check(*_args: object, **_kwargs: object) -> bool:
+        nonlocal checked
+        checked = True
+        return True
+
+    monkeypatch.setattr(rate_limit_module, "check_and_increment_rate_limit", _fake_check)
+
+    downstream_called = False
+
+    async def _downstream_app(scope: dict, receive: object, send: object) -> None:
+        nonlocal downstream_called
+        downstream_called = True
+
+    middleware = RateLimitMiddleware(_downstream_app)  # type: ignore[arg-type]
+    scope: dict[str, object] = {"type": "http", "method": "GET", "path": "/v1/chat"}
+
+    async def receive() -> dict[str, object]:
+        raise AssertionError("body should never be read for a non-POST request")
+
+    async def send(_message: dict[str, object]) -> None:
+        pass
+
+    await middleware(scope, receive, send)  # type: ignore[arg-type]
+
+    assert downstream_called is True
+    assert checked is False
 
 
 # --- _replay_receive ---------------------------------------------------------
@@ -162,6 +226,7 @@ async def test_middleware_checks_both_caps_with_a_one_minute_window(
 
     scope: dict[str, object] = {
         "type": "http",
+        "method": "POST",
         "path": "/v1/chat",
         "headers": [],
         "client": ("1.2.3.4", 123),

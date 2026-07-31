@@ -42,27 +42,52 @@ def _client_ip(request: Request) -> str | None:
     when settings.trust_x_forwarded_for is set (Issue #24: "honor
     X-Forwarded-For only from the trusted host proxy"; see that setting's
     own docstring in app/config.py for why this is a deploy-time on/off
-    switch rather than a per-hop IP allowlist). The header can carry a
-    comma-separated chain (client, proxy1, proxy2, ...) when a request
-    passes through more than one hop — the *first* entry is the original
-    client (the standard convention: each proxy appends its own address
-    to the right, so the leftmost entry is the one furthest from this
-    server).
+    switch rather than a per-hop IP allowlist).
+
+    Deliberately the *last* entry, not the first (review finding —
+    caught before merge): the header is client-suppliable, and a proxy
+    that appends rather than replaces it (the common case — e.g. nginx's
+    `$proxy_add_x_forwarded_for`) puts each hop's own observed peer
+    address at the *end* of the chain, appending to whatever the client
+    already sent. With exactly one trusted hop between the client and
+    this app (this deploy model's single edge proxy, per the setting's
+    own docstring), the last entry is the one value in the header that
+    hop itself actually observed and added — everything to its left,
+    including the "first" entry, is attacker-controlled: a client can
+    freely prepend `X-Forwarded-For: 1.2.3.4` (or a fresh spoofed value
+    per request) before the request ever reaches the trusted proxy.
+    Trusting the first entry would let that spoofing defeat the per-IP
+    cap entirely, in exactly the deployment configuration where this
+    setting is turned on.
     """
     if settings.trust_x_forwarded_for:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
-            first = forwarded.split(",")[0].strip()
-            if first:
-                return first
+            last = forwarded.split(",")[-1].strip()
+            if last:
+                return last
     return request.client.host if request.client else None
 
 
 async def _read_body(receive: Receive) -> bytes:
+    # No hard size cap here (review finding, left as a documented gap
+    # rather than a fix bundled into this change): nothing else in this
+    # codebase enforces a request-body size limit either, and truncating
+    # here would corrupt what gets replayed to the real handler below —
+    # a genuine cap would need to reject the request outright instead of
+    # silently reading a prefix, which is a bigger design decision than
+    # this middleware's own scope (Issue #24 is rate limiting, not body
+    # size enforcement).
     chunks: list[bytes] = []
     more_body = True
     while more_body:
         message = await receive()
+        if message["type"] == "http.disconnect":
+            # The client went away mid-body -- there is nothing more to
+            # read, and no downstream app will run for this connection
+            # either way, so stop rather than looping on more receive()
+            # calls that would never produce a "more_body": False message.
+            break
         chunks.append(message.get("body", b""))
         more_body = message.get("more_body", False)
     return b"".join(chunks)
@@ -110,7 +135,16 @@ class RateLimitMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] != _RATE_LIMITED_PATH:
+        # method check matters (review finding): without it, a GET/OPTIONS/
+        # etc. to this path would still have its body buffered and consume
+        # a rate-limit slot before falling through to routing's own 405,
+        # instead of just 405ing immediately like every other wrong-method
+        # request on this path already does.
+        if (
+            scope["type"] != "http"
+            or scope["method"] != "POST"
+            or scope["path"] != _RATE_LIMITED_PATH
+        ):
             await self.app(scope, receive, send)
             return
 

@@ -8,7 +8,9 @@ about the LLM-backed reply/call count aren't confused by that separate
 zero-LLM-call path.
 """
 
-from collections.abc import AsyncGenerator
+import json
+import logging
+from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 
 import httpx
@@ -28,6 +30,7 @@ from app.config import settings
 from app.db.models import Base
 from app.db.session import get_db
 from app.main import app
+from app.middleware.logging import request_logger
 from app.tools.fake_calendar import FakeCalendar
 
 
@@ -222,12 +225,16 @@ async def test_forwarded_for_ignored_when_not_trusted(
 async def test_forwarded_for_honored_when_trusted(
     engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The *last* entry is what's trusted (the one hop's own appended
+    value) -- both requests here share the same raw TCP peer (as they
+    would behind one reverse proxy) but each has a genuinely distinct
+    single-hop header, exactly as that one proxy would set it for two
+    different real visitors, so each lands in its own IP bucket.
+    """
     monkeypatch.setattr(settings, "trust_x_forwarded_for", True)
     monkeypatch.setattr(settings, "messages_per_session_per_min", 100)
     monkeypatch.setattr(settings, "messages_per_ip_per_min", 1)
 
-    # Both requests share the same raw TCP peer (as they would behind one
-    # reverse proxy) but claim different original clients via the header.
     async with _client(engine, peer=("10.0.0.1", 1)) as client:
         try:
             first = await client.post(
@@ -240,12 +247,48 @@ async def test_forwarded_for_honored_when_trusted(
             second = await client.post(
                 "/v1/chat",
                 json={"session_id": "sess-b", "message": "hi"},
-                headers={"X-Forwarded-For": "2.2.2.2, 10.0.0.1"},
+                headers={"X-Forwarded-For": "2.2.2.2"},
             )
 
-            # Trusted and a distinct claimed original client (the header's
-            # *first* entry) -- its own, untouched IP bucket.
             assert second.status_code == 200
+        finally:
+            _teardown()
+
+
+async def test_forwarded_for_spoofed_leading_entry_does_not_bypass_the_cap(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass found the original implementation
+    trusted the header's *first* entry, which a caller can freely set to
+    anything (it's ordinary request-header content, set before the
+    request ever reaches the trusted proxy) -- letting a flood of
+    requests each claim a different fabricated leading IP defeat the
+    per-IP cap entirely, in exactly the deployment configuration
+    (trust_x_forwarded_for=True) this control exists for. Both requests
+    below share the same real proxy-observed peer (the header's last
+    entry) but claim a different, attacker-controlled leading entry each
+    time -- they must still land in the same IP bucket.
+    """
+    monkeypatch.setattr(settings, "trust_x_forwarded_for", True)
+    monkeypatch.setattr(settings, "messages_per_session_per_min", 100)
+    monkeypatch.setattr(settings, "messages_per_ip_per_min", 1)
+
+    async with _client(engine, peer=("10.0.0.1", 1)) as client:
+        try:
+            first = await client.post(
+                "/v1/chat",
+                json={"session_id": "sess-a", "message": "hi"},
+                headers={"X-Forwarded-For": "6.6.6.6, 10.0.0.1"},
+            )
+            assert first.status_code == 200
+
+            second = await client.post(
+                "/v1/chat",
+                json={"session_id": "sess-b", "message": "hi"},
+                headers={"X-Forwarded-For": "7.7.7.7, 10.0.0.1"},
+            )
+
+            assert second.status_code == 429
         finally:
             _teardown()
 
@@ -267,3 +310,56 @@ async def test_health_endpoint_is_not_rate_limited(
         finally:
             app.dependency_overrides.pop(get_health_calendar_client, None)
             _teardown()
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def request_log() -> Generator[_ListHandler]:
+    """request_logger has propagate=False (Issue #6), so pytest's caplog
+    (which listens via the root logger) can't see its records -- attach a
+    handler directly, same as tests/unit/test_logging_middleware.py.
+    """
+    handler = _ListHandler()
+    request_logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        request_logger.removeHandler(handler)
+
+
+async def test_a_429_from_the_rate_limiter_is_still_logged(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, request_log: _ListHandler
+) -> None:
+    """Regression test: a review pass found app/main.py's middleware
+    registration order backwards from its own stated intent -- Starlette's
+    add_middleware() *prepends*, so the *last*-added middleware ends up
+    outermost, not innermost. The original order put RateLimitMiddleware
+    outermost, so every 429 it short-circuits (before the request reaches
+    routing) never reached LoggingMiddleware at all and went unlogged.
+    This test mounts the real app (both middlewares, in whatever order
+    app/main.py currently registers them) and proves a 429 produces a
+    logged line, not just that the app object exists.
+    """
+    monkeypatch.setattr(settings, "messages_per_session_per_min", 1)
+    monkeypatch.setattr(settings, "messages_per_ip_per_min", 100)
+
+    async with _client(engine) as client:
+        try:
+            first = await _prime(client, "sess-1")
+            assert first.status_code == 200
+
+            blocked = await _send(client, "sess-1")
+            assert blocked.status_code == 429
+        finally:
+            _teardown()
+
+    statuses = [json.loads(r.getMessage())["status"] for r in request_log.records]
+    assert 429 in statuses

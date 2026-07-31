@@ -68,13 +68,19 @@ register_exception_handlers(app)
 # logging.py's module docstring for why LoggingMiddleware still logs the
 # correct status for every path, including the generic-Exception one bound
 # to ServerErrorMiddleware, which always sits outside any add_middleware
-# layer). Order *between the two middlewares below* does matter, though:
-# Starlette wraps the last-added middleware innermost, so adding
-# RateLimitMiddleware after LoggingMiddleware keeps LoggingMiddleware
-# outermost — it needs to see every response, including the 429s
-# RateLimitMiddleware short-circuits before the request ever reaches
-# routing, or those requests would go unlogged.
-app.add_middleware(LoggingMiddleware)
+# layer). Order *between the two middlewares below* does matter, though, and
+# is easy to get backwards (a review pass caught this exact mistake here):
+# Starlette's add_middleware() *prepends* to its internal list
+# (`self.user_middleware.insert(0, ...)`), and build_middleware_stack()
+# then wraps by iterating that list in reverse — so the *last*-added
+# middleware ends up OUTERMOST, not innermost. Registering RateLimitMiddleware
+# after LoggingMiddleware (as an earlier version of this file did) would put
+# RateLimitMiddleware outermost instead, so every 429 it short-circuits
+# before the request reaches routing would never reach LoggingMiddleware at
+# all and would go unlogged. Registering RateLimitMiddleware *first* (below)
+# makes LoggingMiddleware the last-added, and therefore outermost, layer —
+# verified directly against this app object, not just reasoned about.
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(LoggingMiddleware)
 app.include_router(chat_router)
 app.include_router(health_router)
