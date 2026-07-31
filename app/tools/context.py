@@ -43,6 +43,14 @@ class ToolContext:
     # applies. Unlike Issue #24's general message rate limits, this
     # doesn't honor X-Forwarded-For — that's explicitly deferred to #24's
     # "trusted host proxy" handling, not duplicated here.
+    #
+    # Known interim gap (review finding, user-confirmed acceptable for
+    # now): behind a reverse proxy (Render/Railway/Fly.io, per the Tech
+    # Stack), `client.host` is typically the proxy's own address, not the
+    # visitor's real IP — every visitor could share one bucket, or the cap
+    # could be a no-op, depending on the platform's proxy behavior, until
+    # #24 adds real client-IP resolution. The per-session cap is
+    # unaffected either way (it never depends on IP).
     caller_ip: str | None = None
     # flag_summary_conflict (app/tools/registry.py) appends the model's
     # explanation here instead of running reconciliation synchronously —
