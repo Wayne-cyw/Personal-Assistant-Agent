@@ -648,3 +648,34 @@ async def test_calendar_failure_after_the_rate_limit_check_still_persists_state(
     # this same call -- that progress must survive the calendar failure.
     assert state.step is Step.INTENT_DETECTED
     assert state.timezone_name == "America/Toronto"
+
+
+async def test_a_malformed_timezone_also_still_persists_state(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: a review pass on the fix above found it only
+    caught CalendarError, but generate_slots also constructs a ZoneInfo
+    from the caller-supplied timezone_name -- which is never
+    format-validated before reaching here (ChatRequest.timezone has no
+    validator, TIMEZONE_CAPTURED only checks truthiness) -- and raises
+    ZoneInfoNotFoundError, not CalendarError, on a malformed value. That
+    trigger is fully caller-controlled (no real Calendar outage needed)
+    and would have kept silently discarding this call's own progress if
+    the except clause weren't broadened.
+    """
+    _configure_policy(monkeypatch, _policy())
+    context = ToolContext(
+        db=db,
+        session_id=SID,
+        summarizer_provider=FakeProvider(responses=[]),
+        calendar_client=FakeCalendar(),
+        caller_timezone="Not/ARealZone",
+    )
+
+    result = await execute_tool(_call(date_from="2026-08-03", date_to="2026-08-03"), context)
+
+    assert "error" in result
+    assert "rate_limited" not in result
+    state = await load_booking_state(db, SID)
+    assert state.step is Step.INTENT_DETECTED
+    assert state.timezone_name == "Not/ARealZone"

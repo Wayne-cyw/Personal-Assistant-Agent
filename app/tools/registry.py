@@ -328,24 +328,32 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
             now=datetime.now(UTC),
             exclude=exclude,
         )
-    except CalendarError:
+    except Exception:
         # The rate-limit increment above has already committed by this
-        # point (review finding) — a transient Google Calendar failure
-        # here still costs the visitor one of their limited attempts, a
-        # known, accepted trade-off (refunding it would need a decrement
-        # primitive and reintroduce exactly the check-then-write race the
-        # atomic upsert exists to avoid for the per-IP counter, shared
-        # across sessions that aren't otherwise serialized against each
-        # other). What *is* fixed here: without this except block, this
-        # exception would propagate past every save_booking_state call in
-        # this function, silently discarding whatever state.py transitions
-        # already happened earlier in this same call (idle -> intent_
-        # detected, timezone_captured) — persisting them (this session's
-        # honest progress toward its own cap, not the calendar failure)
-        # before degrading gracefully, same pattern as the
-        # AvailabilityPolicyError case above.
+        # point (review finding) — a failure here still costs the visitor
+        # one of their limited attempts, a known, accepted trade-off
+        # (refunding it would need a decrement primitive and reintroduce
+        # exactly the check-then-write race the atomic upsert exists to
+        # avoid for the per-IP counter, shared across sessions that aren't
+        # otherwise serialized against each other). What *is* fixed here:
+        # without this except block, an exception here would propagate
+        # past every save_booking_state call in this function, silently
+        # discarding whatever state.py transitions already happened
+        # earlier in this same call (idle -> intent_detected, timezone_
+        # captured) — persisting them (this session's honest progress
+        # toward its own cap, not the failure) before degrading
+        # gracefully, same pattern as the AvailabilityPolicyError case
+        # above. Deliberately broad (not just CalendarError, the review
+        # finding's original trigger): generate_slots also constructs a
+        # ZoneInfo from the caller-supplied timezone_name, which is never
+        # format-validated before reaching here (ChatRequest.timezone has
+        # no validator, TIMEZONE_CAPTURED only checks truthiness) and
+        # raises ZoneInfoNotFoundError, not CalendarError, on a malformed
+        # value — narrowing this to CalendarError would have left that
+        # trigger (fully caller-controlled, no real Calendar outage
+        # needed) still silently discarding progress.
         logger.error(
-            "calendar_find_slots: get_free_busy failed for session %s", context.session_id
+            "calendar_find_slots: failed to generate slots for session %s", context.session_id
         )
         await save_booking_state(context.db, state)
         return {
