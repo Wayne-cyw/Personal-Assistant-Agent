@@ -677,3 +677,61 @@ async def test_availability_policy_not_configured_degrades_gracefully(
 
     assert response.status_code == 200
     assert response.json()["type"] == "message"
+
+
+async def test_booking_attempt_cap_refuses_after_the_limit_and_chat_still_works(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #23 acceptance criteria: a scripted session's booking attempts
+    beyond BOOKING_ATTEMPTS_PER_SESSION are refused (type: "refusal",
+    directing to the owner's email, a fixed message rather than the
+    model's own prose), and ordinary chat Q&A still works in that same
+    session afterward -- the refusal blocks booking specifically, not the
+    whole conversation.
+    """
+    monkeypatch.setattr(settings, "booking_attempts_per_session", 2)
+    await _prime_past_turn_zero(client, "sess-1")
+
+    for i in range(2):
+        _use_fake_provider(
+            [_find_slots_call(f"call_{i}"), _response("Here are some times that work.")]
+        )
+        allowed = await client.post(
+            "/v1/chat",
+            json={
+                "session_id": "sess-1",
+                "message": "can we book a call?",
+                "timezone": "America/Toronto",
+            },
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["type"] != "refusal"
+
+    _use_fake_provider(
+        [_find_slots_call("call_over"), _response("(overridden by the refusal message)")]
+    )
+    refused = await client.post(
+        "/v1/chat",
+        json={
+            "session_id": "sess-1",
+            "message": "can we book a call?",
+            "timezone": "America/Toronto",
+        },
+    )
+
+    assert refused.status_code == 200
+    body = refused.json()
+    assert body["type"] == "refusal"
+    assert settings.owner_contact_email in body["reply"]
+    assert body["data"] is None
+
+    state = await _get_booking_state(engine, "sess-1")
+    assert state.step is Step.ABANDONED
+
+    _use_fake_provider([_response("Sure — happy to answer that.")])
+    qa = await client.post(
+        "/v1/chat", json={"session_id": "sess-1", "message": "what does he do for work?"}
+    )
+    assert qa.status_code == 200
+    assert qa.json()["type"] == "message"
+    assert qa.json()["reply"] == "Sure — happy to answer that."
