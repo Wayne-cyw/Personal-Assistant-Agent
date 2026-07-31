@@ -93,6 +93,13 @@ async def client(engine: AsyncEngine) -> AsyncGenerator[httpx.AsyncClient]:
             yield session
 
     app.dependency_overrides[get_db] = _override_get_db
+    # RateLimitMiddleware (Issue #24) is raw ASGI middleware, outside
+    # FastAPI's dependency-injection tree, so app.dependency_overrides
+    # above has no effect on it -- it reads app.state.db_session_factory
+    # instead (app/main.py's lifespan sets this for real deployments, but
+    # httpx.ASGITransport doesn't run lifespan events, so nothing sets it
+    # here unless this fixture does).
+    app.state.db_session_factory = session_factory
     try:
         # raise_app_exceptions=False: let the registered Exception handler
         # convert unhandled errors into the real HTTP response a deployed
@@ -104,6 +111,7 @@ async def client(engine: AsyncEngine) -> AsyncGenerator[httpx.AsyncClient]:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_main_provider, None)
         app.dependency_overrides.pop(get_summarizer_provider, None)
+        del app.state.db_session_factory
 
 
 def _response(text: str) -> LLMResponse:

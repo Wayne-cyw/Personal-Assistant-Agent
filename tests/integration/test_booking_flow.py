@@ -75,6 +75,13 @@ async def client(
     monkeypatch.setattr(registry_module, "get_availability_policy", _policy)
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_chat_calendar_client] = lambda: FakeCalendar()
+    # RateLimitMiddleware (Issue #24) is raw ASGI middleware, outside
+    # FastAPI's dependency-injection tree, so app.dependency_overrides
+    # above has no effect on it -- it reads app.state.db_session_factory
+    # instead (app/main.py's lifespan sets this for real deployments, but
+    # httpx.ASGITransport doesn't run lifespan events, so nothing sets it
+    # here unless this fixture does).
+    app.state.db_session_factory = session_factory
     try:
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -83,6 +90,7 @@ async def client(
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_main_provider, None)
         app.dependency_overrides.pop(get_chat_calendar_client, None)
+        del app.state.db_session_factory
 
 
 def _response(text: str) -> LLMResponse:

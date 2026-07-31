@@ -12,8 +12,9 @@ from app.api.chat import router as chat_router
 from app.api.errors import register_exception_handlers
 from app.api.health import router as health_router
 from app.config import settings
-from app.db.session import init_db
+from app.db.session import get_session_factory, init_db
 from app.middleware.logging import LoggingMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -49,18 +50,31 @@ def _check_single_worker() -> None:
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _check_single_worker()
     await init_db()
+    # RateLimitMiddleware (Issue #24) is raw ASGI middleware, outside
+    # FastAPI's dependency-injection tree, so it can't be pointed at a
+    # test's isolated DB via app.dependency_overrides the way get_db is —
+    # it reads this app.state attribute instead (a test's client fixture
+    # sets the same attribute to its own test session_factory).
+    _app.state.db_session_factory = get_session_factory()
     yield
 
 
 app = FastAPI(title="Personal AI Assistant Agent", lifespan=lifespan)
 
 register_exception_handlers(app)
-# Registration order relative to add_middleware has no effect on request
-# handling — Starlette's build_middleware_stack() routes each handler by
-# exception type regardless of call order (see app/middleware/logging.py's
-# module docstring for why LoggingMiddleware still logs the correct status
-# for every path, including the generic-Exception one bound to
-# ServerErrorMiddleware, which always sits outside any add_middleware layer).
+# Registration order relative to *exception-handler* routing has no effect
+# — Starlette's build_middleware_stack() routes each handler by exception
+# type regardless of add_middleware call order (see app/middleware/
+# logging.py's module docstring for why LoggingMiddleware still logs the
+# correct status for every path, including the generic-Exception one bound
+# to ServerErrorMiddleware, which always sits outside any add_middleware
+# layer). Order *between the two middlewares below* does matter, though:
+# Starlette wraps the last-added middleware innermost, so adding
+# RateLimitMiddleware after LoggingMiddleware keeps LoggingMiddleware
+# outermost — it needs to see every response, including the 429s
+# RateLimitMiddleware short-circuits before the request ever reaches
+# routing, or those requests would go unlogged.
 app.add_middleware(LoggingMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.include_router(chat_router)
 app.include_router(health_router)
