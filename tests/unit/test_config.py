@@ -62,6 +62,9 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.owner_notify_webhook_url is None
     assert settings.booking_attempts_per_session == 4
     assert settings.booking_attempts_per_ip_per_day == 10
+    assert settings.messages_per_session_per_min == 10
+    assert settings.messages_per_ip_per_min == 20
+    assert settings.trust_x_forwarded_for is False
 
 
 def test_allowed_origins_parses_comma_separated_string() -> None:
@@ -130,6 +133,9 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
         "OWNER_NOTIFY_WEBHOOK_URL",
         "BOOKING_ATTEMPTS_PER_SESSION",
         "BOOKING_ATTEMPTS_PER_IP_PER_DAY",
+        "MESSAGES_PER_SESSION_PER_MIN",
+        "MESSAGES_PER_IP_PER_MIN",
+        "TRUST_X_FORWARDED_FOR",
     )
     for var in optional_vars:
         monkeypatch.delenv(var, raising=False)
@@ -153,6 +159,9 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.owner_notify_webhook_url is None
     assert settings.booking_attempts_per_session == 4
     assert settings.booking_attempts_per_ip_per_day == 10
+    assert settings.messages_per_session_per_min == 10
+    assert settings.messages_per_ip_per_min == 20
+    assert settings.trust_x_forwarded_for is False
 
 
 def test_web_concurrency_parses_numeric_env_var() -> None:
@@ -218,6 +227,26 @@ def test_booking_attempt_caps_overridable_and_zero_or_negative_rejected() -> Non
         _settings(OPENAI_API_KEY="key", BOOKING_ATTEMPTS_PER_SESSION="0")
     with pytest.raises(ValidationError):
         _settings(OPENAI_API_KEY="key", BOOKING_ATTEMPTS_PER_IP_PER_DAY="0")
+
+
+def test_message_rate_limit_caps_overridable_and_zero_or_negative_rejected() -> None:
+    settings = _settings(
+        OPENAI_API_KEY="key",
+        MESSAGES_PER_SESSION_PER_MIN="5",
+        MESSAGES_PER_IP_PER_MIN="15",
+    )
+    assert settings.messages_per_session_per_min == 5
+    assert settings.messages_per_ip_per_min == 15
+
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", MESSAGES_PER_SESSION_PER_MIN="0")
+    with pytest.raises(ValidationError):
+        _settings(OPENAI_API_KEY="key", MESSAGES_PER_IP_PER_MIN="0")
+
+
+def test_trust_x_forwarded_for_overridable() -> None:
+    settings = _settings(OPENAI_API_KEY="key", TRUST_X_FORWARDED_FOR="true")
+    assert settings.trust_x_forwarded_for is True
 
 
 def test_max_tokens_per_turn_too_low_for_summarizer_rejected() -> None:

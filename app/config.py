@@ -128,6 +128,30 @@ class Settings(BaseSettings):
         default=10, ge=1, alias="BOOKING_ATTEMPTS_PER_IP_PER_DAY"
     )
 
+    # General per-session/per-IP message rate limits (Issue #24) — apply to
+    # all chat traffic, sitting underneath #23's stricter booking-attempt
+    # caps. Both defaults are the issue's own stated numbers.
+    messages_per_session_per_min: int = Field(
+        default=10, ge=1, alias="MESSAGES_PER_SESSION_PER_MIN"
+    )
+    messages_per_ip_per_min: int = Field(default=20, ge=1, alias="MESSAGES_PER_IP_PER_MIN")
+    # Whether to trust the X-Forwarded-For header for per-IP rate limiting
+    # (Issue #24: "honor X-Forwarded-For only from the trusted host
+    # proxy"). The issue doesn't name a mechanism for identifying that
+    # proxy, and no specific IP/CIDR range is documented for any of the
+    # Tech Stack's candidate hosts (Render/Railway/Fly.io) — user-confirmed
+    # design call: a plain on/off switch rather than an IP allowlist,
+    # since this app always runs as exactly one uvicorn worker behind
+    # whichever platform's own edge proxy is the only way in (Engineering
+    # Guide 4.3's single-worker rule). There's no scenario where the
+    # deployed app receives a direct, unproxied connection, so "are we
+    # running in an environment where this header can be trusted at all"
+    # is the only question that actually needs answering, not "which
+    # specific hop sent it." Default False (untrusted, use the raw TCP
+    # peer) so local dev/tests are never fooled by a spoofed header;
+    # deploy config is what should set this True in production.
+    trust_x_forwarded_for: bool = Field(default=False, alias="TRUST_X_FORWARDED_FOR")
+
     # Owner notification (Issue #22, app/notify.py). Optional: unset just
     # means notifications no-op with a logged warning rather than crashing
     # startup — a dev environment without a configured webhook shouldn't be
