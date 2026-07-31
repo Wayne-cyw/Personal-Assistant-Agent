@@ -13,7 +13,7 @@ import re
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -40,7 +40,9 @@ from app.config import settings
 from app.db.session import (
     active_holds,
     add_pinned_fact,
+    check_and_increment_rate_limit,
     create_booking,
+    flag_session,
     load_booking_state,
     save_booking_state,
     set_visitor_info,
@@ -167,6 +169,50 @@ async def _calendar_find_slots(args: BaseModel, context: ToolContext) -> dict[st
     context.calendar_find_slots_used_this_turn = True
 
     state = await load_booking_state(context.db, context.session_id)
+
+    # Booking-specific rate limits (Issue #23, PRD: "booking abuse is
+    # costlier than Q&A abuse" — stricter and separate from #24's general
+    # chat-message limits). Each calendar_find_slots call is one "booking
+    # attempt," whether it's a flow's first entry or a re-propose/widen
+    # within an ongoing negotiation (the negotiation cap already bounds
+    # legitimate reuse within one flow to a handful of calls; this guards
+    # against abuse across many flows/turns instead). Checked before any
+    # FSM progression below, so a rate-limited call never advances
+    # intent_detected/timezone_captured on its way to being refused.
+    session_allowed = await check_and_increment_rate_limit(
+        context.db,
+        f"book:sess:{context.session_id}",
+        limit=settings.booking_attempts_per_session,
+        window=None,
+    )
+    ip_allowed = True
+    if context.caller_ip is not None:
+        ip_allowed = await check_and_increment_rate_limit(
+            context.db,
+            f"book:ip:{context.caller_ip}",
+            limit=settings.booking_attempts_per_ip_per_day,
+            window=timedelta(days=1),
+        )
+    if not session_allowed or not ip_allowed:
+        # "state -> abandoned" (issue text) only applies once there's an
+        # actual in-progress flow to abandon. From idle -- possible only
+        # on this session's very first attempt, blocked because it shares
+        # an already-exhausted IP with other sessions -- there's nothing
+        # to abandon, and the rate limiter itself (not the FSM step) is
+        # what keeps blocking this session's future attempts regardless
+        # of step, so leaving state at idle is still correctly locked out.
+        if state.step not in (Step.IDLE, Step.BOOKING_CREATED, Step.ABANDONED):
+            state = transition(state, Event(kind=EventKind.ABANDON))
+        await save_booking_state(context.db, state)
+        await flag_session(context.db, context.session_id)
+        return {
+            "rate_limited": True,
+            "message": (
+                "The visitor has exceeded the limit on booking attempts for this "
+                "conversation. Do not call calendar_find_slots again -- tell them to email "
+                f"{settings.owner_contact_email} directly to schedule a call."
+            ),
+        }
 
     if state.step is Step.IDLE:
         state = transition(state, Event(kind=EventKind.INTENT_DETECTED))

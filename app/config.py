@@ -108,12 +108,22 @@ class Settings(BaseSettings):
     # costlier than Q&A abuse" — stricter and separate from #24's general
     # chat-message limits). Per-session is a lifetime cap (no reset window
     # — bounded by the session's own natural lifetime, not a rolling
-    # period); per-IP is explicitly "per day" in the issue text. No default
-    # is specified for the per-IP cap in the Engineering Guide; 10 is a
-    # deliberately looser number than the per-session cap (3) so a shared
-    # office/NAT IP with a few genuine visitors in one day isn't
+    # period); per-IP is explicitly "per day" in the issue text. Neither
+    # number is authoritative from the issue text as written: it names
+    # BOOKING_ATTEMPTS_PER_SESSION=3, but "attempt" = one calendar_find_slots
+    # call (the natural unit, since that's the tool's own entry point into
+    # the flow) means a single legitimate negotiation — initial proposal,
+    # one re-propose, one widen, one more call that lands on the
+    # email-fallback conclusion (app/booking/state.py's negotiation cap,
+    # Issue #19/#20) — already takes 4 calls on its own. 3 would rate-limit
+    # that already-shipped, already-tested flow on its own legitimate last
+    # step; 4 is the smallest cap that doesn't (user-confirmed after this
+    # was discovered while wiring the check into calendar_find_slots). No
+    # default is specified for the per-IP cap in the Engineering Guide
+    # either; 10 is deliberately looser than the per-session cap so a
+    # shared office/NAT IP with a few genuine visitors in one day isn't
     # false-positived by one visitor's own legitimate attempts.
-    booking_attempts_per_session: int = Field(default=3, ge=1, alias="BOOKING_ATTEMPTS_PER_SESSION")
+    booking_attempts_per_session: int = Field(default=4, ge=1, alias="BOOKING_ATTEMPTS_PER_SESSION")
     booking_attempts_per_ip_per_day: int = Field(
         default=10, ge=1, alias="BOOKING_ATTEMPTS_PER_IP_PER_DAY"
     )

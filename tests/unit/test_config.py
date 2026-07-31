@@ -60,7 +60,7 @@ def test_defaults_applied_when_only_required_vars_given() -> None:
     assert settings.google_calendar_id == "primary"
     assert settings.hold_minutes == 10
     assert settings.owner_notify_webhook_url is None
-    assert settings.booking_attempts_per_session == 3
+    assert settings.booking_attempts_per_session == 4
     assert settings.booking_attempts_per_ip_per_day == 10
 
 
@@ -151,7 +151,7 @@ def test_env_example_leaves_optional_vars_at_their_python_defaults(
     assert settings.session_token_budget == 50_000
     assert settings.hold_minutes == 10
     assert settings.owner_notify_webhook_url is None
-    assert settings.booking_attempts_per_session == 3
+    assert settings.booking_attempts_per_session == 4
     assert settings.booking_attempts_per_ip_per_day == 10
 
 
