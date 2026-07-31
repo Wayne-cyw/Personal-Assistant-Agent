@@ -45,7 +45,13 @@ _STATUS_CODES: dict[ErrorCode, int] = {
 }
 
 
-def _error_response(code: ErrorCode) -> JSONResponse:
+def error_response(code: ErrorCode) -> JSONResponse:
+    """Public (not just used by the exception handlers below): Issue #24's
+    rate-limit middleware constructs its own 429 response outside FastAPI's
+    exception-handling machinery (it short-circuits before the request
+    ever reaches routing), and needs the exact same envelope shape rather
+    than a hand-duplicated copy that could drift from this one.
+    """
     return JSONResponse(
         status_code=_STATUS_CODES[code],
         content={"error": {"code": code.value, "message": _FIXED_MESSAGES[code]}},
@@ -57,14 +63,14 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _handle_validation_error(
         _request: Request, _exc: RequestValidationError
     ) -> JSONResponse:
-        return _error_response(ErrorCode.INVALID_REQUEST)
+        return error_response(ErrorCode.INVALID_REQUEST)
 
     @app.exception_handler(SessionBusyError)
     async def _handle_session_busy(_request: Request, exc: SessionBusyError) -> JSONResponse:
         # str(exc) is just the session_id (Issue #11) — no secret-bearing
         # payload risk here, unlike the generic-exception handler below.
         logger.info("session turn lock busy", extra={"session_id": str(exc)})
-        return _error_response(ErrorCode.RATE_LIMITED)
+        return error_response(ErrorCode.RATE_LIMITED)
 
     @app.exception_handler(UpstreamError)
     async def _handle_upstream_error(_request: Request, exc: UpstreamError) -> JSONResponse:
@@ -75,7 +81,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             "upstream provider error",
             extra={"status_code": exc.status_code, "error_type": exc.error_type},
         )
-        return _error_response(ErrorCode.UPSTREAM_UNAVAILABLE)
+        return error_response(ErrorCode.UPSTREAM_UNAVAILABLE)
 
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
@@ -96,4 +102,4 @@ def register_exception_handlers(app: FastAPI) -> None:
         # against a future mistake" role Issue #6 describes for it.
         tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         logger.error("unhandled exception\n%s", redact(tb_text))
-        return _error_response(ErrorCode.INTERNAL_ERROR)
+        return error_response(ErrorCode.INTERNAL_ERROR)
